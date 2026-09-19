@@ -374,6 +374,14 @@ class InSARGNN(nn.Module):
         return mu, logvar
 ```
 
+**Alternative layer choices (not adopted, worth benchmarking against).** GATv2Conv is a reasonable fit for the edge/node feature situation here (attention lets the model learn a context-adaptive, edge-feature-informed neighbour weighting instead of a hand-fixed kernel), but it is not the only one, and it is not obviously the best one:
+
+- **`PointTransformerConv`** — designed specifically for point clouds with explicit relative-position encoding, which is arguably a closer match to this problem's actual shape (an irregular point cloud in continuous space) than a generic attention-based GNN layer. Worth trying as a direct comparison to GATv2Conv, not just a footnote.
+- **`NNConv` / edge-conditioned convolution** — edge features generate a full per-edge weight *matrix* applied to the neighbour's features, rather than a scalar attention weight. More expressive than GATv2Conv, more parameters, typically less stable to train with limited data.
+- **`TransformerConv`** (PyG's graph transformer layer) — also supports `edge_dim`, closely related to GATv2Conv but with a different normalization/query-key-value structure; a cheap ablation if GATv2Conv underperforms.
+
+None of these change §3.3's relative-only-position constraint — all three still take `[distance, unit_direction]`-style edge features rather than absolute coordinates. What they're *not* a fit for: diffusion convolution (IGNNK's own layer, built for directed/asymmetric reachability like one-way roads) has no analogue need here, since an InSAR point cloud has no directional-flow structure to model — pulling it in would be solving a problem this data doesn't have.
+
 ### 5.6 Graph construction per query
 
 ```python
@@ -801,6 +809,26 @@ Applies to any pretrained/learned embedding, not only AEF; physically-grounded p
 - **Analogue check:** compare embedding similarity between physically similar but distant sites (e.g. two subsidence bowls in different countries). If proximity dominates similarity over land-cover/process, that is the fingerprint.
 
 **Mitigations if confirmed:** drop AEF and keep only physically-grounded predictors; or aggregate/normalize embeddings per burst so only *local contrast* survives; or adversarially penalize position-decodability during training. Note the first is the cleanest and costs the least thesis-narrative complexity.
+
+### 10.10 OPEN — masked-target scope: single query node vs. multi-node local subgraph
+
+**Status: design question, not resolved. Current plan (§5.6/§7.1) uses the single-query-node version; this is a candidate refinement, not a correction.**
+
+IGNNK (§3.2's source) doesn't just predict one masked node per training sample — within each sampled subgraph it computes reconstruction loss over *every* node, the ones left "observed" included, not only the masked ones (Wu et al. 2021, Loss Function section; citing Hamilton, Ying & Leskovec 2017 for the underlying argument). Your current design (§5.6, §7.1) only ever supervises the one designated query node per graph; neighbour dropout removes some points from the visible context but extracts no gradient from them. Adopting IGNNK's fuller scheme here would mean: build one local subgraph of several nearby points, randomly designate a *subset* of them (not always exactly one) as masked each training step, and take a loss over some or all of the graph's nodes rather than a single readout.
+
+**Why the observed-node loss isn't circular, even though it looks trivial at first glance.** A node's own input isn't thrown away before message passing — only the *masked* nodes get their input zeroed; observed nodes keep their real values as input, and most architectures in this family include a residual/self-loop path (IGNNK's own Eq. 2 explicitly adds the previous layer's representation back in), so reconstructing an observed node's own value is a mostly easy task, close to learned identity. That's fine — it isn't meant to be a hard prediction task. Its value is elsewhere: (1) it's essentially free extra supervision per graph built — `n_o + n_m` loss terms instead of `n_m` — which matters when graph construction itself is a real cost at burst scale; (2) per Hamilton et al.'s argument, it shapes the *same shared* message-passing weights from every node's own vantage point, not only from the vantage point of whichever nodes happen to get drawn as masked targets in a given sample; (3) because which nodes land in the observed vs. masked set is redrawn randomly every training iteration (same mechanism as §3.2's core trick), no node is "always observed" — over the course of training essentially every point takes a turn in both roles. The easy, near-identity signal and the hard, genuinely-predictive signal are two different training pressures on the same weights, not two separate objectives.
+
+**What adopting this for real would change here, concretely:**
+- **Mechanically cheap.** `h[data.query_mask]` already returns however many rows are `True` — if `query_mask` marks several nodes instead of one, the model architecture (§5.5) needs no change at all, only the graph-construction step (§5.6/§7.1) does.
+- **Loss function (§7.2):** straightforward extension — the same Gaussian NLL, summed or averaged over however many masked nodes are in the graph, rather than evaluated at one row.
+- **Uncertainty/calibration (§6.5) — the part that needs real care, not a mechanical change.** Predictions for multiple masked nodes drawn from the same graph share the same random neighbourhood draw and the same message-passing computation — they are correlated, not independent. Split-conformal's coverage guarantee relies on exchangeability of calibration residuals; tightly correlated within-graph residuals shrink the *effective* calibration sample size and can distort coverage if treated as if they were as informative as that many independent draws. Likely mitigation: decouple training-time masking (use several masked nodes per graph, for efficiency) from calibration-time sampling (draw at most one calibration residual per graph, even if training used several) — keeps §6.5's guarantee clean regardless of what the training-side ablation shows.
+- **Possible mismatch with the actual inference distribution, worth naming rather than assuming away.** At inference, "query anywhere" most likely means one arbitrary point queried against a neighbourhood of *real, observed* EGMS points — never neighbours that are themselves simultaneously unknown. Multi-masking trains on a strictly more general (harder) configuration than that — some neighbours being masked-and-uncertain during training, never at inference. Plausibly a net positive (same logic as dropout improving robustness despite not matching the test-time computation graph exactly), but it is a trained-distribution vs. deployed-distribution mismatch, not a pure win, and should be evaluated as such rather than assumed to help.
+
+**Paths to explore, roughly in order of cost:**
+1. Implement as an ablation alongside the current single-query design — same architecture, only the graph-sampling/masking step and loss aggregation differ — and compare Tier-1 LOS metrics (§8.1) between the two.
+2. If it helps, retire the currently-optional reprojection-loss idea (§7.2) — multi-node masking is a more systematic, built-in version of the same consistency-forcing intuition, so keeping both would likely be redundant.
+3. Decide the local-subgraph sampling shape: still a k-NN neighbourhood around a rough centre (closest to what §5.6 already builds), or something closer to IGNNK's own arbitrary-subset-of-indices sampling restricted to a bounded local radius. The former is a smaller change from the current plan; the latter more faithfully reproduces IGNNK's actual algorithm but has less obvious justification at this data density.
+4. If adopted, implement the calibration-decoupling mitigation above *before* running any §6.5 calibration numbers, not after — retrofitting it later would mean redoing calibration.
 
 ---
 
