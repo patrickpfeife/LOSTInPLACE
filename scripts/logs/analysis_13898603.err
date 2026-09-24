@@ -1,0 +1,28 @@
+Traceback (most recent call last):
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/01_download_data.py", line 217, in <module>
+    main() 
+    ^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/01_download_data.py", line 210, in main
+    download_egms(Path(__file__).parent / "../../assets/real_subsidence_pointbased.gpkg", 
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/01_download_data.py", line 177, in download_egms
+    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending", set = 2)
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/.venv/lib/python3.12/site-packages/geopandas/geodataframe.py", line 1992, in apply
+    result = super().apply(
+             ^^^^^^^^^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/.venv/lib/python3.12/site-packages/pandas/core/frame.py", line 12437, in apply
+    return op.apply().__finalize__(self, method="apply")
+           ^^^^^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/.venv/lib/python3.12/site-packages/pandas/core/apply.py", line 1015, in apply
+    return self.apply_standard()
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/.venv/lib/python3.12/site-packages/pandas/core/apply.py", line 1167, in apply_standard
+    results, res_index = self.apply_series_generator()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/.venv/lib/python3.12/site-packages/pandas/core/apply.py", line 1183, in apply_series_generator
+    results[i] = self.func(v, *self.args, **self.kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/dss/dsshome1/0C/di54haf/LOSTInPLACE-Line-Of-Sight-To-INSAR-derived-continuous-DisPLACEment/scripts/python/01_download_data.py", line 125, in pull_egms
+    best_rel_orbit = max(
+                     ^^^^
+ValueError: max() iterable argument is empty

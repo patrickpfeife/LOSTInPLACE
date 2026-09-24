@@ -24,6 +24,11 @@ from shapely.ops import unary_union
 #============================================================#
 
 PROJECT_DIR = Path("/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE")
+DATA_DIR = PROJECT_DIR / "data"
+# For the data split between training, dev and validation regions
+TRAIN_DIR = DATA_DIR / "train"
+DEV_DIR = DATA_DIR / "dev"
+VAL_DIR = DATA_DIR / "val"
 
 #============================================================#
 # Helper Functions
@@ -31,23 +36,11 @@ PROJECT_DIR = Path("/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE")
 
 def create_file_system():
     # setting up the file system for the project 
-
-    # For the egms training data
-    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
-    (PROJECT_DIR / "data").mkdir(parents=True, exist_ok=True)
-    (PROJECT_DIR / "data/egms").mkdir(parents=True, exist_ok=True)
-    (PROJECT_DIR / "data/egms/train").mkdir(parents=True, exist_ok=True)
-    (PROJECT_DIR / "data/egms/dev").mkdir(parents=True, exist_ok=True)
-    (PROJECT_DIR / "data/egms/val").mkdir(parents=True, exist_ok=True)
-     
-    # for the covariates
-    (PROJECT_DIR / "data/covariates").mkdir(parents=True, exist_ok=True)
-
-    # for the GNSS data
-    (PROJECT_DIR / "data/gnss").mkdir(parents=True, exist_ok=True)
-
-    # miscillaneous like country boudaries
-    (PROJECT_DIR / "assets").mkdir(parents=True, exist_ok=True)
+    PROJECT_DIR.mkdir(parents=True, exist_ok=True) 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    DEV_DIR.mkdir(parents=True, exist_ok=True)
+    VAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_access_token(token_path):
@@ -91,9 +84,6 @@ def point_to_bbox(row, t2projected, t2wgs84):
     bl_lon, bl_lat = t2wgs84.transform(bottom_left_x, bottom_left_y)
     br_lon, br_lat = t2wgs84.transform(bottom_right_x, bottom_right_y)
 
-    if not all(lo <= v <= hi and v > 0 for pair in coords for v in pair):
-        raise ValueError("At least one of the lat/lon pairs must be incorrect!")
-
     return [[tl_lon, tl_lat], [bl_lon, bl_lat], [br_lon, br_lat], [tr_lon, tr_lat]]
 
 def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
@@ -117,7 +107,7 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
     return result, links
     
 
-def pull_egms(row, headers, orbit):
+def pull_egms(row, headers, orbit, set):
 
     # build a Polygon to compare with to filter out the best relative orbit.
     study_area = Polygon(row["bbox"])
@@ -139,10 +129,19 @@ def pull_egms(row, headers, orbit):
     hits, links = zip(*by_rel_orbit[best_rel_orbit])
 
     # some of the real subsidence areas go into training but some also go into validation 
-    save_path = PROJECT_DIR / "data/egms" / ("val" if row["val"] == 1 else "train") / row["location"] / "orbit"
+    # the set variable decides into which region the data goes
+    # Generally:  0 = train    1 = dev   2 = val
+    if set == 0:
+        save_path = TRAIN_DIR / row["location"] / str(orbit)
+    elif set == 1:
+        save_path = DEV_DIR / row["location"] / str(orbit)
+    elif set == 2:
+        save_path = VAL_DIR / row["location"] / str(orbit)
+
+    # creating the directory where the data goes
     save_path.mkdir(parents=True, exist_ok=True)
 
-    for link, hit in zip(row["download_links"], row["query_results"]["hits"]):
+    for hit,link in zip(hits, links):
          filename = hit["filename"]
          with requests.get(link, headers=headers, stream=True) as r:
             r.raise_for_status()
@@ -160,12 +159,6 @@ def download_egms(real_sub_path, token_path):
     # Loading the real subsidence cases
     real_subsidence = gpd.read_file(real_sub_path)
 
-
-    ##########################
-    
-
-
-
     # Compute the bounding boxes for every real subsidence region
     t2projected = Transformer.from_crs(real_subsidence.crs, "EPSG:3035", always_xy=True)
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
@@ -179,8 +172,10 @@ def download_egms(real_sub_path, token_path):
     real_subsidence[["query_results", "download_links"]] = real_subsidence.apply(query_egms, axis=1, headers=headers, result_type = "expand")
 
     # Download the products with filter before
-    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
-    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
+    # the set variable decides into which region the data goes
+    # Generally:  0 = train    1 = dev   2 = val
+    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending", set = 2)
+    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "descending", set = 2)
 
 
 
