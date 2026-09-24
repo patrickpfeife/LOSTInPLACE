@@ -1,8 +1,10 @@
 # custom additions
-/prototyping_notebooks
-/presentation
-/test
+prototyping_notebooks/
+presentation/
+test/
 token.jwt
+*.err
+*.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
