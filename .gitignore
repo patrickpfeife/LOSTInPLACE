@@ -3,6 +3,7 @@ prototyping_notebooks/
 presentation/
 test/
 token.jwt
+assets/plots/
 *.err
 *.out
 

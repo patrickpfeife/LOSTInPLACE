@@ -82,7 +82,7 @@ def get_access_token(token_path):
     access_token = access_token_info_json.get('access_token')
     return access_token
 
-def point_to_bbox(row, t2projected, t2wgs84):
+def point_to_bbox(row, t2projected, t2wgs84, source_crs):
     """
     Builds a lon/lat bounding box around a point by offsetting it west/east/north/south by the row's margins.
 
@@ -94,9 +94,11 @@ def point_to_bbox(row, t2projected, t2wgs84):
     Returns:
         bbox -- list of [lon, lat] pairs, the four corners in order top-left, bottom-left, bottom-right, top-right
     """
-    # reproject to appropriate crs
-    # assumes that the correct projection is already set
-    x, y = t2projected.transform(row.geometry.x, row.geometry.y)
+    
+    if source_crs == "EPSG:3035":
+        x, y = row.geometry.x, row.geometry.y      # already projected, no transform needed
+    else:
+        x, y = t2projected.transform(row.geometry.x, row.geometry.y)   # e.g. EPSG:4326 -> EPSG:3035
 
     # compute the min/max values
     top_left_x = x - (row["west"] * 1000)
@@ -289,7 +291,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     # Compute the bounding boxes for every real subsidence region
     t2projected = Transformer.from_crs(real_subsidence.crs, "EPSG:3035", always_xy=True)
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
-    real_subsidence["bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84)
+    real_subsidence["bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=real_subsidence.crs)
 
     # get the access token for the egms api
     access_token = get_access_token(token_path)
@@ -328,13 +330,26 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     # setting up the geopy functionality to determine the closest city
     geolocator = Nominatim(user_agent="lostinplace_thesis")
     reverse = RateLimiter(geolocator.reverse, min_delay_seconds=1)  # Nominatim's usage policy caps at 1 req/s
-
+    # filling the location col via this function 
     egms_random["location"] = egms_random.apply(closest_city_name, axis = 1, reverser = reverse)
 
+    # Creating the bbox and querying the archive on the random point samples
+    egms_random["bbox"] = egms_random.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=egms_random.crs)
+    egms_random[["query_results", "download_links"]] = egms_random.apply(query_egms, axis=1, headers=headers, result_type = "expand")
+    
     # downloading the egms data for the new areas
     egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
     egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
 
+    # Now concattenating both gdfs. This gdf is representative for the entire study area.
+    # First making sure they are both in the same crs
+    real_subsidence = real_subsidence.to_crs("EPSG:3035")
+    egms_random = egms_random.to_crs("EPSG:3035")
+
+    study_areas_gdf = pd.concat([real_subsidence, egms_random])
+    study_areas_gdf.to_file(Path(__file__).parent / "../../assets/study_areas_gdf.gpkg", driver="gpkg")
+
+    return study_areas_gdf
 
 
     # current state:
@@ -421,11 +436,11 @@ def main():
 
     ##############################
     # Downloading the data
-    download_egms(Path(__file__).parent / "../../assets/real_subsidence_pointbased.gpkg", 
-                  Path(__file__).parent / "../../assets/token.jwt",
-                  Path(__file__).parent / "../../assets/egms_coverage_countries.geojson",
-                  real_sub_buffer_value = 400000,
-                  n_rnd=25, mindist_rnd=200000, maxit_rnd=200)
+    study_areas_gdf = download_egms(Path(__file__).parent / "../../assets/real_subsidence_pointbased.gpkg", 
+                        Path(__file__).parent / "../../assets/token.jwt",
+                        Path(__file__).parent / "../../assets/egms_coverage_countries.geojson",
+                        real_sub_buffer_value = 400000,
+                        n_rnd=25, mindist_rnd=200000, maxit_rnd=200)
     ##############################
     # Pre-Processing the data
 
