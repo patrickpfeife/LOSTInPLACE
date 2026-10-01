@@ -28,23 +28,6 @@ from shapely.geometry import box
 # Helper Functions
 #============================================================#
 
-def unzip(data_dir):
-    """Extract every zip found under a directory (recursively) into its own folder, then delete the zip.
-
-    Args:
-        data_dir (str or Path): root directory to search for "*.zip" files in.
-    Returns:
-        None. Extracts files to disk and removes the original zips.
-    """
-    # finding all the zips upfront and putting into a list
-    zips = list(Path(data_dir).rglob("*.zip"))
-    # iterate over the zip paths that were found
-    for zip_path in zips:
-        # open the zips, extract them and remove the original files
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(zip_path.parent)
-        zip_path.unlink()
-
 def bbox_per_csv(csv_file):
     """Compute the axis-aligned bounding box of the easting/northing points in one EGMS csv.
 
@@ -66,7 +49,7 @@ def bbox_per_csv(csv_file):
 
     return bbox
 
-def bbox_union(individual_bboxes, folder):
+def bbox_envelope(individual_bboxes):
     """Merge a folder's per-csv bounding boxes into one geometry and write it to a gpkg in that folder.
 
     Args:
@@ -79,8 +62,7 @@ def bbox_union(individual_bboxes, folder):
     # and returns the union of them
     union = union_all(individual_bboxes)
     union = gpd.GeoDataFrame(geometry=[union], crs="EPSG:3035")
-    output_file = folder / "covered_area.gpkg"
-    union.to_file(output_file, driver='GPKG')
+    
 
 
 

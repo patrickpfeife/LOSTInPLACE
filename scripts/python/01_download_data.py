@@ -1,9 +1,11 @@
 #######################################
 # 01_download_egms
 
-#============================================================#
-# Import Statements
-#============================================================#
+##############################################################################
+#============================================================================#
+# 1) Import Statements
+#============================================================================#
+##############################################################################
 
 import geopandas as gpd
 import json
@@ -13,6 +15,8 @@ import jwt
 import os
 import numpy as np
 import pandas as pd
+import polars as pl
+import zipfile
 
 from pathlib import Path
 from pyproj import Transformer
@@ -20,11 +24,13 @@ from shapely.geometry import Polygon
 from shapely import union_all
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
+from shapely.geometry import box
 
-
-#============================================================#
-# Define Global Variables
-#============================================================#
+##############################################################################
+#============================================================================#
+# 2) Define Global Variables
+#============================================================================#
+##############################################################################
 
 PROJECT_DIR = Path("/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE")
 DATA_DIR = PROJECT_DIR / "data"
@@ -34,9 +40,16 @@ DEV_DIR = DATA_DIR / "dev"
 CAL_DIR = DATA_DIR / "cal"
 VAL_DIR = DATA_DIR / "val"
 
-#============================================================#
-# Helper Functions
-#============================================================#
+##############################################################################
+#============================================================================#
+# 2) Helper Functions
+#============================================================================#
+##############################################################################
+
+################################################
+#===== Section 1: Shared Helper Functions =====#
+################################################
+# Used across more than one processing step below, not specific to a single one.
 
 def create_file_system():
     """
@@ -56,6 +69,113 @@ def create_file_system():
     CAL_DIR.mkdir(parents=True, exist_ok=True)
     VAL_DIR.mkdir(parents=True, exist_ok=True)
 
+def study_areas_io(mode, gdf=None, base_path=None):
+    """
+    Splits a GeoDataFrame into a gpkg (geometry + scalar columns) and a JSON file (the list/dict
+    columns gpkg can't store), or reconstructs it from both files. Rows are matched by a dedicated
+    "uid" column generated fresh on every write, rather than by index or "location" (which isn't
+    guaranteed unique), so the two files can never get mismatched against each other.
+
+    Arguments:
+        mode -- string, "write" to split and save gdf, "read" to load and recombine
+        gdf -- geopandas.GeoDataFrame, required when mode is "write"; the frame to split and save
+        base_path -- path (str or Path) without extension, the shared filename stem for both files
+
+    Returns:
+        result -- on "write": None, writes base_path.gpkg and base_path_complex.json to disk.
+                  on "read": geopandas.GeoDataFrame, the recombined frame
+    """
+    base_path = Path(base_path)
+    gpkg_path = base_path.with_suffix(".gpkg")
+    json_path = base_path.parent / f"{base_path.stem}_complex.json"
+    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", "gse_tiles_by_year", "large_bbox"]
+
+    if mode == "write":
+        gdf = gdf.copy()
+        gdf["uid"] = range(len(gdf))
+
+        existing_complex_cols = [c for c in complex_cols if c in gdf.columns]
+        gdf.drop(columns=existing_complex_cols).to_file(gpkg_path, driver="GPKG")
+        gdf[["uid"] + existing_complex_cols].to_json(json_path, orient="records")
+
+    elif mode == "read":
+        simple_gdf = gpd.read_file(gpkg_path)
+        complex_df = pd.read_json(json_path, orient="records")
+        return simple_gdf.merge(complex_df, on="uid", how="left")
+
+    else:
+        raise ValueError(f"mode must be 'write' or 'read', got {mode!r}")
+
+def pull_data_by_url(url, out_dir, file):
+    """
+    Streams a URL's response body to a file, used for any plain-HTTP download (station list,
+    GNSS time series, AlphaEarth tiles, ...).
+
+    Arguments:
+        url -- string, the URL to download
+        out_dir -- Path, the directory to save into
+        file -- string, the filename to save as
+
+    Returns:
+        file_path -- string, the full path the file was saved to (out_dir / file)
+    """
+    # Downloading the station list or other resources from NGL
+    with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            file_path = out_dir / file
+            with open(file_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+    return str(file_path)
+
+################################################
+#====== Section 2: EGMS Download Helpers ======#
+################################################
+# Used by download_egms, in the order they're first called there.
+
+def point_to_bbox(row, t2projected, t2wgs84, source_crs):
+    """
+    Builds a lon/lat bounding box around a point by offsetting it west/east/north/south by the row's margins.
+
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with a Point geometry and numeric west/east/north/south margins (km)
+        t2projected -- pyproj.Transformer, transforms the point's CRS to a metric CRS
+        t2wgs84 -- pyproj.Transformer, transforms that metric CRS to EPSG:4326
+        source_crs -- the row's actual CRS; if "EPSG:3035" the point is used as-is, otherwise t2projected is applied
+
+    Returns:
+        bbox -- list of [lon, lat] pairs, the four corners in order top-left, bottom-left, bottom-right, top-right
+    """
+
+    if source_crs == "EPSG:3035":
+        x, y = row.geometry.x, row.geometry.y      # already projected, no transform needed
+    else:
+        x, y = t2projected.transform(row.geometry.x, row.geometry.y)   # e.g. EPSG:4326 -> EPSG:3035
+
+    west = row["west"] * 1000
+    north = row["north"] * 1000
+    east = row["east"] * 1000
+    south = row["south"] * 1000
+
+    # compute the min/max values
+    top_left_x = x - west
+    top_left_y = y + north
+
+    top_right_x = x + east
+    top_right_y = y + north
+
+    bottom_left_x = x - west
+    bottom_left_y = y - south
+
+    bottom_right_x = x + east
+    bottom_right_y = y - south
+
+    tl_lon, tl_lat = t2wgs84.transform(top_left_x, top_left_y)
+    tr_lon, tr_lat = t2wgs84.transform(top_right_x, top_right_y)
+    bl_lon, bl_lat = t2wgs84.transform(bottom_left_x, bottom_left_y)
+    br_lon, br_lat = t2wgs84.transform(bottom_right_x, bottom_right_y)
+
+    return [[tl_lon, tl_lat], [bl_lon, bl_lat], [br_lon, br_lat], [tr_lon, tr_lat]]
 
 def get_access_token(token_path):
     """
@@ -83,44 +203,6 @@ def get_access_token(token_path):
     access_token_info_json = result.json()
     access_token = access_token_info_json.get('access_token')
     return access_token
-
-def point_to_bbox(row, t2projected, t2wgs84, source_crs):
-    """
-    Builds a lon/lat bounding box around a point by offsetting it west/east/north/south by the row's margins.
-
-    Arguments:
-        row -- pandas.Series, a GeoDataFrame row with a Point geometry and numeric west/east/north/south margins (km)
-        t2projected -- pyproj.Transformer, transforms the point's CRS to a metric CRS
-        t2wgs84 -- pyproj.Transformer, transforms that metric CRS to EPSG:4326
-
-    Returns:
-        bbox -- list of [lon, lat] pairs, the four corners in order top-left, bottom-left, bottom-right, top-right
-    """
-    
-    if source_crs == "EPSG:3035":
-        x, y = row.geometry.x, row.geometry.y      # already projected, no transform needed
-    else:
-        x, y = t2projected.transform(row.geometry.x, row.geometry.y)   # e.g. EPSG:4326 -> EPSG:3035
-
-    # compute the min/max values
-    top_left_x = x - (row["west"] * 1000)
-    top_left_y = y + (row["north"] * 1000)
-
-    top_right_x = x + (row["east"] * 1000)
-    top_right_y = y + (row["north"] * 1000)
-
-    bottom_left_x = x - (row["west"] * 1000)
-    bottom_left_y = y - (row["south"] * 1000)
-
-    bottom_right_x = x + (row["east"] * 1000)
-    bottom_right_y = y - (row["south"] * 1000)
-
-    tl_lon, tl_lat = t2wgs84.transform(top_left_x, top_left_y)
-    tr_lon, tr_lat = t2wgs84.transform(top_right_x, top_right_y)
-    bl_lon, bl_lat = t2wgs84.transform(bottom_left_x, bottom_left_y)
-    br_lon, br_lat = t2wgs84.transform(bottom_right_x, bottom_right_y)
-
-    return [[tl_lon, tl_lat], [bl_lon, bl_lat], [br_lon, br_lat], [tr_lon, tr_lat]]
 
 def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
     """
@@ -152,7 +234,7 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
         links.append(link)
 
     return result, links
-    
+
 
 def pull_egms(row, headers, orbit):
     """
@@ -164,7 +246,7 @@ def pull_egms(row, headers, orbit):
         orbit -- string, orbit direction to keep, e.g. "ascending" or "descending"
 
     Returns:
-        None -- writes the downloaded files to disk under TRAIN_DIR, DEV_DIR or VAL_DIR
+        return_path -- string, the location-level folder the files were saved under (TRAIN_DIR, DEV_DIR, CAL_DIR or VAL_DIR / location)
     """
     # build a Polygon to compare with to filter out the best relative orbit.
     study_area = Polygon(row["bbox"])
@@ -185,7 +267,7 @@ def pull_egms(row, headers, orbit):
     )
     hits, links = zip(*by_rel_orbit[best_rel_orbit])
 
-    # some of the real subsidence areas go into training but some also go into validation 
+    # some of the real subsidence areas go into training but some also go into validation
     # the set variable decides into which region the data goes
     # Generally:  0 = train    1 = dev   2 = cal   3 = val
     if row["set"] == 0:
@@ -266,17 +348,41 @@ def closest_city_name(row, reverser):
     address = location.raw.get("address", {}) if location else {}
     return address.get("city") or address.get("town") or address.get("village")
 
-def pull_data_by_url(url, out_dir, file):
-    # Downloading the station list or other resources from NGL
-    with requests.get(url, stream=True) as r:
-            r.raise_for_status()
-            file_path = out_dir / file
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
-    return str(file_path)
+def unzip(data_dir):
+    """
+    Extracts every zip found under a directory (recursively) into its own folder, then deletes the zip.
+
+    Arguments:
+        data_dir -- path (str or Path), root directory to search for "*.zip" files in
+
+    Returns:
+        None -- extracts files to disk and removes the original zips
+    """
+    # finding all the zips upfront and putting into a list
+    zips = list(Path(data_dir).rglob("*.zip"))
+    # iterate over the zip paths that were found
+    for zip_path in zips:
+        # open the zips, extract them and remove the original files
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(zip_path.parent)
+        zip_path.unlink()
+
+################################################
+#====== Section 3: GNSS Download Helpers ======#
+################################################
+# Used by download_gnss, in the order they're first called there.
 
 def stations_in_bbox(row, stations):
+    """
+    Returns the 4-digit station codes ("Sta") of the GNSS stations within a row's bbox polygon.
+
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
+        stations -- geopandas.GeoDataFrame, station points with a "Sta" column, same CRS as the bbox
+
+    Returns:
+        station_codes_within -- list of strings, the "Sta" codes of stations within the bbox
+    """
     # create a polygon from the bbox col
     bbox = Polygon(row["bbox"])
     # .within returns boolean, so selection on stations first
@@ -286,6 +392,16 @@ def stations_in_bbox(row, stations):
     return station_codes_within
 
 def pull_stations_in_bbox_data(row):
+    """
+    Downloads the GNSS time series (plate-fixed Eurasia frame) for every station code in a row's
+    station_codes, into the row's location folder.
+
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with station_codes and path
+
+    Returns:
+        ts_file_paths -- list of strings, local file paths of the downloaded time series
+    """
     # base url for the Eurasia fixed time series
     base_url = "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/EU/"    #<ssss>.<plate>.tenv3
     # empty list to catch the paths to the gnss files
@@ -301,49 +417,69 @@ def pull_stations_in_bbox_data(row):
 
     return ts_file_paths
 
-def study_areas_io(mode, gdf=None, base_path=None):
+#################################################
+#======= Section 4: GSE Download Helpers =======#
+#################################################
+# Used by download_gse, in the order they're first called there (bbox_per_csv and gs_uri_to_https
+# are placed right before the function that calls them: large_bbox and pull_gse_data).
+
+def bbox_per_csv(csv_file):
     """
-    Splits a GeoDataFrame into a gpkg (geometry + scalar columns) and a JSON file (the list/dict
-    columns gpkg can't store), or reconstructs it from both files. Rows are matched by a dedicated
-    "uid" column generated fresh on every write, rather than by index or "location" (which isn't
-    guaranteed unique), so the two files can never get mismatched against each other.
+    Computes the axis-aligned bounding box of the easting/northing points in one EGMS csv.
 
     Arguments:
-        mode -- string, "write" to split and save gdf, "read" to load and recombine
-        gdf -- geopandas.GeoDataFrame, required when mode is "write"; the frame to split and save
-        base_path -- path (str or Path) without extension, the shared filename stem for both files
+        csv_file -- path (str or Path) to the EGMS csv, with easting and northing columns (EPSG:3035, metres)
 
     Returns:
-        result -- on "write": None, writes base_path.gpkg and base_path_complex.json to disk.
-                  on "read": geopandas.GeoDataFrame, the recombined frame
+        bbox -- shapely.geometry.Polygon, rectangle covering the min/max easting and northing of the file
     """
-    base_path = Path(base_path)
-    gpkg_path = base_path.with_suffix(".gpkg")
-    json_path = base_path.parent / f"{base_path.stem}_complex.json"
-    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", "gse_tiles_by_year"]
+    # lazy computation of the relevant columns min and max values
+    # .collect() does the actual computation
+    # returns a one row df which is turned into a dict using .row(0, named=True)
+    crs_cols = pl.scan_csv(csv_file).select(pl.col("easting").min().alias("min_easting"),
+                                            pl.col("easting").max().alias("max_easting"),
+                                            pl.col("northing").min().alias("min_northing"),
+                                            pl.col("northing").max().alias("max_northing")).collect().row(0, named=True)
 
-    if mode == "write":
-        gdf = gdf.copy()
-        gdf["uid"] = range(len(gdf))
+    bbox = box(crs_cols["min_easting"], crs_cols["min_northing"],
+               crs_cols["max_easting"], crs_cols["max_northing"])
 
-        existing_complex_cols = [c for c in complex_cols if c in gdf.columns]
-        gdf.drop(columns=existing_complex_cols).to_file(gpkg_path, driver="GPKG")
-        gdf[["uid"] + existing_complex_cols].to_json(json_path, orient="records")
+    return bbox
 
-    elif mode == "read":
-        simple_gdf = gpd.read_file(gpkg_path)
-        complex_df = pd.read_json(json_path, orient="records")
-        return simple_gdf.merge(complex_df, on="uid", how="left")
+def large_bbox(row):
+    """
+    Computes the smallest rectangle spanning the union of all downloaded burst footprints (both
+    orbit directions) for a study area, so GSE/ESA WorldCover downloads cover more than the
+    narrow query bbox -- enough to support points queried later, not just the original margins.
 
-    else:
-        raise ValueError(f"mode must be 'write' or 'read', got {mode!r}")
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with path (the location folder containing
+            ascending/ and descending/ subfolders of downloaded, unzipped EGMS csvs)
+
+    Returns:
+        corners -- list of [lon, lat] pairs, the four corners, same format as the bbox column
+    """
+    # computes the footprint for every csv in the two orbit folders per location
+    bboxes = []
+    for folder in ["ascending", "descending"]:
+        csvs = (Path(row["path"]) / folder).glob("*.csv")
+        for csv_path in csvs:
+            # A list with all the individual bbox is created
+            bboxes.append(bbox_per_csv(csv_path))
+
+    # The union over the bboxes and their envelope
+    envelope = union_all(bboxes).envelope
+    # Transform to lat/lon. Index df for the gse data is also in lat/lon
+    poly_4326 = gpd.GeoSeries([envelope], crs="EPSG:3035").to_crs("EPSG:4326").iloc[0]
+    # Return it in the same format as the point_to_bbox function
+    return [[x, y] for x, y in list(poly_4326.exterior.coords)[:-1]]
 
 def load_gse_index(index_url):
     """
     Loads the AlphaEarth tile index into a GeoDataFrame, geometry from its WKT column.
 
     Arguments:
-        index_url_or_path -- the local path (or, if you download it once, a URL) to aef_index.csv
+        index_url -- URL to download the aef_index.csv tile index from
 
     Returns:
         index_gdf -- geopandas.GeoDataFrame, one row per tile, with year/utm_zone/path/geometry
@@ -358,19 +494,19 @@ def load_gse_index(index_url):
 
 def tiles_for_row(row, index_gdf, years):
     """
-    Finds which AlphaEarth tiles intersect a study-area row's bbox, for a set of years.
+    Finds which AlphaEarth tiles intersect a study-area row's large_bbox, grouped by year.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
+        row -- pandas.Series, a GeoDataFrame row with a large_bbox field (list of [lon, lat] corners)
         index_gdf -- geopandas.GeoDataFrame, the loaded tile index (see load_gse_index)
         years -- iterable of ints, which years to keep (e.g. range(2019, 2024) for the 5-year EGMS window)
 
     Returns:
-        matches -- geopandas.GeoDataFrame, the index rows (tiles) that intersect the bbox, for those years
+        tiles_by_year -- dict, {year: [tile_dict, ...]} -- only years with at least one matching tile appear
     """
 
     # First we build a Polygon from the bbox column
-    bbox = Polygon(row["bbox"])
+    bbox = Polygon(row["large_bbox"])
     # Filtering the index gdf based on the wanted years first because that is cheap operation
     index_gdf = index_gdf[index_gdf["year"].isin(years)]
     # Now find all tiles that intersect with the bounding box
@@ -400,15 +536,13 @@ def gs_uri_to_https(gs_uri):
 
 def pull_gse_data(row):
     """
-    Downloads every AlphaEarth tile covering a study-area row, for the given years, into its folder.
+    Downloads every AlphaEarth tile listed in a study-area row's gse_tiles_by_year, into its folder.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with bbox, path and location
-        index_gdf -- geopandas.GeoDataFrame, the loaded tile index
-        years -- iterable of ints, which years to download
+        row -- pandas.Series, a GeoDataFrame row with path and gse_tiles_by_year (see tiles_for_row)
 
     Returns:
-        tile_paths -- list of strings, local file paths of everything downloaded for this row
+        None -- downloads each tile to Path(row["path"]), with the year prefixed onto its filename
     """
 
     out_dir = Path(row["path"])
@@ -418,10 +552,11 @@ def pull_gse_data(row):
             filename = f"{year}_{Path(tile['path']).name}"   # prefixes the year, since the tile name alone doesn't carry it
             pull_data_by_url(url, out_dir, filename)
 
-
-#============================================================#
-# Processing
-#============================================================#
+##############################################################################
+#============================================================================#
+# 3) Processing
+#============================================================================#
+##############################################################################
 
 def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, maxit_rnd, real_sub_buffer_value = 400000):
     """
@@ -437,7 +572,8 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
         maxit_rnd -- int, upper bound on sampling attempts for the random points
 
     Returns:
-        None -- downloads files under TRAIN_DIR/DEV_DIR/VAL_DIR
+        study_areas_gdf -- geopandas.GeoDataFrame, the real subsidence regions plus the randomly
+            sampled regions combined (EPSG:3035), with bbox/query_results/download_links/path set
     """
 
     ################################################
@@ -503,6 +639,9 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random["path"] = egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
     egms_random["path"] = egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
 
+    # Unzipping the egms zip files for later use
+    unzip(DATA_DIR)
+
     # Now concattenating both gdfs. This gdf is representative for the entire study area.
     # First making sure they are both in the same crs
     real_subsidence = real_subsidence.to_crs("EPSG:3035")
@@ -517,13 +656,14 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
 def download_gnss(study_areas_gdf):
     """
-    Downloads GNSS station time series for the validation areas. Not implemented yet.
+    Finds the GNSS stations within each validation region's bbox and downloads their time series,
+    leaving station_codes/station_file_paths as None for train/dev/cal regions.
 
     Arguments:
-        None
+        study_areas_gdf -- geopandas.GeoDataFrame, from download_egms, with bbox/location/set/path
 
     Returns:
-        None
+        study_areas_gdf -- the same GeoDataFrame, with station_codes and station_file_paths added
     """
     # Creating a col for the station codes. Only the val regions shall receive a valid entry
     # For the train and dev regions this stays None
@@ -564,14 +704,20 @@ def download_gnss(study_areas_gdf):
 
 def download_gse(study_areas_gdf, years):
     """
-    Downloads Google satellite embeddings covering the train/dev/val areas. Not implemented yet.
+    Downloads the AlphaEarth satellite embedding tiles covering every study area's large_bbox
+    (the union of its downloaded burst footprints, not just the narrow query bbox), for every
+    requested year.
 
     Arguments:
-        None
+        study_areas_gdf -- geopandas.GeoDataFrame, from download_egms/download_gnss, with path set
+        years -- iterable of ints, which years to download (e.g. [2019, 2020, 2021, 2022, 2023])
 
     Returns:
-        None
+        study_areas_gdf -- the same GeoDataFrame, with large_bbox and gse_tiles_by_year added
     """
+
+    # Computing the larger bbox for the covariates on the dataframe
+    study_areas_gdf["large_bbox"] = study_areas_gdf.apply(large_bbox, axis=1)
 
     # First download the index dataframe that contains information about the gse tiles and years
     # index_gdf is the raw index_gdf only filtered by the years that are relevant here
@@ -589,7 +735,8 @@ def download_gse(study_areas_gdf, years):
 
 def download_esa_worldcover():
     """
-    Downloads miscellaneous auxiliary data, e.g. country boundaries. Not implemented yet.
+    Downloads ESA WorldCover land-cover tiles covering every study area's large_bbox. Not
+    implemented yet -- will reuse the same large_bbox column download_gse computes.
 
     Arguments:
         None
@@ -600,13 +747,16 @@ def download_esa_worldcover():
     pass
 
 
-#============================================================#
-# Main
-#============================================================#
+##############################################################################
+#============================================================================#
+# 4) Main
+#============================================================================#
+##############################################################################
 
 def main():
     """
-    Checks the required input files exist, sets up the project's file system, and runs the EGMS download.
+    Checks the required input files exist, sets up the project's file system, and runs the
+    EGMS, GNSS and GSE downloads in sequence.
 
     Arguments:
         None
