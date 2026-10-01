@@ -6,6 +6,12 @@ token.jwt
 assets/plots/
 *.err
 *.out
+tutorial/oop_tutorial.ipynb 
+tutorial/empty_scripts/oop_tutorial.ipynb
+dummy_study_areas_gdf_complex.json
+dummy_study_areas_gdf.gpkg
+gnss_station_list.txt
+gse_index_file.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

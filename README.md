@@ -47,6 +47,6 @@ Currently only the download stage is implemented; later stages follow the plan i
 | `project.md` | Design document and thesis plan |
 | `scripts/` | Pipeline code (`python/`) and SLURM jobs (`slurm/`) |
 | `assets/` | Study regions and EGMS coverage boundaries |
-| `tutorial/` | Learning notebooks: PyTorch Geometric, OOP |
+| `tutorial/` | Learning notebooks: PyTorch Geometric |
 
 License: see [`LICENSE`](LICENSE).

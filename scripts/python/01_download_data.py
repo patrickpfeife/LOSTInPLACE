@@ -31,6 +31,7 @@ DATA_DIR = PROJECT_DIR / "data"
 # For the data split between training, dev and validation regions
 TRAIN_DIR = DATA_DIR / "train"
 DEV_DIR = DATA_DIR / "dev"
+CAL_DIR = DATA_DIR / "cal"
 VAL_DIR = DATA_DIR / "val"
 
 #============================================================#
@@ -52,6 +53,7 @@ def create_file_system():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TRAIN_DIR.mkdir(parents=True, exist_ok=True)
     DEV_DIR.mkdir(parents=True, exist_ok=True)
+    CAL_DIR.mkdir(parents=True, exist_ok=True)
     VAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -185,13 +187,19 @@ def pull_egms(row, headers, orbit):
 
     # some of the real subsidence areas go into training but some also go into validation 
     # the set variable decides into which region the data goes
-    # Generally:  0 = train    1 = dev   2 = val
+    # Generally:  0 = train    1 = dev   2 = cal   3 = val
     if row["set"] == 0:
-        save_path = TRAIN_DIR / row["location"] / str(orbit)
+        return_path = TRAIN_DIR / row["location"]
+        save_path = return_path / str(orbit)
     elif row["set"] == 1:
-        save_path = DEV_DIR / row["location"] / str(orbit)
+        return_path = DEV_DIR / row["location"]
+        save_path = return_path  / str(orbit)
     elif row["set"] == 2:
-        save_path = VAL_DIR / row["location"] / str(orbit)
+        return_path = CAL_DIR / row["location"]
+        save_path = return_path / str(orbit)
+    elif row["set"] == 3:
+            return_path = VAL_DIR / row["location"]
+            save_path = return_path / str(orbit)
     else:
         raise ValueError("Not all rows have regions assigned!")
 
@@ -205,6 +213,8 @@ def pull_egms(row, headers, orbit):
             with open(save_path / filename, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
+
+    return str(return_path)
 
 
 def sample_random_points(polygon, n_points, min_dist, max_attempts, crs=None):
@@ -256,6 +266,158 @@ def closest_city_name(row, reverser):
     address = location.raw.get("address", {}) if location else {}
     return address.get("city") or address.get("town") or address.get("village")
 
+def pull_data_by_url(url, out_dir, file):
+    # Downloading the station list or other resources from NGL
+    with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            file_path = out_dir / file
+            with open(file_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+    return str(file_path)
+
+def stations_in_bbox(row, stations):
+    # create a polygon from the bbox col
+    bbox = Polygon(row["bbox"])
+    # .within returns boolean, so selection on stations first
+    # then return them as list to be added as col in the gdf
+    station_codes_within = stations.loc[stations.within(bbox), "Sta"].tolist()
+
+    return station_codes_within
+
+def pull_stations_in_bbox_data(row):
+    # base url for the Eurasia fixed time series
+    base_url = "https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/EU/"    #<ssss>.<plate>.tenv3
+    # empty list to catch the paths to the gnss files
+    ts_file_paths = []
+    # loop over all stations that were found within that region
+    for station_code in row["station_codes"]:
+       # create individual url for every station
+       url = f"{base_url}{station_code}.EU.tenv3"
+       # reuse the download function
+       ts_file_path = pull_data_by_url(url, Path(row["path"]), f"{str(station_code)}_gnss_time_series.tenv3")
+       # catch the file paths to fill a new dataframe column
+       ts_file_paths.append(ts_file_path)
+
+    return ts_file_paths
+
+def study_areas_io(mode, gdf=None, base_path=None):
+    """
+    Splits a GeoDataFrame into a gpkg (geometry + scalar columns) and a JSON file (the list/dict
+    columns gpkg can't store), or reconstructs it from both files. Rows are matched by a dedicated
+    "uid" column generated fresh on every write, rather than by index or "location" (which isn't
+    guaranteed unique), so the two files can never get mismatched against each other.
+
+    Arguments:
+        mode -- string, "write" to split and save gdf, "read" to load and recombine
+        gdf -- geopandas.GeoDataFrame, required when mode is "write"; the frame to split and save
+        base_path -- path (str or Path) without extension, the shared filename stem for both files
+
+    Returns:
+        result -- on "write": None, writes base_path.gpkg and base_path_complex.json to disk.
+                  on "read": geopandas.GeoDataFrame, the recombined frame
+    """
+    base_path = Path(base_path)
+    gpkg_path = base_path.with_suffix(".gpkg")
+    json_path = base_path.parent / f"{base_path.stem}_complex.json"
+    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", "gse_tiles_by_year"]
+
+    if mode == "write":
+        gdf = gdf.copy()
+        gdf["uid"] = range(len(gdf))
+
+        existing_complex_cols = [c for c in complex_cols if c in gdf.columns]
+        gdf.drop(columns=existing_complex_cols).to_file(gpkg_path, driver="GPKG")
+        gdf[["uid"] + existing_complex_cols].to_json(json_path, orient="records")
+
+    elif mode == "read":
+        simple_gdf = gpd.read_file(gpkg_path)
+        complex_df = pd.read_json(json_path, orient="records")
+        return simple_gdf.merge(complex_df, on="uid", how="left")
+
+    else:
+        raise ValueError(f"mode must be 'write' or 'read', got {mode!r}")
+
+def load_gse_index(index_url):
+    """
+    Loads the AlphaEarth tile index into a GeoDataFrame, geometry from its WKT column.
+
+    Arguments:
+        index_url_or_path -- the local path (or, if you download it once, a URL) to aef_index.csv
+
+    Returns:
+        index_gdf -- geopandas.GeoDataFrame, one row per tile, with year/utm_zone/path/geometry
+    """
+    # download the index file
+    index_file_path = pull_data_by_url(index_url, Path(__file__).parent / "../../assets/", "gse_index_file.csv"  )
+    # read the csv file and build geodata from wkt column
+    index_file_df = pd.read_csv(index_file_path, sep=",")
+    index_gdf = gpd.GeoDataFrame(index_file_df, geometry=gpd.GeoSeries.from_wkt(index_file_df["WKT"]), crs="EPSG:4326")
+
+    return index_gdf
+
+def tiles_for_row(row, index_gdf, years):
+    """
+    Finds which AlphaEarth tiles intersect a study-area row's bbox, for a set of years.
+
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
+        index_gdf -- geopandas.GeoDataFrame, the loaded tile index (see load_gse_index)
+        years -- iterable of ints, which years to keep (e.g. range(2019, 2024) for the 5-year EGMS window)
+
+    Returns:
+        matches -- geopandas.GeoDataFrame, the index rows (tiles) that intersect the bbox, for those years
+    """
+
+    # First we build a Polygon from the bbox column
+    bbox = Polygon(row["bbox"])
+    # Filtering the index gdf based on the wanted years first because that is cheap operation
+    index_gdf = index_gdf[index_gdf["year"].isin(years)]
+    # Now find all tiles that intersect with the bounding box
+    tiles = index_gdf[index_gdf.intersects(bbox)]
+
+    # Returning a dictionary to be able to add the years to the file names to make them distinguishable
+    tiles_by_year = {}
+    for year, group in tiles.drop(columns="geometry").groupby("year"):
+        tiles_by_year[year] = group.to_dict("records")
+
+    return tiles_by_year
+
+def gs_uri_to_https(gs_uri):
+    """
+    Converts a gs://bucket/key URI to its public HTTPS equivalent for plain download.
+
+    Arguments:
+        gs_uri -- string, e.g. "gs://alphaearth_foundations/satellite_embedding/v1/annual/2019/31N/x....tiff"
+
+    Returns:
+        https_url -- string, e.g. "https://storage.googleapis.com/alphaearth_foundations/..."
+    """
+
+    without_prefix = gs_uri.removeprefix("gs://")
+    bucket, key = without_prefix.split("/", 1)
+    return f"https://storage.googleapis.com/{bucket}/{key}"
+
+def pull_gse_data(row):
+    """
+    Downloads every AlphaEarth tile covering a study-area row, for the given years, into its folder.
+
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with bbox, path and location
+        index_gdf -- geopandas.GeoDataFrame, the loaded tile index
+        years -- iterable of ints, which years to download
+
+    Returns:
+        tile_paths -- list of strings, local file paths of everything downloaded for this row
+    """
+
+    out_dir = Path(row["path"])
+    for year, tiles in row["gse_tiles_by_year"].items():
+        for tile in tiles:
+            url = gs_uri_to_https(tile["path"])
+            filename = f"{year}_{Path(tile['path']).name}"   # prefixes the year, since the tile name alone doesn't carry it
+            pull_data_by_url(url, out_dir, filename)
+
 
 #============================================================#
 # Processing
@@ -302,9 +464,9 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     # Download the products with filter before
     # the set variable decides into which region the data goes
-    # Generally:  0 = train    1 = dev   2 = val
-    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
-    real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
+    # Generally:  0 = train    1 = dev   2 = cal   3 = val
+    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
+    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
 
     ################################################
     #=== Section 2: The Normal Training Regions ===#
@@ -325,7 +487,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random["east"] = 25
     egms_random["south"] = 25
     egms_random["west"] = 25
-    egms_random["set"] = np.random.default_rng(42).choice([0, 1], size=len(egms_random), p=[0.8, 0.2]) 
+    egms_random["set"] = np.random.default_rng(42).choice([0, 1, 2], size=len(egms_random), p=[0.6, 0.2, 0.2]) 
 
     # setting up the geopy functionality to determine the closest city
     geolocator = Nominatim(user_agent="lostinplace_thesis")
@@ -338,8 +500,8 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random[["query_results", "download_links"]] = egms_random.apply(query_egms, axis=1, headers=headers, result_type = "expand")
     
     # downloading the egms data for the new areas
-    egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
-    egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
+    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
+    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
 
     # Now concattenating both gdfs. This gdf is representative for the entire study area.
     # First making sure they are both in the same crs
@@ -347,32 +509,13 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random = egms_random.to_crs("EPSG:3035")
 
     study_areas_gdf = pd.concat([real_subsidence, egms_random])
-    study_areas_gdf.to_file(Path(__file__).parent / "../../assets/study_areas_gdf.gpkg", driver="gpkg")
 
+    study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
+    
     return study_areas_gdf
 
 
-    # current state:
-    # for all real subsidence areas, egms data was downloaded but not unpacked yet.
-    # Some of them went into train and some into val as specified in the set column of the df.
-    # 1) Generate random points with minimum distance to the center point of the real subsidence areas.
-    # 2) Download egms for those regions as well. 
-
-    # Next steps:
-    # 3) run the unzip and and cover area functions on the complete egms downloads(in 02_preprocessing)
-    # 4) Download GNSS for all validation areas (the point_to_bbox will be used herefor)
-    # 5) ensure that enough GNSS stations are there and time series are of good quality. (checked)
-    # 6) Download google satellite embeddings covering all the areas in train, dev and val
-
-    # !!! for the GNSS sites: ascending and descending must overlap!!!
-    # this should be ensured: all overlapping products are downloaded and in the preprocessing
-    # cropped to the areas. So every GNSS site should be covered by two orbits.
-
-    
-
-
-
-def download_gnss():
+def download_gnss(study_areas_gdf):
     """
     Downloads GNSS station time series for the validation areas. Not implemented yet.
 
@@ -382,9 +525,44 @@ def download_gnss():
     Returns:
         None
     """
-    pass
+    # Creating a col for the station codes. Only the val regions shall receive a valid entry
+    # For the train and dev regions this stays None
+    study_areas_gdf["station_codes"] = None
 
-def download_gse():
+    # pull the list of all stations
+    gnss_station_list_path = pull_data_by_url("https://geodesy.unr.edu/NGLStationPages/DataHoldings.txt", 
+                            out_dir=Path(__file__).parent / "../../assets/",
+                            file="gnss_station_list.txt")
+
+    # Reading the whole station list from the path returned by pull_data_by_url above
+    station_list = pd.read_csv(gnss_station_list_path, sep=r"\s+", parse_dates=["Dtbeg", "Dtend", "Dtmod"], usecols=range(11))
+    # Adjust the longitude from 360 to -180/+180 convention
+    station_list["Long(deg)"] = station_list["Long(deg)"].mask(station_list["Long(deg)"] > 180, station_list["Long(deg)"] - 360)
+    # creating a geometry column
+    station_list["geometry"] = gpd.points_from_xy(station_list["Long(deg)"], station_list["Lat(deg)"])
+    # create a gdf from those points for further analysis
+    stations = gpd.GeoDataFrame(station_list, geometry= "geometry" , crs="EPSG:4326")
+
+    # Creating a mask to apply station_codes_in_bbox only to the validation regions
+    val_mask = study_areas_gdf["set"] == 3
+    # apply the function and write the result back into the val row, leaving None for train/dev
+    study_areas_gdf.loc[val_mask, "station_codes"] = study_areas_gdf.loc[val_mask].apply(
+        stations_in_bbox, axis=1, stations=stations)
+
+    ##########################################################
+    # Now downloading the actual time series
+
+    # Again only compute on the validation areas
+    study_areas_gdf["station_file_paths"] = None
+    study_areas_gdf.loc[val_mask, "station_file_paths"] = study_areas_gdf.loc[val_mask].apply(
+            pull_stations_in_bbox_data, axis=1)
+
+    # Saving the updated geodataframe
+    study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
+        
+    return study_areas_gdf
+
+def download_gse(study_areas_gdf, years):
     """
     Downloads Google satellite embeddings covering the train/dev/val areas. Not implemented yet.
 
@@ -394,9 +572,22 @@ def download_gse():
     Returns:
         None
     """
-    pass
 
-def download_miscellaneous():
+    # First download the index dataframe that contains information about the gse tiles and years
+    # index_gdf is the raw index_gdf only filtered by the years that are relevant here
+    index_gdf = load_gse_index("https://storage.googleapis.com/alphaearth_foundations/satellite_embedding/v1/annual/aef_index.csv")
+
+    # This adds the tiles per year as a new column to the gdf
+    study_areas_gdf["gse_tiles_by_year"] = study_areas_gdf.apply(tiles_for_row, axis=1, index_gdf=index_gdf, years=years)
+
+    # Downloading the tiles into the location folder with year prefixes in filenames
+    study_areas_gdf.apply(pull_gse_data, axis=1)
+
+    study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
+
+    return study_areas_gdf
+
+def download_esa_worldcover():
     """
     Downloads miscellaneous auxiliary data, e.g. country boundaries. Not implemented yet.
 
@@ -439,10 +630,15 @@ def main():
     study_areas_gdf = download_egms(Path(__file__).parent / "../../assets/real_subsidence_pointbased.gpkg", 
                         Path(__file__).parent / "../../assets/token.jwt",
                         Path(__file__).parent / "../../assets/egms_coverage_countries.geojson",
-                        real_sub_buffer_value = 400000,
-                        n_rnd=25, mindist_rnd=200000, maxit_rnd=200)
-    ##############################
-    # Pre-Processing the data
+                        real_sub_buffer_value = 150000,
+                        n_rnd=35, mindist_rnd=150000, maxit_rnd=200)
+    
+    # Use the dataframe of the regions for which egms was downloaded to select and download
+    # the GNSS stations and time series.
+    study_areas_gdf = download_gnss(study_areas_gdf)
+
+    # download google satellite embeddings for every region
+    study_areas_gdf = download_gse(study_areas_gdf, [2019, 2020, 2021, 2022, 2023])
 
 
 if __name__ == '__main__':

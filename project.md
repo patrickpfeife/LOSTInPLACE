@@ -186,6 +186,8 @@ Over the rest of Europe, place **random burst-anchor points** with a **minimum s
 
 Within each selected burst, sample **target points stratified by dominant land-cover class** (use CORINE or ESA WorldCover). Draw roughly equal numbers per class per burst, again respecting the minimum-distance constraint. This avoids area-proportional bias and ensures the model sees forests, urban, agricultural, shrub, etc., equally.
 
+**Pipeline staging note:** this step happens later than Steps 1–2, at graph-generation/training-sampling time — not during the raw EGMS acquisition step (`01_download_data.py` only downloads full-burst products for each anchor; it doesn't yet pick individual target points). Land-cover data isn't downloaded yet either (§9's `download_miscellaneous` stub). Don't read Step 3's absence from the acquisition script as a gap in that script — it's scoped for a later step in the pipeline (the same place §3's actual point/graph sampling for training happens).
+
 **Why this hybrid?** Handpicking ensures rare-but-important processes (mining, peat) are represented and held out for testing. Random draw with stratification ensures broad coverage and fair representation of conditions. Together, you sample the "condition space," not just the "area space."
 
 ### 4.4 Neighbourhood radius and min-distance
@@ -549,7 +551,7 @@ Apply this to **aleatoric and epistemic separately**, so the split survives into
 3. Compute the `(1 - α)`-quantile of residuals, call it `q` (e.g., α = 0.1 → 90% coverage target, q = quantile at 0.9).
 4. At inference, scale intervals: `CI = [mu - q*sigma, mu + q*sigma]`
 
-**Distance-binned calibration** (optional, stronger):
+**Distance-binned calibration — flagged as a major planned addition, not just an option.** A single global `q` only guarantees *marginal* coverage: it necessarily trades away accuracy in both directions — needlessly wide intervals in dense, well-supported areas, and (the dangerous failure mode) falsely narrow intervals in sparse or far-extrapolated areas, exactly where "query anywhere" is being trusted most. Binning `q` by `distance_to_nearest_coherent` fixes this by giving each distance regime its own calibrated interval width, closer to true *conditional* coverage instead of only marginal coverage — directly analogous to how classical kriging variance already grows with distance from data, just derived empirically instead of from an assumed covariance model. Defer implementing this until the base single-`q` pipeline (train → calibrate → test) is working end to end, then revisit — the two later parameters to decide then are bin edges and how many calibration points land in each bin (too many bins against a limited calibration set gives noisy per-bin quantiles).
 ```python
 # Bin calibration residuals by distance_to_nearest_coherent
 dist_bins = [0, 500, 1000, 2000, 5000, np.inf]  # metres
