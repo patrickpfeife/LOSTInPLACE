@@ -88,7 +88,7 @@ def study_areas_io(mode, gdf=None, base_path=None):
     base_path = Path(base_path)
     gpkg_path = base_path.with_suffix(".gpkg")
     json_path = base_path.parent / f"{base_path.stem}_complex.json"
-    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", "gse_tiles_by_year", "large_bbox"]
+    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", "gse_tiles_by_year", "large_bbox", "world_cover_tile_urls"]
 
     if mode == "write":
         gdf = gdf.copy()
@@ -492,7 +492,7 @@ def load_gse_index(index_url):
 
     return index_gdf
 
-def tiles_for_row(row, index_gdf, years):
+def tiles_for_row_gse(row, index_gdf, years):
     """
     Finds which AlphaEarth tiles intersect a study-area row's large_bbox, grouped by year.
 
@@ -539,7 +539,7 @@ def pull_gse_data(row):
     Downloads every AlphaEarth tile listed in a study-area row's gse_tiles_by_year, into its folder.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with path and gse_tiles_by_year (see tiles_for_row)
+        row -- pandas.Series, a GeoDataFrame row with path and gse_tiles_by_year (see tiles_for_row_gse)
 
     Returns:
         None -- downloads each tile to Path(row["path"]), with the year prefixed onto its filename
@@ -551,6 +551,39 @@ def pull_gse_data(row):
             url = gs_uri_to_https(tile["path"])
             filename = f"{year}_{Path(tile['path']).name}"   # prefixes the year, since the tile name alone doesn't carry it
             pull_data_by_url(url, out_dir, filename)
+
+##################################################
+#======= Section 5: ESA Worldcover Helper =======#
+##################################################
+
+def pull_worldcover(row, index_gdf):
+    """
+    Finds the ESA WorldCover (v200, 2021) tiles intersecting a study-area row's large_bbox and
+    downloads each one into the row's location folder.
+
+    Arguments:
+        row -- pandas.Series, a GeoDataFrame row with large_bbox and path
+        index_gdf -- geopandas.GeoDataFrame, the WorldCover tile grid, with an "ll_tile" column
+            (see download_esa_worldcover)
+
+    Returns:
+        tile_urls -- list of strings, the download URL of every tile that intersects the row
+    """
+    # First we build a Polygon from the bbox column
+    bbox = Polygon(row["large_bbox"])
+    # Find all tiles that intersect with that large bbox per location
+    tiles = index_gdf[index_gdf.intersects(bbox)]
+    # extract only the tile codes in that column to build the download urls for that tile
+    tile_codes = tiles["ll_tile"]
+    tile_urls = []
+    for tile_code in tile_codes:
+        url = f"https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_{tile_code}_Map.tif"
+        tile_urls.append(url)
+    # Pull the tiles reusing pull_data_by_url
+    for tile_url in tile_urls:
+        pull_data_by_url(tile_url, Path(row["path"]), Path(tile_url).name)
+
+    return tile_urls
 
 ##############################################################################
 #============================================================================#
@@ -724,7 +757,7 @@ def download_gse(study_areas_gdf, years):
     index_gdf = load_gse_index("https://storage.googleapis.com/alphaearth_foundations/satellite_embedding/v1/annual/aef_index.csv")
 
     # This adds the tiles per year as a new column to the gdf
-    study_areas_gdf["gse_tiles_by_year"] = study_areas_gdf.apply(tiles_for_row, axis=1, index_gdf=index_gdf, years=years)
+    study_areas_gdf["gse_tiles_by_year"] = study_areas_gdf.apply(tiles_for_row_gse, axis=1, index_gdf=index_gdf, years=years)
 
     # Downloading the tiles into the location folder with year prefixes in filenames
     study_areas_gdf.apply(pull_gse_data, axis=1)
@@ -733,19 +766,26 @@ def download_gse(study_areas_gdf, years):
 
     return study_areas_gdf
 
-def download_esa_worldcover():
+def download_esa_worldcover(study_areas_gdf, index_url):
     """
-    Downloads ESA WorldCover land-cover tiles covering every study area's large_bbox. Not
-    implemented yet -- will reuse the same large_bbox column download_gse computes.
+    Downloads the ESA WorldCover (v200, 2021) tiles covering every study area's large_bbox,
+    reusing the same large_bbox column download_gse computes.
 
     Arguments:
-        None
+        study_areas_gdf -- geopandas.GeoDataFrame, from download_gse, with large_bbox and path set
+        index_url -- URL to download the WorldCover tile grid geojson from
 
     Returns:
-        None
+        None -- study_areas_gdf is updated and saved in place, not returned
     """
-    pass
+    index_path = pull_data_by_url(index_url, Path(__file__).parent / "../../assets/", "esa_world_cover_index.geojson")
 
+    index_gdf = gpd.read_file(index_path)
+
+    study_areas_gdf["world_cover_tile_urls"] = study_areas_gdf.apply(pull_worldcover, axis=1, index_gdf=index_gdf)
+
+    study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
+    
 
 ##############################################################################
 #============================================================================#
@@ -789,6 +829,9 @@ def main():
 
     # download google satellite embeddings for every region
     study_areas_gdf = download_gse(study_areas_gdf, [2019, 2020, 2021, 2022, 2023])
+
+    # Download the ESA world cover for later land use stratification
+    download_esa_worldcover(study_areas_gdf, index_url="https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/esa_worldcover_grid.geojson")
 
 
 if __name__ == '__main__':
