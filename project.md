@@ -147,11 +147,11 @@ Verified against EGMS's own `los_*` columns: agreement to 6e-4. The asc/desc sig
 | Source | Use | Format | Notes |
 |---|---|---|---|
 | EGMS L2b LOS | Training | CSV per burst (lat, lon, time series) | Both orbits; separate files |
-| DEM (e.g., GEBCO / SRTM30) | Predictors | GeoTIFF, EPSG:3035 unified grid | Slope derived from DEM |
-| Hydrogeology / Aquifer maps | Predictors | GeoTIFF or polygon (proximity) | BGR / state geological surveys; EU WFD data |
-| AlphaEarth Foundations embeddings | Predictors | Analysis-ready 64-dim annual rasters | Google Cloud Storage / Earth Engine; CC-BY 4.0; "provider-pays" egress |
+| AlphaEarth Foundations embeddings (GSE) | **Sole covariate source, for now** | Analysis-ready 64-dim annual rasters, int8-quantised | Google Cloud Storage, anonymous HTTPS, "provider-pays" egress, CC-BY 4.0. Downloaded **cropped to each study area's achieved bbox via windowed COG reads**, not full tiles — a full tile is ~4.3 GB (8192×8192 px × 64 bands), a typical region's window is ~200 MB. De-quantise with `x = ((v/127.5)**2) * np.sign(v)` (unit-length output, verified). |
+| ESA WorldCover (v200, 2021) | **Sampling stratification only — not a model covariate.** Used for §4.3 Step 3's land-cover-stratified target sampling. | 10 m GeoTIFF, EPSG:4326, tiled per 3°×3° | Also a proper COG (confirmed: internally tiled, 6-level overview pyramid) — same windowed-read approach as AlphaEarth applies, and the savings are proportionally similar (~95 MB full tile vs. ~2 MB for a typical region's window). |
+| DEM, Hydrogeology / Aquifer maps | **Deprioritised for now** | — | Originally planned as predictors (see git history for the original table). Not currently being pursued; AlphaEarth is the only covariate source until/unless this is revisited. |
 | Viewing geometry (incidence, track angle) | Decomposition | Per-point columns in the LOS input itself | **No separate raster/metadata dependency** — derived analytically per (track, sub-swath), see §3.7 |
-| GNSS (EPN / EUREF / national CORS) | Validation only | Time series, velocity + epoch series | Never training. Reserve validation regions with GNSS. |
+| GNSS (EPN / EUREF / national CORS, via Nevada Geodetic Laboratory) | Validation only | `.tenv3` time series, EU-fixed (plate-fixed Eurasia) frame | Never training. Reserve validation regions with GNSS. Use the `IGS20/tenv3/EU/` tree, not `IGS14` — both resolve but are different reference-frame realisations; IGS20 is current. |
 
 ### 4.2 Coordinate system & distances
 
@@ -186,7 +186,7 @@ Over the rest of Europe, place **random burst-anchor points** with a **minimum s
 
 Within each selected burst, sample **target points stratified by dominant land-cover class** (use CORINE or ESA WorldCover). Draw roughly equal numbers per class per burst, again respecting the minimum-distance constraint. This avoids area-proportional bias and ensures the model sees forests, urban, agricultural, shrub, etc., equally.
 
-**Pipeline staging note:** this step happens later than Steps 1–2, at graph-generation/training-sampling time — not during the raw EGMS acquisition step (`01_download_data.py` only downloads full-burst products for each anchor; it doesn't yet pick individual target points). Land-cover data isn't downloaded yet either (§9's `download_miscellaneous` stub). Don't read Step 3's absence from the acquisition script as a gap in that script — it's scoped for a later step in the pipeline (the same place §3's actual point/graph sampling for training happens).
+**Pipeline staging note:** the actual stratified *sampling* happens later than Steps 1–2, at graph-generation/training-sampling time — not during the raw EGMS acquisition step (`01_download_data.py` only downloads full-burst products for each anchor; it doesn't yet pick individual target points). The land-cover *data* itself is now downloaded during acquisition, though (`download_esa_worldcover`, cropped per study area via windowed COG reads) — so by the time Step 3 is actually implemented, the WorldCover tiles it needs will already be sitting in each region's folder. Don't read Step 3's absence from the acquisition script as a gap in that script — only the sampling logic is scoped for later, not the data itself.
 
 **Why this hybrid?** Handpicking ensures rare-but-important processes (mining, peat) are represented and held out for testing. Random draw with stratification ensures broad coverage and fair representation of conditions. Together, you sample the "condition space," not just the "area space."
 
@@ -210,6 +210,8 @@ Set **min_distance ≥ 1.5 × neighbourhood_radius** to guarantee targets don't 
 
 The split is **geographic**: train blocks are spatially far from test blocks, so a test point's neighbours are in train, not in test. This prevents "leakage" where a test sample's ground truth is hidden from the model but its neighbourhood is known.
 
+**Current implementation uses four groups, not three** — `01_download_data.py`'s `set` column is train / dev / cal / val (0/1/2/3), mapping onto this section as: `cal` = this section's **Calibration**, `val` = this section's **Test**. `dev` is an addition beyond this original plan — a fourth, separately held-out group, kept deliberately distinct from `cal` so that whatever `dev` ends up used for (e.g. iteration/sanity-checking during pipeline development) can never leak into the conformal-calibration guarantee the way it would if the two were merged (see §6.5's train/calibrate/test independence argument — the same reasoning applies a level up, to the splits themselves). `val`/test is drawn only from the handpicked real-subsidence regions, never the random background points, since GNSS validation (§8.1 Tier 2) needs a real named region with actual nearby GNSS stations, not an arbitrary anchor.
+
 ### 4.6 Global normalization (on train split only)
 
 Compute standardization statistics (mean, std) for all features **across the entire train split**, treating all bursts as one pool:
@@ -221,18 +223,23 @@ Apply these same scalers uniformly at inference. **Never compute stats on test o
 
 ### 4.7 Handling EGMS L2b CSV structure
 
-EGMS CSVs typically have columns like:
+EGMS L2b CSVs actually have columns like (verified against real downloaded files, not the product spec):
 ```
-latitude, longitude, t_YYYY_MM_DD_1, t_YYYY_MM_DD_2, ..., t_YYYY_MM_DD_N
+pid, mp_type, latitude, longitude, easting, northing, height, height_wgs84, line, pixel,
+rmse, temporal_coherence, amplitude_dispersion, incidence_angle, track_angle,
+los_east, los_north, los_up, mean_velocity, mean_velocity_std, acceleration, acceleration_std,
+seasonality, seasonality_std, 20190101, 20190107, 20190113, ..., 20231224
 ```
+Date columns are plain 8-digit `YYYYMMDD` strings, **not** prefixed with `t_`. `rmse`/`temporal_coherence`/`amplitude_dispersion`/`mp_type` are the per-point quality fields to filter/flag on before basis-fitting (§3.5); `incidence_angle`/`track_angle`/`los_*` are the §3.7 viewing-geometry columns, already present, no separate raster needed.
 
 **Loading:**
 ```python
 import pandas as pd, numpy as np
 df = pd.read_csv("burst_id.csv")
-epochs_raw = [parse_date(col) for col in df.columns if col.startswith("t_")]
-los = df[[f"t_{e}" for e in epochs_raw]].values  # (N_points, T_raw)
-xy = np.c_[df["longitude"], df["latitude"]]
+date_cols = [c for c in df.columns if c.isdigit() and len(c) == 8]
+epochs_raw = [pd.to_datetime(c, format="%Y%m%d") for c in date_cols]
+los = df[date_cols].values  # (N_points, T_raw), cumulative displacement in mm
+xy = np.c_[df["longitude"], df["latitude"]]  # or use easting/northing (EPSG:3035) directly, already provided
 ```
 
 Then project to EPSG:3035 and fit the temporal basis.

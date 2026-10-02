@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import zipfile
+import rasterio
+import argparse
 
 from pathlib import Path
 from pyproj import Transformer
@@ -25,20 +27,7 @@ from shapely import union_all
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from shapely.geometry import box
-
-##############################################################################
-#============================================================================#
-# 2) Define Global Variables
-#============================================================================#
-##############################################################################
-
-PROJECT_DIR = Path("/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE")
-DATA_DIR = PROJECT_DIR / "data"
-# For the data split between training, dev and validation regions
-TRAIN_DIR = DATA_DIR / "train"
-DEV_DIR = DATA_DIR / "dev"
-CAL_DIR = DATA_DIR / "cal"
-VAL_DIR = DATA_DIR / "val"
+from rasterio.mask import mask as rio_mask
 
 ##############################################################################
 #============================================================================#
@@ -88,7 +77,8 @@ def study_areas_io(mode, gdf=None, base_path=None):
     base_path = Path(base_path)
     gpkg_path = base_path.with_suffix(".gpkg")
     json_path = base_path.parent / f"{base_path.stem}_complex.json"
-    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", "gse_tiles_by_year", "large_bbox", "world_cover_tile_urls"]
+    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", 
+                    "gse_tiles_by_year", "gse_crop_paths", "large_bbox", "world_cover_tile_urls"]
 
     if mode == "write":
         gdf = gdf.copy()
@@ -296,12 +286,20 @@ def pull_egms(row, token_path, orbit):
     # creating the directory where the data goes
     save_path.mkdir(parents=True, exist_ok=True)
 
-    for hit,link in zip(hits, links):
-        # egms access token needs to be renewed regularly since only valid for one hour
-        # otherwise it expires and download breaks down in the middle
-        access_token = get_access_token(token_path)
-        headers = {"Authorization" : f"Bearer {access_token}", "Accept" : "application/json"}
-         
+    # fetch a token once before the loop, and remember when
+    access_token = get_access_token(token_path)
+    token_issued_at = time.time()
+
+    for hit, link in zip(hits, links):
+        # how many seconds old the current token is
+        token_age = time.time() - token_issued_at
+        # tokens are valid for 60 min; refresh once we're within 10 min of that to be safe
+        if token_age > 50 * 60:
+            access_token = get_access_token(token_path)
+            token_issued_at = time.time()
+
+        headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
         filename = hit["filename"]
         with requests.get(link, headers=headers, stream=True) as r:
             r.raise_for_status()
@@ -547,23 +545,47 @@ def gs_uri_to_https(gs_uri):
     bucket, key = without_prefix.split("/", 1)
     return f"https://storage.googleapis.com/{bucket}/{key}"
 
-def pull_gse_data(row):
+
+def crop_gse_data(row):
     """
-    Downloads every AlphaEarth tile listed in a study-area row's gse_tiles_by_year, into its folder.
+    Crops every AlphaEarth tile covering a study-area row's large_bbox directly over HTTPS
+    (COG range reads -- no full-tile download), saving only the needed pixels per tile/year.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with path and gse_tiles_by_year (see tiles_for_row_gse)
+        row -- pandas.Series, a GeoDataFrame row with path and gse_tiles_by_year
 
     Returns:
-        None -- downloads each tile to Path(row["path"]), with the year prefixed onto its filename
+        crop_paths -- list of strings, local file paths of the cropped GeoTIFFs written for this row
     """
-
     out_dir = Path(row["path"])
+    crop_paths = []
+
     for year, tiles in row["gse_tiles_by_year"].items():
         for tile in tiles:
             url = gs_uri_to_https(tile["path"])
-            filename = f"{year}_{Path(tile['path']).name}"   # prefixes the year, since the tile name alone doesn't carry it
-            pull_data_by_url(url, out_dir, filename)
+            with rasterio.open(url) as src:
+                # Reproject the study area's bbox into this tile's own CRS -- rio_mask needs
+                # the geometry in the same CRS as the raster, not lon/lat.
+                bbox_poly = gpd.GeoSeries([Polygon(row["large_bbox"])], crs="EPSG:4326").to_crs(tile["crs"]).iloc[0]
+
+                try:
+                    # Does the intersection + windowed read + crop in one call: reads only
+                    # the pixels covering bbox_poly (not the whole tile), and returns them
+                    # already cropped, along with the correct transform for just this crop.
+                    data, out_transform = rio_mask(src, [bbox_poly], crop=True)
+                except ValueError:
+                    # Raised when bbox_poly doesn't overlap this tile at all.
+                    continue
+
+                profile = src.profile.copy()
+                profile.update(height=data.shape[1], width=data.shape[2], transform=out_transform)
+
+            crop_path = out_dir / f"{year}_{Path(tile['path']).stem}_crop.tif"
+            with rasterio.open(crop_path, "w", **profile) as dst:
+                dst.write(data)
+            crop_paths.append(str(crop_path))
+
+    return crop_paths
 
 ##################################################
 #======= Section 5: ESA Worldcover Helper =======#
@@ -746,16 +768,17 @@ def download_gnss(study_areas_gdf):
 
 def download_gse(study_areas_gdf, years):
     """
-    Downloads the AlphaEarth satellite embedding tiles covering every study area's large_bbox
-    (the union of its downloaded burst footprints, not just the narrow query bbox), for every
-    requested year.
+    Crops the AlphaEarth satellite embedding tiles covering every study area's large_bbox (the
+    union of its downloaded burst footprints, not just the narrow query bbox), for every
+    requested year -- read directly over HTTPS (COG range reads), without downloading whole tiles.
 
     Arguments:
         study_areas_gdf -- geopandas.GeoDataFrame, from download_egms/download_gnss, with path set
         years -- iterable of ints, which years to download (e.g. [2019, 2020, 2021, 2022, 2023])
 
     Returns:
-        study_areas_gdf -- the same GeoDataFrame, with large_bbox and gse_tiles_by_year added
+        study_areas_gdf -- the same GeoDataFrame, with large_bbox, gse_tiles_by_year and
+            gse_crop_paths added
     """
 
     # Computing the larger bbox for the covariates on the dataframe
@@ -769,7 +792,7 @@ def download_gse(study_areas_gdf, years):
     study_areas_gdf["gse_tiles_by_year"] = study_areas_gdf.apply(tiles_for_row_gse, axis=1, index_gdf=index_gdf, years=years)
 
     # Downloading the tiles into the location folder with year prefixes in filenames
-    study_areas_gdf.apply(pull_gse_data, axis=1)
+    study_areas_gdf["gse_crop_paths"] = study_areas_gdf.apply(crop_gse_data, axis=1)
 
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
 
@@ -802,10 +825,10 @@ def download_esa_worldcover(study_areas_gdf, index_url):
 #============================================================================#
 ##############################################################################
 
-def main():
+def main(real_sub_buffer_value, n_rnd, mindist_rnd, maxit_rnd):
     """
     Checks the required input files exist, sets up the project's file system, and runs the
-    EGMS, GNSS and GSE downloads in sequence.
+    EGMS, GNSS, GSE and ESA WorldCover downloads in sequence.
 
     Arguments:
         None
@@ -829,8 +852,8 @@ def main():
     study_areas_gdf = download_egms(Path(__file__).parent / "../../assets/real_subsidence_pointbased.gpkg", 
                         Path(__file__).parent / "../../assets/token.jwt",
                         Path(__file__).parent / "../../assets/egms_coverage_countries.geojson",
-                        real_sub_buffer_value = 150000,
-                        n_rnd=35, mindist_rnd=150000, maxit_rnd=200)
+                        real_sub_buffer_value = real_sub_buffer_value,
+                        n_rnd=n_rnd, mindist_rnd=mindist_rnd, maxit_rnd=maxit_rnd)
     
     # Use the dataframe of the regions for which egms was downloaded to select and download
     # the GNSS stations and time series.
@@ -844,4 +867,29 @@ def main():
 
 
 if __name__ == '__main__':
-    main() 
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--projectdir", required=True)
+    parser.add_argument("--real_sub_buffer_value", required=True)
+    parser.add_argument("--n_rnd", required=True)
+    parser.add_argument("--mindist_rnd", required=True)
+    parser.add_argument("--maxit_rnd", required=True)
+
+    args = parser.parse_args()
+
+    REAL_SUB_BUFFER_VALUE = int(args.real_sub_buffer_value)
+    N_RND = int(args.n_rnd)
+    MINDIST_RND = int(args.mindist_rnd)
+    MAXIT_RND = int(args.maxit_rnd)
+
+    PROJECT_DIR = Path(args.projectdir)
+    DATA_DIR = PROJECT_DIR / "data"
+    # For the data split between training, dev and validation regions
+    TRAIN_DIR = DATA_DIR / "train"
+    DEV_DIR = DATA_DIR / "dev"
+    CAL_DIR = DATA_DIR / "cal"
+    VAL_DIR = DATA_DIR / "val"
+
+    main(real_sub_buffer_value = REAL_SUB_BUFFER_VALUE,
+          n_rnd=N_RND, mindist_rnd=MINDIST_RND, maxit_rnd=MAXIT_RND) 
