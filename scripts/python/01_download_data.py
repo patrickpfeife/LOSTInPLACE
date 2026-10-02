@@ -204,19 +204,25 @@ def get_access_token(token_path):
     access_token = access_token_info_json.get('access_token')
     return access_token
 
-def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
+def query_egms(row, token_path, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
     """
     Searches the EGMS archive for products overlapping a row's bbox and builds the download link for each hit.
 
     Arguments:
         row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
-        headers -- dict, HTTP headers including the bearer Authorization token
+        token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
+            a fresh access token for this request (tokens expire after 1 hour, so a new one is
+            fetched per call rather than reusing one across the whole run)
         api_endpoint -- string, base URL of the EGMS API
 
     Returns:
         result -- dict, the raw JSON search result returned by the API
         links -- list of strings, one download link per hit in result["hits"]
     """
+    # Creating the access token fresh regularly is better since it expires after one hour
+    access_token = get_access_token(token_path)
+    headers = {"Authorization" : f"Bearer {access_token}", "Accept" : "application/json"}
+     
     query = {"id": None,
          "bbox": row["bbox"],
          "levels" : ["L2B"],
@@ -236,13 +242,15 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
     return result, links
 
 
-def pull_egms(row, headers, orbit):
+def pull_egms(row, token_path, orbit):
     """
     Picks the relative orbit (of a given direction) whose bursts overlap the study area most, then downloads its files.
 
     Arguments:
         row -- pandas.Series, a GeoDataFrame row with bbox, query_results, download_links, location and set
-        headers -- dict, HTTP headers including the bearer Authorization token
+        token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
+            a fresh access token before every file download (tokens expire after 1 hour, and a
+            single row's files can take longer than that to all download)
         orbit -- string, orbit direction to keep, e.g. "ascending" or "descending"
 
     Returns:
@@ -289,8 +297,13 @@ def pull_egms(row, headers, orbit):
     save_path.mkdir(parents=True, exist_ok=True)
 
     for hit,link in zip(hits, links):
-         filename = hit["filename"]
-         with requests.get(link, headers=headers, stream=True) as r:
+        # egms access token needs to be renewed regularly since only valid for one hour
+        # otherwise it expires and download breaks down in the middle
+        access_token = get_access_token(token_path)
+        headers = {"Authorization" : f"Bearer {access_token}", "Accept" : "application/json"}
+         
+        filename = hit["filename"]
+        with requests.get(link, headers=headers, stream=True) as r:
             r.raise_for_status()
             with open(save_path / filename, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -624,18 +637,14 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
     real_subsidence["bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=real_subsidence.crs)
 
-    # get the access token for the egms api
-    access_token = get_access_token(token_path)
-    headers = {"Authorization" : f"Bearer {access_token}", "Accept" : "application/json"}
-
     # query the archive for overlapping bursts
-    real_subsidence[["query_results", "download_links"]] = real_subsidence.apply(query_egms, axis=1, headers=headers, result_type = "expand")
+    real_subsidence[["query_results", "download_links"]] = real_subsidence.apply(query_egms, axis=1, token_path=token_path, result_type = "expand")
 
     # Download the products with filter before
     # the set variable decides into which region the data goes
     # Generally:  0 = train    1 = dev   2 = cal   3 = val
-    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
-    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
+    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending")
+    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending")
 
     ################################################
     #=== Section 2: The Normal Training Regions ===#
@@ -666,11 +675,11 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     # Creating the bbox and querying the archive on the random point samples
     egms_random["bbox"] = egms_random.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=egms_random.crs)
-    egms_random[["query_results", "download_links"]] = egms_random.apply(query_egms, axis=1, headers=headers, result_type = "expand")
+    egms_random[["query_results", "download_links"]] = egms_random.apply(query_egms, axis=1, token_path=token_path, result_type = "expand")
     
     # downloading the egms data for the new areas
-    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "ascending")
-    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, headers=headers, orbit = "descending")
+    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending")
+    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending")
 
     # Unzipping the egms zip files for later use
     unzip(DATA_DIR)
