@@ -9,17 +9,9 @@
 
 import argparse 
 
-##############################################################################
-#============================================================================#
-# 2) Define Global Variables
-#============================================================================#
-##############################################################################
 
-parser = argparse.ArgumentParser()
 
-parser.add_argument("--datadir", required=True)
 
-args = parser.parse_args()
 
 
 
@@ -34,7 +26,7 @@ args = parser.parse_args()
 ################################################
 #===== Section 1: Shared Helper Functions =====#
 ################################################
-
+"""
 2. What preprocessing needs to handle
 Grounding this in what project.md actually specifies for this stage, roughly in the order it'd naturally happen:
 
@@ -54,86 +46,74 @@ A sanity check on the split's geography, not just its labels. §4.5 wants train 
 
 Decide the output shape. Everything above collapses into one decision: what does a finished, per-point record actually look like (pid, projected coordinates, basis coefficients, predictor values, quality flags, split label), and in what file format — given hundreds of thousands of points per region, this is the first point where Parquet (you've already got polars) is probably worth it over CSV.
 
-
-
-
-
-
-
-
-#============================================================#
-# Helper Functions
-#============================================================#
-
-def bbox_per_csv(csv_file):
-    """Compute the axis-aligned bounding box of the easting/northing points in one EGMS csv.
-
-    Args:
-        csv_file (str or Path): path to the EGMS csv, with `easting` and `northing` columns (EPSG:3035, metres).
-    Returns:
-        shapely.geometry.Polygon: rectangle covering the min/max easting and northing of the file.
-    """
-    # lazy computation of the relevant columns min and max values
-    # .collect() does the actual computation
-    # returns a one row df which is turned into a dict using .row(0, named=True)
-    crs_cols = pl.scan_csv(csv_file).select(pl.col("easting").min().alias("min_easting"),
-                                            pl.col("easting").max().alias("max_easting"),
-                                            pl.col("northing").min().alias("min_northing"),
-                                            pl.col("northing").max().alias("max_northing")).collect().row(0, named=True)
-
-    bbox = box(crs_cols["min_easting"], crs_cols["min_northing"], 
-               crs_cols["max_easting"], crs_cols["max_northing"])
-
-    return bbox
-
-def bbox_envelope(individual_bboxes):
-    """Merge a folder's per-csv bounding boxes into one geometry and write it to a gpkg in that folder.
-
-    Args:
-        individual_bboxes (list[shapely.geometry.Polygon]): bounding boxes from bbox_per_csv, in EPSG:3035.
-        folder (Path): folder to write "covered_area.gpkg" into (the folder the csvs came from).
-    Returns:
-        None. Writes "covered_area.gpkg" to `folder`.
-    """
-    # takes a list of bboxes from individual egms csv downloads
-    # and returns the union of them
-    union = union_all(individual_bboxes)
-    union = gpd.GeoDataFrame(geometry=[union], crs="EPSG:3035")
-    
-
-
-
-
-#============================================================#
-# Processing
-#============================================================#
-
-
 # remember to crop the egms coverage to the actual bounding box defined. otherwise, too much surrounding 
 # points with barely any real displacement will be introduced through the regions that are actually just 
 # supposed to cover the real subsidence
 
-unzip(data_dir)
+"""
 
-    # {} creates a set which removes duplicates. So for a folder with 6 csvs, the path is collected only once
-    csv_folder = {p.parent for p in Path(data_dir).rglob("*.csv")}
+################################################
+#====== Section 2: EGMS Helper Functions ======#
+################################################  
 
-    for folder in csv_folder:
-        csvs = folder.glob("*.csv")
-        bboxes = []
-        for csv_path in csvs:
-            bboxes.append(bbox_per_csv(csv_path))
-        bbox_union(bboxes, folder)
+################################################
+#====== Section 3: GNSS Helper Functions ======#
+################################################
+
+#################################################
+#======= Section 4: GSE Helper Functions =======#
+#################################################
+
+#################################################
+#===== Section 5: ESA10wc Helper Functions =====#
+#################################################
 
 
-#============================================================#
-# Main
-#============================================================#
+
+
+##############################################################################
+#============================================================================#
+# 3) Processing
+#============================================================================#
+##############################################################################
+
+def preprocess_egms():
+    pass
+
+def preprocess_gnss():
+    pass
+
+def preprocess_gse():
+    pass
+
+def preprocess_esa10mwc():
+    pass
+
+
+##############################################################################
+#============================================================================#
+# 4) Main
+#============================================================================#
+##############################################################################
 
 def main():
 
+    preprocess_egms()
+
+    preprocess_gnss()
+
+    preprocess_gse()
+
+    preprocess_esa10mwc()
 
 
 if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--datadir", required=True)
+
+    args = parser.parse_args()
+
     main() 
 

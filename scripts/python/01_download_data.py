@@ -45,7 +45,7 @@ def create_file_system():
     Creates the project's directory tree (data, train, dev, val) under PROJECT_DIR if it doesn't exist yet.
 
     Arguments:
-        None -- uses the global PROJECT_DIR / DATA_DIR / TRAIN_DIR / DEV_DIR / VAL_DIR paths
+        None -- uses the global PROJECT_DIR / DATA_DIR / TRAIN_DIR / DEV_DIR / CAL_DIR / VAL_DIR paths
 
     Returns:
         None -- creates the folders on disk as a side effect
@@ -77,7 +77,8 @@ def study_areas_io(mode, gdf=None, base_path=None):
     base_path = Path(base_path)
     gpkg_path = base_path.with_suffix(".gpkg")
     json_path = base_path.parent / f"{base_path.stem}_complex.json"
-    complex_cols = ["bbox", "query_results", "download_links", "station_codes", "station_file_paths", 
+
+    complex_cols = ["bbox", "station_codes", "station_file_paths", 
                     "gse_tiles_by_year", "gse_crop_paths", "large_bbox", "world_cover_tile_urls"]
 
     if mode == "write":
@@ -96,6 +97,39 @@ def study_areas_io(mode, gdf=None, base_path=None):
     else:
         raise ValueError(f"mode must be 'write' or 'read', got {mode!r}")
 
+def requests_get(url, part_file_path, file_path, headers=None):
+    """
+    Streams a URL's response body to part_file_path, then renames it to file_path once the
+    download finished without error (so a crash mid-download leaves only the .part file behind).
+
+    Arguments:
+        url -- string, the URL to download
+        part_file_path -- Path, temporary path written to while streaming
+        file_path -- Path, final path part_file_path is renamed to on success
+        headers -- dict or None, request headers (e.g. EGMS bearer token); None for plain downloads
+
+    Returns:
+        None -- writes to disk and renames part_file_path to file_path as a side effect
+    """
+    if headers == None:
+        # Downloading the station list or other resources from NGL
+            with requests.get(url, stream=True) as r:
+                    r.raise_for_status()
+                    with open(part_file_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            f.write(chunk)
+                    
+            part_file_path.rename(file_path)
+    else:
+        with requests.get(url, headers=headers, stream=True) as r:
+            r.raise_for_status()
+            with open(part_file_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+
+        part_file_path.rename(file_path)
+
+
 def pull_data_by_url(url, out_dir, file):
     """
     Streams a URL's response body to a file, used for any plain-HTTP download (station list,
@@ -109,13 +143,17 @@ def pull_data_by_url(url, out_dir, file):
     Returns:
         file_path -- string, the full path the file was saved to (out_dir / file)
     """
-    # Downloading the station list or other resources from NGL
-    with requests.get(url, stream=True) as r:
-            r.raise_for_status()
-            file_path = out_dir / file
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
+    file_path = out_dir / file
+    part_file_path = out_dir / f"PART_{file}"
+
+    if part_file_path.exists():
+        part_file_path.unlink()
+        requests_get(url, part_file_path, file_path)
+    elif not file_path.exists():
+        requests_get(url, part_file_path, file_path)
+    else: 
+        pass
+
     return str(file_path)
 
 ################################################
@@ -194,25 +232,20 @@ def get_access_token(token_path):
     access_token = access_token_info_json.get('access_token')
     return access_token
 
-def query_egms(row, token_path, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
+def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
     """
     Searches the EGMS archive for products overlapping a row's bbox and builds the download link for each hit.
 
     Arguments:
         row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
-        token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
-            a fresh access token for this request (tokens expire after 1 hour, so a new one is
-            fetched per call rather than reusing one across the whole run)
+        headers -- dict, request headers carrying the bearer access token (see get_access_token)
         api_endpoint -- string, base URL of the EGMS API
 
     Returns:
         result -- dict, the raw JSON search result returned by the API
         links -- list of strings, one download link per hit in result["hits"]
     """
-    # Creating the access token fresh regularly is better since it expires after one hour
-    access_token = get_access_token(token_path)
-    headers = {"Authorization" : f"Bearer {access_token}", "Accept" : "application/json"}
-     
+    
     query = {"id": None,
          "bbox": row["bbox"],
          "levels" : ["L2B"],
@@ -237,7 +270,7 @@ def pull_egms(row, token_path, orbit):
     Picks the relative orbit (of a given direction) whose bursts overlap the study area most, then downloads its files.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with bbox, query_results, download_links, location and set
+        row -- pandas.Series, a GeoDataFrame row with bbox, location and set
         token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
             a fresh access token before every file download (tokens expire after 1 hour, and a
             single row's files can take longer than that to all download)
@@ -246,12 +279,19 @@ def pull_egms(row, token_path, orbit):
     Returns:
         return_path -- string, the location-level folder the files were saved under (TRAIN_DIR, DEV_DIR, CAL_DIR or VAL_DIR / location)
     """
-    # build a Polygon to compare with to filter out the best relative orbit.
-    study_area = Polygon(row["bbox"])
 
-    # keep only hits/links from the requested orbit direction
-    pairs = [(hit, link) for hit, link in zip(row["query_results"]["hits"], row["download_links"])
-             if hit["direction"] == orbit]
+    # Create an access token and note when it was generated (expires after one hour)
+    access_token = get_access_token(token_path)
+    token_issued_at = time.time()
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
+    # Call query egms once per line since the ids also expire
+    # Calling it once upfront on the entire df leads to expired ids once the download is actually performed
+    result, links = query_egms(row=row, headers=headers)
+
+    study_area = Polygon(row["bbox"])
+    pairs = [(hit, link) for hit, link in zip(result["hits"], links)
+                 if hit["direction"] == orbit]
 
     # group by relative orbit, aggregating all bursts of that relative orbit
     by_rel_orbit = {}
@@ -286,10 +326,6 @@ def pull_egms(row, token_path, orbit):
     # creating the directory where the data goes
     save_path.mkdir(parents=True, exist_ok=True)
 
-    # fetch a token once before the loop, and remember when
-    access_token = get_access_token(token_path)
-    token_issued_at = time.time()
-
     for hit, link in zip(hits, links):
         # how many seconds old the current token is
         token_age = time.time() - token_issued_at
@@ -300,12 +336,18 @@ def pull_egms(row, token_path, orbit):
 
         headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
 
-        filename = hit["filename"]
-        with requests.get(link, headers=headers, stream=True) as r:
-            r.raise_for_status()
-            with open(save_path / filename, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
+        # Checking whether a file already exists or not 
+        file_path = save_path / hit["filename"]
+        part_file_path = save_path / f"PART_{hit["filename"]}"
+        csv_path = save_path / f"{file_path.stem}.csv"
+
+        if part_file_path.exists():
+            part_file_path.unlink()
+            requests_get(link, part_file_path, file_path, headers=headers)
+        elif not (file_path.exists() or csv_path.exists()):
+            requests_get(link, part_file_path, file_path, headers=headers)
+        else:
+            pass
 
     return str(return_path)
 
@@ -545,6 +587,46 @@ def gs_uri_to_https(gs_uri):
     bucket, key = without_prefix.split("/", 1)
     return f"https://storage.googleapis.com/{bucket}/{key}"
 
+def pull_gse_tiles(part_crop_path, crop_path, tile, row):
+    """
+    Crops a single AlphaEarth tile to row's large_bbox via a remote windowed read and writes it
+    to part_crop_path, renaming to crop_path on success.
+
+    Arguments:
+        part_crop_path -- Path, temporary path written to while cropping
+        crop_path -- Path, final path part_crop_path is renamed to on success
+        tile -- dict, one tile record from the GSE index (path, crs, ...)
+        row -- pandas.Series, a GeoDataFrame row with a large_bbox field (list of [lon, lat] corners)
+
+    Returns:
+        result -- string, crop_path if the tile overlapped large_bbox and was written; None if
+            the tile didn't overlap (nothing is written in that case)
+    """
+    url = gs_uri_to_https(tile["path"])
+    with rasterio.open(url) as src:
+        # Reproject the study area's bbox into this tile's own CRS -- rio_mask needs
+        # the geometry in the same CRS as the raster, not lon/lat.
+        bbox_poly = gpd.GeoSeries([Polygon(row["large_bbox"])], crs="EPSG:4326").to_crs(tile["crs"]).iloc[0]
+    
+        try:
+            # Does the intersection + windowed read + crop in one call: reads only
+            # the pixels covering bbox_poly (not the whole tile), and returns them
+            # already cropped, along with the correct transform for just this crop.
+            data, out_transform = rio_mask(src, [bbox_poly], crop=True)
+        except ValueError:
+            # Raised when bbox_poly doesn't overlap this tile at all.
+            return None
+    
+        profile = src.profile.copy()
+        profile.update(height=data.shape[1], width=data.shape[2], transform=out_transform)
+    
+    with rasterio.open(part_crop_path, "w", **profile) as dst:
+        dst.write(data)
+
+    part_crop_path.rename(crop_path)
+
+    return str(crop_path)
+
 
 def crop_gse_data(row):
     """
@@ -557,33 +639,31 @@ def crop_gse_data(row):
     Returns:
         crop_paths -- list of strings, local file paths of the cropped GeoTIFFs written for this row
     """
+    # defining path for output directory and list that catches all the paths to the files
     out_dir = Path(row["path"])
     crop_paths = []
 
     for year, tiles in row["gse_tiles_by_year"].items():
         for tile in tiles:
-            url = gs_uri_to_https(tile["path"])
-            with rasterio.open(url) as src:
-                # Reproject the study area's bbox into this tile's own CRS -- rio_mask needs
-                # the geometry in the same CRS as the raster, not lon/lat.
-                bbox_poly = gpd.GeoSeries([Polygon(row["large_bbox"])], crs="EPSG:4326").to_crs(tile["crs"]).iloc[0]
-
-                try:
-                    # Does the intersection + windowed read + crop in one call: reads only
-                    # the pixels covering bbox_poly (not the whole tile), and returns them
-                    # already cropped, along with the correct transform for just this crop.
-                    data, out_transform = rio_mask(src, [bbox_poly], crop=True)
-                except ValueError:
-                    # Raised when bbox_poly doesn't overlap this tile at all.
-                    continue
-
-                profile = src.profile.copy()
-                profile.update(height=data.shape[1], width=data.shape[2], transform=out_transform)
-
+            # to check whether a file is already successfully downloaded, 
+            # a temporary filename and a final file name are defined
             crop_path = out_dir / f"{year}_{Path(tile['path']).stem}_crop.tif"
-            with rasterio.open(crop_path, "w", **profile) as dst:
-                dst.write(data)
-            crop_paths.append(str(crop_path))
+            part_crop_path = out_dir / f"PART_{year}_{Path(tile['path']).stem}_crop.tif"
+
+            # checking three scenarios: 1) only stale file exists  
+            if part_crop_path.exists():
+                part_crop_path.unlink()
+                r = pull_gse_tiles(part_crop_path, crop_path, tile, row)
+                if r is not None:
+                    crop_paths.append(r) 
+            # 2) file does not exist at all (has never been downloaded before)
+            elif not crop_path.exists():
+                r = pull_gse_tiles(part_crop_path, crop_path, tile, row)
+                if r is not None:
+                    crop_paths.append(r) 
+            # complete file exists
+            elif crop_path.exists(): 
+                crop_paths.append(str(crop_path))
 
     return crop_paths
 
@@ -641,7 +721,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     Returns:
         study_areas_gdf -- geopandas.GeoDataFrame, the real subsidence regions plus the randomly
-            sampled regions combined (EPSG:3035), with bbox/query_results/download_links/path set
+            sampled regions combined (EPSG:3035), with bbox and path set
     """
 
     ################################################
@@ -658,9 +738,6 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     t2projected = Transformer.from_crs(real_subsidence.crs, "EPSG:3035", always_xy=True)
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
     real_subsidence["bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=real_subsidence.crs)
-
-    # query the archive for overlapping bursts
-    real_subsidence[["query_results", "download_links"]] = real_subsidence.apply(query_egms, axis=1, token_path=token_path, result_type = "expand")
 
     # Download the products with filter before
     # the set variable decides into which region the data goes
@@ -697,7 +774,6 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     # Creating the bbox and querying the archive on the random point samples
     egms_random["bbox"] = egms_random.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=egms_random.crs)
-    egms_random[["query_results", "download_links"]] = egms_random.apply(query_egms, axis=1, token_path=token_path, result_type = "expand")
     
     # downloading the egms data for the new areas
     egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending")
@@ -831,7 +907,11 @@ def main(real_sub_buffer_value, n_rnd, mindist_rnd, maxit_rnd):
     EGMS, GNSS, GSE and ESA WorldCover downloads in sequence.
 
     Arguments:
-        None
+        real_sub_buffer_value -- float, buffer radius (metres) around each real subsidence point
+            excluded from random sampling (passed through to download_egms)
+        n_rnd -- int, number of extra random points to sample across the EGMS coverage area
+        mindist_rnd -- float, minimum distance (metres) required between the random points
+        maxit_rnd -- int, upper bound on sampling attempts for the random points
 
     Returns:
         None -- raises FileNotFoundError if the real subsidence file is missing
