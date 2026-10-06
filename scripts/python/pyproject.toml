@@ -8,7 +8,6 @@ dependencies = [
     "cartopy>=0.26.0",
     "cryptography>=50.0.1",
     "geopandas>=1.1.4",
-    "geopy>=2.5.0",
     "gstools>=1.7.0",
     "ipykernel>=7.3.0",
     "jupyter>=1.1.1",

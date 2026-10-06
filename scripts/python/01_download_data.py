@@ -24,8 +24,6 @@ from pathlib import Path
 from pyproj import Transformer
 from shapely.geometry import Polygon
 from shapely import union_all
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 from shapely.geometry import box
 from rasterio.mask import mask as rio_mask
 
@@ -42,7 +40,7 @@ from rasterio.mask import mask as rio_mask
 
 def create_file_system():
     """
-    Creates the project's directory tree (data, train, dev, val) under PROJECT_DIR if it doesn't exist yet.
+    Creates the project's directory tree (data, train, dev, cal, val) under PROJECT_DIR if it doesn't exist yet.
 
     Arguments:
         None -- uses the global PROJECT_DIR / DATA_DIR / TRAIN_DIR / DEV_DIR / CAL_DIR / VAL_DIR paths
@@ -74,22 +72,30 @@ def study_areas_io(mode, gdf=None, base_path=None):
         result -- on "write": None, writes base_path.gpkg and base_path_complex.json to disk.
                   on "read": geopandas.GeoDataFrame, the recombined frame
     """
+    # building the paths of the two files from the shared filename stem
     base_path = Path(base_path)
     gpkg_path = base_path.with_suffix(".gpkg")
     json_path = base_path.parent / f"{base_path.stem}_complex.json"
 
+    # the columns holding lists or dicts. gpkg can't store those, so they go into the json
     complex_cols = ["bbox", "station_codes", "station_file_paths", 
                     "gse_tiles_by_year", "gse_crop_paths", "large_bbox", "world_cover_tile_urls"]
 
     if mode == "write":
+        # work on a copy so the uid column doesn't end up in the gdf of the caller
         gdf = gdf.copy()
+        # fresh uid per row, to match the rows of both files again when reading
         gdf["uid"] = range(len(gdf))
 
+        # only the complex columns that exist already, since they get added step by step
         existing_complex_cols = [c for c in complex_cols if c in gdf.columns]
+        # everything but the complex columns goes into the gpkg
         gdf.drop(columns=existing_complex_cols).to_file(gpkg_path, driver="GPKG")
+        # the uid and the complex columns go into the json
         gdf[["uid"] + existing_complex_cols].to_json(json_path, orient="records")
 
     elif mode == "read":
+        # read both files and join them again via the uid column
         simple_gdf = gpd.read_file(gpkg_path)
         complex_df = pd.read_json(json_path, orient="records")
         return simple_gdf.merge(complex_df, on="uid", how="left")
@@ -101,6 +107,8 @@ def requests_get(url, part_file_path, file_path, headers=None):
     """
     Streams a URL's response body to part_file_path, then renames it to file_path once the
     download finished without error (so a crash mid-download leaves only the .part file behind).
+    If the server answers with an error status, a requests.exceptions.HTTPError is raised and
+    nothing is written. For downloads with headers (EGMS) the server's own message is printed first.
 
     Arguments:
         url -- string, the URL to download
@@ -114,19 +122,28 @@ def requests_get(url, part_file_path, file_path, headers=None):
     if headers == None:
         # Downloading the station list or other resources from NGL
             with requests.get(url, stream=True) as r:
+                    # stop here if the server answered with an error status
                     r.raise_for_status()
+                    # write the response to the temporary file in chunks of 1 MB
                     with open(part_file_path, "wb") as f:
                         for chunk in r.iter_content(chunk_size=1024 * 1024):
                             f.write(chunk)
                     
+            # download finished without error, so the temporary file gets its final name
             part_file_path.rename(file_path)
     else:
+        # Downloading from EGMS, the headers carry the access token
         with requests.get(url, headers=headers, stream=True) as r:
+            # raise_for_status only reports the status code, so print the server's own message first
+            if not r.ok:
+                print(f"Download failed [{r.status_code}] {url}\n    server response: {r.text[:500]}", flush=True)
             r.raise_for_status()
+            # write the response to the temporary file in chunks of 1 MB
             with open(part_file_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
 
+        # download finished without error, so the temporary file gets its final name
         part_file_path.rename(file_path)
 
 
@@ -143,14 +160,18 @@ def pull_data_by_url(url, out_dir, file):
     Returns:
         file_path -- string, the full path the file was saved to (out_dir / file)
     """
+    # a temporary filename and a final filename, to tell a stale download from a complete one
     file_path = out_dir / file
     part_file_path = out_dir / f"PART_{file}"
 
+    # checking three scenarios: 1) only stale file exists
     if part_file_path.exists():
         part_file_path.unlink()
         requests_get(url, part_file_path, file_path)
+    # 2) file does not exist at all (has never been downloaded before)
     elif not file_path.exists():
         requests_get(url, part_file_path, file_path)
+    # 3) complete file exists
     else: 
         pass
 
@@ -175,11 +196,13 @@ def point_to_bbox(row, t2projected, t2wgs84, source_crs):
         bbox -- list of [lon, lat] pairs, the four corners in order top-left, bottom-left, bottom-right, top-right
     """
 
+    # the point is needed in a metric crs, to add the margins in metres
     if source_crs == "EPSG:3035":
         x, y = row.geometry.x, row.geometry.y      # already projected, no transform needed
     else:
         x, y = t2projected.transform(row.geometry.x, row.geometry.y)   # e.g. EPSG:4326 -> EPSG:3035
 
+    # the margins are given in km, so convert them to metres
     west = row["west"] * 1000
     north = row["north"] * 1000
     east = row["east"] * 1000
@@ -198,6 +221,7 @@ def point_to_bbox(row, t2projected, t2wgs84, source_crs):
     bottom_right_x = x + east
     bottom_right_y = y - south
 
+    # transform the four corners back to lon/lat
     tl_lon, tl_lat = t2wgs84.transform(top_left_x, top_left_y)
     tr_lon, tr_lat = t2wgs84.transform(top_right_x, top_right_y)
     bl_lon, bl_lat = t2wgs84.transform(bottom_left_x, bottom_left_y)
@@ -208,6 +232,7 @@ def point_to_bbox(row, t2projected, t2wgs84, source_crs):
 def get_access_token(token_path):
     """
     Requests a short-lived OAuth access token for the EGMS API from a service-account key file.
+    Raises a RuntimeError with the server's answer if no token comes back.
 
     Arguments:
         token_path -- path (str or Path) to the service-account JSON key file
@@ -216,8 +241,10 @@ def get_access_token(token_path):
         access_token -- string, the bearer access token used to authenticate EGMS API requests
     """
     # This is from the egms api repo https://github.com/copernicus-land/egms-api/blob/main/EGMS-API.ipynb
+    # reading the service-account key file
     service_key = json.load(open(token_path, 'rb'))
     private_key = service_key['private_key'].encode('utf-8')
+    # the claim set says who asks for the token and that it shall be valid for one hour
     claim_set = {
         "iss": service_key['client_id'],
         "sub": service_key['user_id'],
@@ -225,16 +252,24 @@ def get_access_token(token_path):
         "iat": int(time.time()),
         "exp": int(time.time() + (60 * 60)),
     }
+    # sign the claim set with the private key
     grant = jwt.encode(claim_set, private_key, algorithm='RS256')
+    # exchange the signed grant for the actual access token
     result = requests.post(service_key["token_uri"], headers={ "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" },
             data={ "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": grant } )
     access_token_info_json = result.json()
     access_token = access_token_info_json.get('access_token')
+    
+    # In case the token generation fails, this will deliver a meaningful error message
+    if not access_token:
+        raise RuntimeError(f"EGMS token request failed: {access_token_info_json}")
+    
     return access_token
 
 def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/insar-api/archive"):
     """
     Searches the EGMS archive for products overlapping a row's bbox and builds the download link for each hit.
+    Raises a RuntimeError if the search fails or is rejected (e.g. because of an invalid token).
 
     Arguments:
         row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
@@ -246,14 +281,26 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
         links -- list of strings, one download link per hit in result["hits"]
     """
     
+    # the search query: all L2B products of the 2019-2023 release that overlap the bbox
     query = {"id": None,
          "bbox": row["bbox"],
          "levels" : ["L2B"],
          "releases" : ["2019-2023"]
          }
 
+    # send the query to the archive
     r = requests.post(f"{api_endpoint}/search", headers=headers, data=json.dumps(query))
+    # stop here if the server answered with an error status
+    # otherwise this only shows up later as a confusing KeyError
+    if not r.ok:
+        raise RuntimeError(f"EGMS search failed [{r.status_code}] for {row['location']}: {r.text[:500]}")
+
     result = r.json()
+
+    # a search without a valid token still answers with 200, but with status False and no id
+    # stop here as well, because no download works without the id
+    if not result.get("status") or result.get("id") is None:
+        raise RuntimeError(f"EGMS search was rejected for {row['location']}: {str(result)[:500]}")
 
     # Constructing a download link for all the products in the result
     # code from the egms api repo
@@ -265,49 +312,30 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
     return result, links
 
 
-def pull_egms(row, token_path, orbit):
+def pull_egms(row, token_path, orbit, failed_downloads):
     """
     Picks the relative orbit (of a given direction) whose bursts overlap the study area most, then downloads its files.
+    Files that are already on disk are skipped. Files the server refuses are recorded in
+    failed_downloads and skipped as well, so a single bad file doesn't stop the whole run.
 
     Arguments:
         row -- pandas.Series, a GeoDataFrame row with bbox, location and set
         token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
-            a fresh access token before every file download (tokens expire after 1 hour, and a
-            single row's files can take longer than that to all download)
+            a fresh access token and search id once they are close to expiring (both expire after
+            1 hour, and a single row's files can take longer than that to all download)
         orbit -- string, orbit direction to keep, e.g. "ascending" or "descending"
+        failed_downloads -- list, every file that could not be downloaded is appended to it as a
+            dict (location, orbit, filename, status_code, server_response)
 
     Returns:
         return_path -- string, the location-level folder the files were saved under (TRAIN_DIR, DEV_DIR, CAL_DIR or VAL_DIR / location)
+            Also returned if there are no products for this orbit direction
     """
-
-    # Create an access token and note when it was generated (expires after one hour)
-    access_token = get_access_token(token_path)
-    token_issued_at = time.time()
-    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-
-    # Call query egms once per line since the ids also expire
-    # Calling it once upfront on the entire df leads to expired ids once the download is actually performed
-    result, links = query_egms(row=row, headers=headers)
-
-    study_area = Polygon(row["bbox"])
-    pairs = [(hit, link) for hit, link in zip(result["hits"], links)
-                 if hit["direction"] == orbit]
-
-    # group by relative orbit, aggregating all bursts of that relative orbit
-    by_rel_orbit = {}
-    for hit, link in pairs:
-        by_rel_orbit.setdefault(hit["relativeOrbit"], []).append((hit, link))
-
-    # keep only the relative orbit whose combined bursts overlap the study area most
-    best_rel_orbit = max(
-        by_rel_orbit,
-        key=lambda ro: union_all([Polygon(hit["poly"]) for hit, _ in by_rel_orbit[ro]]).intersection(study_area).area
-    )
-    hits, links = zip(*by_rel_orbit[best_rel_orbit])
 
     # some of the real subsidence areas go into training but some also go into validation
     # the set variable decides into which region the data goes
     # Generally:  0 = train    1 = dev   2 = cal   3 = val
+    # This comes first so return_path is known even if nothing is downloaded for this orbit
     if row["set"] == 0:
         return_path = TRAIN_DIR / row["location"]
         save_path = return_path / str(orbit)
@@ -318,10 +346,44 @@ def pull_egms(row, token_path, orbit):
         return_path = CAL_DIR / row["location"]
         save_path = return_path / str(orbit)
     elif row["set"] == 3:
-            return_path = VAL_DIR / row["location"]
-            save_path = return_path / str(orbit)
+        return_path = VAL_DIR / row["location"]
+        save_path = return_path / str(orbit)
     else:
         raise ValueError("Not all rows have regions assigned!")
+    
+    # Create an access token and note when it was generated (expires after one hour)
+    access_token = get_access_token(token_path)
+    token_issued_at = time.time()
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
+    # Call query egms once per line since the ids also expire
+    # Calling it once upfront on the entire df leads to expired ids once the download is actually performed
+    result, links = query_egms(row=row, headers=headers)
+
+    # the study area as polygon, to measure the overlap with the bursts below
+    study_area = Polygon(row["bbox"])
+    # keep only the products of the wanted orbit direction, together with their links
+    pairs = [(hit, link) for hit, link in zip(result["hits"], links)
+                 if hit["direction"] == orbit]
+
+    # group by relative orbit, aggregating all bursts of that relative orbit
+    by_rel_orbit = {}
+    for hit, link in pairs:
+        by_rel_orbit.setdefault(hit["relativeOrbit"], []).append((hit, link))
+
+    # Nothing to download for this orbit direction. Still return the path because download_egms
+    # assigns the path column once per orbit direction
+    if not by_rel_orbit:
+        print(f"No {orbit} products found for {row['location']}, skipping", flush=True)
+        return str(return_path)
+    
+    # keep only the relative orbit whose combined bursts overlap the study area most
+    best_rel_orbit = max(
+        by_rel_orbit,
+        key=lambda ro: union_all([Polygon(hit["poly"]) for hit, _ in by_rel_orbit[ro]]).intersection(study_area).area
+    )
+    # split the (hit, link) pairs of that orbit into two separate tuples again
+    hits, links = zip(*by_rel_orbit[best_rel_orbit])
 
     # creating the directory where the data goes
     save_path.mkdir(parents=True, exist_ok=True)
@@ -333,21 +395,59 @@ def pull_egms(row, token_path, orbit):
         if token_age > 50 * 60:
             access_token = get_access_token(token_path)
             token_issued_at = time.time()
+            headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+            # the search id expires together with the token, so the search is repeated to get a new one
+            result, _ = query_egms(row=row, headers=headers)
 
-        headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+        # put the current search id into the link (it changes whenever the search is repeated)
+        link = f"{link.split('?id=')[0]}?id={result['id']}"
 
         # Checking whether a file already exists or not 
+        # after unzipping only the csv is left, so that one counts as already downloaded as well
         file_path = save_path / hit["filename"]
         part_file_path = save_path / f"PART_{hit["filename"]}"
         csv_path = save_path / f"{file_path.stem}.csv"
 
+        # checking three scenarios: 1) only stale file exists, so remove it and download again
         if part_file_path.exists():
             part_file_path.unlink()
-            requests_get(link, part_file_path, file_path, headers=headers)
-        elif not (file_path.exists() or csv_path.exists()):
-            requests_get(link, part_file_path, file_path, headers=headers)
-        else:
-            pass
+        # 2) complete file exists, so move on to the next file
+        elif file_path.exists() or csv_path.exists():
+            continue
+
+        # 3) file does not exist at all (has never been downloaded before)
+        # the download itself, reached in scenario 1) and 3)
+        # the server sometimes refuses a link right after the search (401) or still counts finished
+        # downloads as running (429), so every file gets up to five attempts
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                requests_get(link, part_file_path, file_path, headers=headers)
+                # download worked, no further attempt needed
+                break
+            # an error status from the server ends up here
+            except requests.exceptions.HTTPError as e:
+                # last attempt failed as well: give up on this file but keep going with the rest
+                # note which file failed and why, download_egms writes that list to disk at the end
+                if attempt == max_attempts:
+                    failed_downloads.append({"location": row["location"],
+                                             "orbit": orbit,
+                                             "filename": hit["filename"],
+                                             "status_code": e.response.status_code,
+                                             "server_response": e.response.text[:500]})
+                    break
+
+                # 401 means the server does not accept the search id of the link
+                # the server asks to rerun the search in that case, so a new token and id are fetched
+                if e.response.status_code == 401:
+                    access_token = get_access_token(token_path)
+                    token_issued_at = time.time()
+                    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+                    result, _ = query_egms(row=row, headers=headers)
+                    link = f"{link.split('?id=')[0]}?id={result['id']}"
+
+                # give the server some time before the next attempt, a bit longer every time
+                time.sleep(10 * attempt)
 
     return str(return_path)
 
@@ -367,39 +467,35 @@ def sample_random_points(polygon, n_points, min_dist, max_attempts, crs=None):
         points -- geopandas.GeoDataFrame, one row per accepted point, with a geometry column
     """
 
+    # fixed seed, so the same points are sampled on every run
     random_generator = np.random.default_rng(6576)
 
+    # counters for the loop below
     attempts = 0
     n = 0
+    # the area that is still allowed for sampling, it shrinks with every new point
     poly = gpd.GeoDataFrame(geometry=[polygon])
+    # the first point can be anywhere in the polygon
     points = gpd.GeoSeries([polygon]).sample_points(1, rng=random_generator)
 
     while attempts < max_attempts-1 and n < n_points-1:
+        # buffer all points sampled so far and remove that area from the allowed area
+        # this way the next point keeps the minimum distance to all of them
         too_close_area = points.buffer(min_dist).union_all()
         poly.geometry = poly.difference(too_close_area)
+        # sample the next point from what is left and add it to the others
         new_point = poly.sample_points(1, rng=random_generator)
         points = pd.concat([points, new_point], ignore_index=True)
 
         attempts += 1
         n += 1
 
+    # sample_points returns a MultiPoint per row, even if it only holds a single point
+    # explode turns them into plain Points, the later steps need their x and y
+    points = points.explode(ignore_index=True)
+
     return gpd.GeoDataFrame(geometry=points, crs=crs)
 
-
-def closest_city_name(row, reverser):
-    """
-    Returns the name of the nearest city/town to a GeoDataFrame row's point, via reverse geocoding.
-
-    Arguments:
-        row -- pandas.Series, a GeoDataFrame row with a Point geometry in EPSG:4326 (lon/lat)
-        reverser -- callable, a geopy reverse-geocoding function (e.g. a RateLimiter-wrapped Nominatim.reverse)
-
-    Returns:
-        name -- string or None, the city/town/village name from OpenStreetMap, or None if nothing was found
-    """
-    location = reverser((row.geometry.y, row.geometry.x), exactly_one=True)
-    address = location.raw.get("address", {}) if location else {}
-    return address.get("city") or address.get("town") or address.get("village")
 
 def unzip(data_dir):
     """
@@ -474,7 +570,7 @@ def pull_stations_in_bbox_data(row):
 #======= Section 4: GSE Download Helpers =======#
 #################################################
 # Used by download_gse, in the order they're first called there (bbox_per_csv and gs_uri_to_https
-# are placed right before the function that calls them: large_bbox and pull_gse_data).
+# are placed right before the function that calls them: large_bbox and pull_gse_tiles).
 
 def bbox_per_csv(csv_file):
     """
@@ -583,8 +679,10 @@ def gs_uri_to_https(gs_uri):
         https_url -- string, e.g. "https://storage.googleapis.com/alphaearth_foundations/..."
     """
 
+    # cut off the gs:// prefix and split the rest into bucket and key
     without_prefix = gs_uri.removeprefix("gs://")
     bucket, key = without_prefix.split("/", 1)
+    # put both behind the public https address of google cloud storage
     return f"https://storage.googleapis.com/{bucket}/{key}"
 
 def pull_gse_tiles(part_crop_path, crop_path, tile, row):
@@ -602,6 +700,7 @@ def pull_gse_tiles(part_crop_path, crop_path, tile, row):
         result -- string, crop_path if the tile overlapped large_bbox and was written; None if
             the tile didn't overlap (nothing is written in that case)
     """
+    # the public https url of the tile, rasterio can read from it directly
     url = gs_uri_to_https(tile["path"])
     with rasterio.open(url) as src:
         # Reproject the study area's bbox into this tile's own CRS -- rio_mask needs
@@ -617,12 +716,15 @@ def pull_gse_tiles(part_crop_path, crop_path, tile, row):
             # Raised when bbox_poly doesn't overlap this tile at all.
             return None
     
+        # the crop is smaller than the tile, so size and transform in the profile are adjusted
         profile = src.profile.copy()
         profile.update(height=data.shape[1], width=data.shape[2], transform=out_transform)
     
+    # write the crop to the temporary file first
     with rasterio.open(part_crop_path, "w", **profile) as dst:
         dst.write(data)
 
+    # writing finished without error, so the temporary file gets its final name
     part_crop_path.rename(crop_path)
 
     return str(crop_path)
@@ -690,6 +792,7 @@ def pull_worldcover(row, index_gdf):
     tiles = index_gdf[index_gdf.intersects(bbox)]
     # extract only the tile codes in that column to build the download urls for that tile
     tile_codes = tiles["ll_tile"]
+    # empty list to catch the urls
     tile_urls = []
     for tile_code in tile_codes:
         url = f"https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_{tile_code}_Map.tif"
@@ -709,6 +812,7 @@ def pull_worldcover(row, index_gdf):
 def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, maxit_rnd, real_sub_buffer_value = 400000):
     """
     Downloads EGMS L2b data for the real subsidence regions and for extra randomly sampled regions, for both orbit directions.
+    Files that could not be downloaded are listed in assets/failed_egms_downloads.csv.
 
     Arguments:
         real_sub_path -- path (str or Path) to the real_subsidence_pointbased.gpkg file
@@ -739,11 +843,14 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
     real_subsidence["bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=real_subsidence.crs)
 
+    # Collects every file that could not be downloaded, filled by pull_egms and written to disk below
+    failed_downloads = []
+
     # Download the products with filter before
     # the set variable decides into which region the data goes
     # Generally:  0 = train    1 = dev   2 = cal   3 = val
-    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending")
-    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending")
+    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending", failed_downloads=failed_downloads)
+    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending", failed_downloads=failed_downloads)
 
     ################################################
     #=== Section 2: The Normal Training Regions ===#
@@ -757,6 +864,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     # egms coverage area without the already represented areas through real subsidence areas
     allowed_area = coverage_egms.difference(real_sub_buffer)
 
+    # sampling the random points within the allowed area
     egms_random = sample_random_points(allowed_area, n_rnd, mindist_rnd, maxit_rnd, crs = "EPSG:3035")
 
     # adding the same columns to the dataframe that the initial real_subsidence df has 
@@ -764,21 +872,27 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random["east"] = 25
     egms_random["south"] = 25
     egms_random["west"] = 25
+    # the random regions only go into train, dev and cal (0, 1, 2), with a fixed seed for the split
     egms_random["set"] = np.random.default_rng(42).choice([0, 1, 2], size=len(egms_random), p=[0.6, 0.2, 0.2]) 
 
-    # setting up the geopy functionality to determine the closest city
-    geolocator = Nominatim(user_agent="lostinplace_thesis")
-    reverse = RateLimiter(geolocator.reverse, min_delay_seconds=1)  # Nominatim's usage policy caps at 1 req/s
-    # filling the location col via this function 
-    egms_random["location"] = egms_random.apply(closest_city_name, axis = 1, reverser = reverse)
+    # naming the random regions after their set with a running number per set
+    # e.g. train_1, train_2, ... dev_1, dev_2, ... cal_1, cal_2, ...
+    set_names = {0: "train", 1: "dev", 2: "cal"}
+    egms_random["location"] = egms_random["set"].map(set_names) + "_" + (egms_random.groupby("set").cumcount() + 1).astype(str)
 
     # Creating the bbox and querying the archive on the random point samples
     egms_random["bbox"] = egms_random.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=egms_random.crs)
     
     # downloading the egms data for the new areas
-    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending")
-    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending")
+    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending", failed_downloads=failed_downloads)
+    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending", failed_downloads=failed_downloads)
 
+    # Writing the files that could not be downloaded to disk so they are not lost silently
+    if failed_downloads:
+        failed_path = Path(__file__).parent / "../../assets/failed_egms_downloads.csv"
+        pd.DataFrame(failed_downloads).to_csv(failed_path, index=False)
+        print(f"{len(failed_downloads)} EGMS files could not be downloaded, see {failed_path}", flush=True)
+    
     # Unzipping the egms zip files for later use
     unzip(DATA_DIR)
 
@@ -789,6 +903,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     study_areas_gdf = pd.concat([real_subsidence, egms_random])
 
+    # Saving the geodataframe
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
     
     return study_areas_gdf
@@ -823,7 +938,7 @@ def download_gnss(study_areas_gdf):
     # create a gdf from those points for further analysis
     stations = gpd.GeoDataFrame(station_list, geometry= "geometry" , crs="EPSG:4326")
 
-    # Creating a mask to apply station_codes_in_bbox only to the validation regions
+    # Creating a mask to apply stations_in_bbox only to the validation regions
     val_mask = study_areas_gdf["set"] == 3
     # apply the function and write the result back into the val row, leaving None for train/dev
     study_areas_gdf.loc[val_mask, "station_codes"] = study_areas_gdf.loc[val_mask].apply(
@@ -870,6 +985,7 @@ def download_gse(study_areas_gdf, years):
     # Downloading the tiles into the location folder with year prefixes in filenames
     study_areas_gdf["gse_crop_paths"] = study_areas_gdf.apply(crop_gse_data, axis=1)
 
+    # Saving the updated geodataframe
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
 
     return study_areas_gdf
@@ -886,12 +1002,16 @@ def download_esa_worldcover(study_areas_gdf, index_url):
     Returns:
         None -- study_areas_gdf is updated and saved in place, not returned
     """
+    # download the index file with the tile grid
     index_path = pull_data_by_url(index_url, Path(__file__).parent / "../../assets/", "esa_world_cover_index.geojson")
 
+    # read it as gdf to find the tiles per region
     index_gdf = gpd.read_file(index_path)
 
+    # Downloading the tiles and adding their urls as a new column to the gdf
     study_areas_gdf["world_cover_tile_urls"] = study_areas_gdf.apply(pull_worldcover, axis=1, index_gdf=index_gdf)
 
+    # Saving the updated geodataframe
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
     
 
@@ -948,6 +1068,7 @@ def main(real_sub_buffer_value, n_rnd, mindist_rnd, maxit_rnd):
 
 if __name__ == '__main__':
 
+    # reading the command line arguments that the slurm script passes
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--projectdir", required=True)
@@ -958,11 +1079,13 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    # the arguments arrive as strings, so the numeric ones are converted to int
     REAL_SUB_BUFFER_VALUE = int(args.real_sub_buffer_value)
     N_RND = int(args.n_rnd)
     MINDIST_RND = int(args.mindist_rnd)
     MAXIT_RND = int(args.maxit_rnd)
 
+    # the paths of the project's file system, used as globals by the functions above
     PROJECT_DIR = Path(args.projectdir)
     DATA_DIR = PROJECT_DIR / "data"
     # For the data split between training, dev and validation regions
@@ -971,5 +1094,6 @@ if __name__ == '__main__':
     CAL_DIR = DATA_DIR / "cal"
     VAL_DIR = DATA_DIR / "val"
 
+    # running the whole download
     main(real_sub_buffer_value = REAL_SUB_BUFFER_VALUE,
           n_rnd=N_RND, mindist_rnd=MINDIST_RND, maxit_rnd=MAXIT_RND) 

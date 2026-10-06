@@ -117,6 +117,16 @@ Stage 2: CLASSICAL GEOMETRIC DECOMPOSITION (closed-form)
 
 **Why:** L2a is relative to a local reference per burst/processing unit. Asc and desc have *different* reference frames. Inverting a 2×2 on LOS from two different datums contaminates both the EW and vertical outputs with an arbitrary offset/ramp. L2b is tied to a GNSS-calibrated model, so asc and desc share a compatible reference. The decomposition output is much more trustworthy.
 
+### 3.6a Current prototype scope (interim simplifications)
+
+**Status: active working scope, not a permanent architecture change.** To get a first end-to-end pipeline running, several of the above mechanisms are deliberately narrowed. The fuller versions they defer are kept everywhere else in this document, not deleted — the prototype choices below are a strict subset of them, chosen so the later, fuller version reuses the same code rather than requiring a rewrite.
+
+- **Target: single-year velocity, not the full time series or §3.5's multi-year basis coefficients.** Fit velocity from one year's date columns in the raw EGMS series (self-computed, via the same `lstsq` machinery as §3.5, just restricted to one year's dates). EGMS's own `mean_velocity` field spans the *entire* downloaded 2019–2023 window, so it can't be reused directly for a single-year target.
+- **Covariate: that same year's AlphaEarth embedding, not averaged across years.** No year-pooling needed for the prototype — §5.3's `AnnualEncoder` (mean-pool over years) becomes relevant again only once the target moves beyond one year.
+- **Node features, simplified accordingly:** `[velocity (1), is_query (1), incidence_angle (1), dist_to_coherent (1), encoded GSE static vector]` — no `p`-dimensional basis coefficients. Output head is scalar `(mu, logvar)` instead of `ℝ^p`.
+- **Uncertainty propagation (§6.3/6.4), scalar version:** no basis-reconstruction step (`Φ @ coeffs`) needed, since there's no coefficient vector. The asc/desc decomposition (§6.4) applies the same `G⁻¹` once to `(mu_v, var_v)` per orbit, instead of looping over `T` epochs.
+- **Deferred, revisit once this works end-to-end:** full multi-year time series target; reprojection loss (§7.2 — parked, not on the near-term roadmap); MSE-warmup before switching to NLL (§7.4 — pending literature justification, see §10.12); GSE per-channel normalization and the compression-MLP choice (§5.4 — both flagged for supervisor discussion, not finalized, see §10.13).
+
 ### 3.7 Viewing geometry is derived analytically, never learned
 
 **Decision:** Build the LOS unit vector at a query point from the per-point `incidence_angle` + `track_angle` that every provider ships, via a low-order (planar) fit per **(track, sub-swath)**. Do *not* add the look vector as a GNN output, and do not depend on provider-specific metadata files.
@@ -182,24 +192,37 @@ Choose one representative region per major deformation process; hold *at least o
 
 Over the rest of Europe, place **random burst-anchor points** with a **minimum separation** equal to or greater than your **neighbourhood radius** (see Section 4.4). This ensures training targets from different anchors don't share neighbour points, maintaining sample independence.
 
-**Step 3: Within-burst stratified sampling.**
+**Step 3: Within-burst candidate pool construction (angular-balanced k-NN, sequential, no point reuse).**
 
-Within each selected burst, sample **target points stratified by dominant land-cover class** (use CORINE or ESA WorldCover). Draw roughly equal numbers per class per burst, again respecting the minimum-distance constraint. This avoids area-proportional bias and ensures the model sees forests, urban, agricultural, shrub, etc., equally.
+Within each selected burst csv, build the pool of mini-graph anchors as follows — this supersedes the simpler uniform-radius/min-distance idea originally sketched for this step (see §4.4 for what that radius concept is still used for):
+
+1. Stratify by dominant land-cover class (ESA WorldCover) so urban areas aren't overrepresented — same intent as before.
+2. Exclude a buffer margin along the burst's own boundary (sized like the §4.4 neighbourhood-radius estimate) so every candidate anchor has points available in every direction — no edge-starved anchors.
+3. Process points sequentially (order doesn't matter beyond determinism/reproducibility). For each still-unused point considered as an anchor: run **angular-balanced k-NN** — split the local neighbourhood into angular sectors, pick the nearest unused point(s) per sector — restricted to points **not already claimed by an earlier anchor's graph**.
+4. If a sector comes up short, either accept a smaller/uneven graph for this anchor (graphs don't need a fixed size — PyG batches variable-size graphs natively) or reject the anchor below some minimum-neighbour threshold. Open, decide empirically.
+5. On acceptance: mark the anchor and all its chosen neighbours as used, remove them from the pool, move to the next unused point.
+
+This replaces reserving a conservative worst-case min-distance around every anchor (which wastes points in dense areas) with directly tracking which points are already claimed — denser sampling, more training examples per burst, same no-shared-points-between-graphs guarantee.
+
+**Sparsity augmentation — open, not yet decided.** The variable-graph-size support above is also what a future "simulate sparser regions" augmentation (dropping neighbours, possibly with its own point-level min-distance) would need. Tracked as open, see §10.11.
 
 **Pipeline staging note:** the actual stratified *sampling* happens later than Steps 1–2, at graph-generation/training-sampling time — not during the raw EGMS acquisition step (`01_download_data.py` only downloads full-burst products for each anchor; it doesn't yet pick individual target points). The land-cover *data* itself is now downloaded during acquisition, though (`download_esa_worldcover`, cropped per study area via windowed COG reads) — so by the time Step 3 is actually implemented, the WorldCover tiles it needs will already be sitting in each region's folder. Don't read Step 3's absence from the acquisition script as a gap in that script — only the sampling logic is scoped for later, not the data itself.
 
 **Why this hybrid?** Handpicking ensures rare-but-important processes (mining, peat) are represented and held out for testing. Random draw with stratification ensures broad coverage and fair representation of conditions. Together, you sample the "condition space," not just the "area space."
 
-### 4.4 Neighbourhood radius and min-distance
+### 4.4 Neighbourhood radius and burst-edge buffer
 
-Compute the typical radius your k-NN search reaches:
+Compute the typical radius a k-NN search reaches, as before:
 ```python
-# e.g., after selecting k=24 angular-balanced neighbours
 radii = [distance from target to k-th neighbour, for each training point]
 neighbourhood_radius = np.percentile(radii, 95)  # conservative upper bound
 ```
 
-Set **min_distance ≥ 1.5 × neighbourhood_radius** to guarantee targets don't share neighbours.
+**Superseded use:** this radius was originally meant to also set a global `min_distance ≥ 1.5×` between anchors at the point level (§4.3 Step 3). That use is now superseded by Step 3's sequential, no-reuse candidate pool construction, which tracks shared points directly instead of reserving a conservative worst-case radius around every anchor — denser sampling, same independence guarantee.
+
+**Remaining use:** sizing the burst-edge buffer (§4.3 Step 3.2) — the margin near a burst's boundary within which no anchor may land, so every accepted anchor gets angular-balanced coverage in every direction.
+
+Step 2's region-level min-distance (between randomly sampled *regions* across Europe, before any single burst is even downloaded) is a different, coarser pipeline stage and is unaffected by this.
 
 ### 4.5 Training / calibration / test split
 
@@ -298,6 +321,8 @@ class TemporalEncoder(nn.Module):
 
 ### 5.3 Annual predictor encoding
 
+**Prototype note (§3.6a):** with a single-year velocity target, there's only one year of AEF data per point — no pooling needed. Feed the (64,) vector directly into §5.4's `StaticEncoder`. This encoder becomes relevant again once the target moves to multi-year.
+
 ```python
 class AnnualEncoder(nn.Module):
     def __init__(self, n_annual, d=32):
@@ -315,6 +340,10 @@ class AnnualEncoder(nn.Module):
 Alternatives: Transformer over the year axis, or a small 1D-CNN over time.
 
 ### 5.4 Static predictor MLP
+
+Compresses the raw GSE vector before it's concatenated with the other node features — rationale: (1) dimensional balance, 64 raw dims would otherwise dwarf the handful of other features (is_query, incidence, distance, velocity); (2) lets the network learn a task-specific projection of the embedding rather than consuming it raw at full width; (3) matches the same group → small-encoder → common-width pattern used for every other feature group, so adding more covariate groups later doesn't require reshaping the fuse layer.
+
+**Open, pending supervisor discussion (§10.13):** whether to compress at all, and whether/how to normalize the raw GSE vector beforehand — it's already roughly unit-scale post de-quantization and may encode meaningful relative geometry across its 64 dims (cosine-similarity-like structure), which per-channel standardization could distort. Not finalized.
 
 ```python
 class StaticEncoder(nn.Module):
@@ -506,6 +535,8 @@ This is the honest "I'm unsure where you are" signal.
 
 ### 6.3 Propagation through basis reconstruction
 
+**Prototype note (§3.6a):** not needed for now — with a scalar single-year velocity target there's no coefficient vector to reconstruct. Skip straight to §6.4, applied to `(mu_v, var_v)` directly. Revisit this section once the target moves to multi-year/full time series.
+
 Basis coefficients → LOS series:
 ```
 LOS(t) = Φ(t) @ coeffs,  where Φ ∈ ℝ^{T × p}
@@ -522,6 +553,8 @@ var_los_epistemic = Phi @ diag(var_epistemic) @ Phi.T
 ```
 
 ### 6.4 Propagation through decomposition
+
+**Prototype note (§3.6a):** for the single-year velocity target, `G⁻¹` is applied once to `(mu_v_asc, var_v_asc)` / `(mu_v_desc, var_v_desc)` — the scalar case of the same formula below, no per-epoch loop. Run it twice (once for aleatoric variances, once for epistemic) to keep the split alive into the final EW/Up numbers.
 
 Decomposition at the query point:
 ```
@@ -580,59 +613,42 @@ This adapts coverage: points far from data get wider intervals.
 
 ### 7.1 Data loading and graph generation
 
+**Two-level caching, not one flat pre-generated graph set.** What's cached on disk and what's rebuilt every epoch are different things:
+
+- **Cached once per burst, on disk** (via `Dataset.process()`'s `raw_file_names`/`processed_file_names` skip-if-exists mechanism, saved as `.pt` tensor bundles, not csv): the §4.3 Step 3 candidate pool itself — point coordinates, fetched GSE features per candidate point, land-cover class, and the angular-balanced neighbour indices for each anchor. This is the expensive part (k-NN search, GSE fetch) and never needs recomputing.
+- **Rebuilt fresh every call to `__getitem__`**: the actual masked `Data` graph — which cached neighbours are "known" vs "masked" this time. Cheap (just indexing + a random draw), and must **not** be cached, or masking stops varying across epochs.
+
 ```python
-from torch_geometric.loader import DataLoader
-from torch_geometric.data import InMemoryDataset, Data
+class BurstGraphDataset(torch.utils.data.Dataset):
+    """One per burst csv. Holds ONLY this burst's precomputed candidate pool."""
+    def __init__(self, csv_path, k=24, mask_rate=0.3):
+        super().__init__()
+        # process() pattern: build pool + cache k-NN + fetch GSE once,
+        # skip rebuilding if the processed .pt file already exists
+        self.pool = ...          # cached candidate points + their features
+        self.neighbours = ...    # cached angular-balanced neighbour indices per anchor
 
-class InSARLOSGraphDataset(InMemoryDataset):
-    """
-    Pre-generated graphs from all bursts, masked-target training.
-    Each sample: query node + k neighbours, from one burst.
-    """
-    def __init__(self, list_of_data_objects):
-        super().__init__(None)
-        self.data, self.slices = self.collate(list_of_data_objects)
+    def __len__(self):
+        return len(self.pool)
 
-# Training:
-# For each epoch:
-#   For each burst:
-#     For each point in the burst (sample some or all):
-#       Randomly select k neighbours from the same burst
-#       Randomly mask some neighbouring points (don't predict them)
-#       Build the query graph (target = this point, neighbours = unmasked)
-#       Append to batch
-#
-# This is more flexible than pre-generating all graphs.
+    def __getitem__(self, idx):
+        cached_neighbours = self.neighbours[idx]           # fixed, no recompute
+        mask = np.random.rand(len(cached_neighbours)) > self.mask_rate  # FRESH every call
+        known_idx = cached_neighbours[mask]
+        return build_query_graph(idx, known_idx, self.pool, ...)
 
-class InSARBurstDataset(torch.utils.data.IterableDataset):
-    def __init__(self, burst_files, k=24, mask_rate=0.3, burst_sample_rate=0.2):
-        self.bursts = [torch.load(f) for f in burst_files]  # pre-cached tensors
-        self.k = k
-        self.mask_rate = mask_rate
-        self.burst_sample_rate = burst_sample_rate
-    
-    def __iter__(self):
-        while True:
-            for burst in self.bursts:
-                # Sample points in this burst as targets
-                n_points = burst['los_coeffs'].shape[0]
-                n_targets = max(1, int(n_points * self.burst_sample_rate))
-                target_idx = np.random.choice(n_points, n_targets, replace=False)
-                
-                for t_idx in target_idx:
-                    # Find k neighbours (excluding self, + min-distance constraint)
-                    neighbours = self.find_neighbours(burst, t_idx, k=self.k)
-                    
-                    # Mask some neighbours (simulation of unknown data)
-                    mask = np.random.rand(len(neighbours)) > self.mask_rate
-                    known_idx = neighbours[mask]
-                    target_neighbours = neighbours[~mask]
-                    
-                    # Build graph (only known_idx inform the target)
-                    graph = build_query_graph(
-                        target_idx, known_idx, burst, ...)
-                    yield graph
+burst_datasets = [BurstGraphDataset(csv) for csv in train_burst_csvs]
+full_dataset = torch.utils.data.ConcatDataset(burst_datasets)
+loader = torch_geometric.loader.DataLoader(full_dataset, batch_size=64, shuffle=True)
 ```
+
+**Why masking actually varies per epoch — mechanism, not magic.** `shuffle=True` only randomizes the *order* anchors are visited in; it has nothing to do with the mask itself. The mask varies because `__getitem__(idx)` draws fresh randomness **every time it's called**, and `DataLoader` calls it again every epoch without caching the return value — same cached neighbour list, new random draw each time.
+
+**Caveat needing actual code, not automatic:** with `num_workers > 0`, forked/spawned worker processes can inherit identical RNG state, producing duplicated "random" masks across workers in the same epoch. Needs an explicit `worker_init_fn` that reseeds each worker (e.g. from `torch.utils.data.get_worker_info().seed`). Not an issue at `num_workers=0`.
+
+**Normalization placement:** compute mean/std per feature group (velocity, incidence, each GSE handling per §5.4/§10.13) once from the train split's cached pool, store separately, apply inside `__getitem__` on read — never bake normalized values into the cached raw tensors, so the stats can change without refetching anything.
+
+`ConcatDataset` is what combines the per-burst datasets into the one dataset a single `DataLoader` wraps — each burst's `__getitem__` only ever draws neighbours from its own cached pool, so batches can freely mix anchors from different bursts without ever mixing points *within* one graph across bursts.
 
 ### 7.2 Loss function
 
@@ -649,6 +665,8 @@ def loss_total(mu, logvar, y, data, model, lambda_reproj=0.2):
     return loss_nll  # + lambda_reproj * loss_reproj
 ```
 
+**Status: parked, not on the near-term roadmap (§3.6a).** The idea is kept for later — run the head on the *unmasked* neighbour nodes too, and compare each to its own already-known value, as extra (lower-weighted) supervision on the same shared weights, not just the one masked query node. Not circular despite reusing the known value as both input and target: residual/skip connections mean it isn't a pure identity mapping. Likely redundant with §10.10's multi-node masking if that's adopted later.
+
 ### 7.3 Training loop (pseudocode)
 
 ```python
@@ -657,8 +675,14 @@ ensemble_models = [InSARGNN(...) for _ in range(M)]
 optimizers = [torch.optim.AdamW(m.parameters(), lr=3e-4) for m in ensemble_models]
 
 for member_id, (model, opt) in enumerate(zip(ensemble_models, optimizers)):
-    # Bootstrap sample of training bursts
-    train_bursts_sample = random.sample(train_bursts, size=len(train_bursts))
+    # Bootstrap sample WITH replacement, same size as the full train pool.
+    # NOT a disjoint 1/M split: each member sees ~63% of the unique training
+    # points on average (some omitted, some duplicated), which is what
+    # creates between-member disagreement (the epistemic signal) without
+    # starving any one member down to a small fixed slice.
+    # Decision: keep bootstrapping (confirmed) -- needs a literature citation
+    # before writeup, see §10.12.
+    train_bursts_sample = random.choices(train_bursts, k=len(train_bursts))
     
     for epoch in range(EPOCHS):
         for graph in DataLoader(InSARBurstDataset(train_bursts_sample), batch_size=64):
@@ -683,7 +707,7 @@ for member_id, (model, opt) in enumerate(zip(ensemble_models, optimizers)):
 
 ### 7.4 Warmup strategy
 
-Optionally, train with MSE on the mean only for a few epochs before switching to Gaussian NLL. This stabilizes variance head learning.
+**Status: under consideration, not yet adopted — pending literature justification (§10.12).** The idea: train with MSE on the mean only for a few epochs before switching to Gaussian NLL, since an uncalibrated variance head early on can destabilize both heads at once. Keep in mind, don't implement yet without evidence this is worth the added complexity.
 
 ---
 
@@ -794,7 +818,9 @@ The single-CRS concern raised in Section 4.2 turned out to be a non-issue: the a
 
 ### 10.8 OPEN — temporal representation for irregular / non-EGMS series
 
-**Status: point of concern, not decided.**
+**Status: moot for now.** With the §3.6a prototype scoped to a single-year scalar velocity target, no temporal basis fitting is happening at all — this only becomes relevant again once the target moves back to multi-year/full time series. Shelved until then, not resolved.
+
+**Original concern, unchanged below:**
 
 The Section 3.5 global basis-coefficient fit (one set of ~8–15 coefficients per node over the whole record) assumes a reasonably long, stationary, densely-sampled series — true for EGMS, not guaranteed for worldwide transfer (shorter tracks, gaps, regime changes mid-record e.g. mine flooding, pumping changes).
 
@@ -839,6 +865,25 @@ IGNNK (§3.2's source) doesn't just predict one masked node per training sample 
 3. Decide the local-subgraph sampling shape: still a k-NN neighbourhood around a rough centre (closest to what §5.6 already builds), or something closer to IGNNK's own arbitrary-subset-of-indices sampling restricted to a bounded local radius. The former is a smaller change from the current plan; the latter more faithfully reproduces IGNNK's actual algorithm but has less obvious justification at this data density.
 4. If adopted, implement the calibration-decoupling mitigation above *before* running any §6.5 calibration numbers, not after — retrofitting it later would mean redoing calibration.
 
+### 10.11 OPEN — candidate-pool sparsity augmentation
+
+**Status: not yet decided.** §4.3 Step 3's angular-balanced candidate pool construction deliberately supports variable-size graphs so a future "simulate sparser regions" augmentation (dropping neighbours, possibly with its own point-level min-distance) can reuse the same mechanism. The augmentation method itself — how aggressively to sparsify, whether it varies by land-cover stratum, whether it changes per epoch or is baked into the pool — is undetermined. Motivation: EGMS point clouds are usually dense, so without this the model may never see realistically sparse neighbourhoods at train time, which §10.4 already flags as a case where epistemic uncertainty should inflate.
+
+### 10.12 OPEN — literature support needed: MSE warmup and bootstrap ensembling
+
+**Status: decisions made pragmatically, literature review pending before thesis writeup.**
+
+- **Bootstrap ensembling (§7.3): keep it (confirmed).** Need a citation establishing bootstrap-resampled deep ensembles as a valid epistemic-uncertainty estimator (standard practice, but cite it) before writing this up.
+- **MSE-then-NLL warmup (§7.4): not yet adopted.** Need literature evidence this measurably helps heteroscedastic-head training before committing to it — currently just "keep in mind," not implemented.
+
+### 10.13 OPEN — GSE normalization and compression, pending supervisor discussion
+
+**Status: idea sketched, not finalized — needs supervisor input before implementing.**
+
+Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5.4):
+- **Compression:** project a 64-dim embedding down via a small MLP before concatenating with other node features (rationale: dimensional balance, task-specific projection — see §5.4), vs. feeding it raw. Leaning toward compressing, not committed.
+- **Normalization:** the embedding is already roughly unit-scale post de-quantization and may encode meaningful relative geometry across its 64 dims; standardizing each dimension independently (the default treatment for every other feature group, §4.6) could distort that. Leaning toward skipping per-channel normalization for GSE specifically (or applying one shared scalar at most), unlike velocity/incidence/distance which get ordinary independent normalization. Not committed either way.
+
 ---
 
 ---
@@ -870,24 +915,32 @@ IGNNK (§3.2's source) doesn't just predict one masked node per training sample 
 
 ## Quick Reference Checklist
 
-- [ ] EGMS L2b bursts downloaded, per-burst CSVs cached as Parquet/torch
-- [ ] Temporal basis fitted and cached (8–15 coefficients per point)
-- [ ] Look-vector fit per (track, sub-swath) from incidence + track angle (§3.7)
-- [ ] AlphaEarth / DEM / hydrogeology rasters in EPSG:3035, stacked
-- [ ] Handpicked regions chosen, test subsets reserved
-- [ ] Min-distance random draw placed, stratified by land cover
-- [ ] Train / calibration / test split assigned at burst level
-- [ ] Global normalization stats computed on train split
-- [ ] Model architecture implemented, ensemble × M copies
-- [ ] Masked-target subgraph training loop working
-- [ ] Heteroscedastic NLL loss + (optional) reprojection loss
-- [ ] Uncertainty propagation: Φ @ coeffs, G⁻¹ @ LOS
-- [ ] Conformal calibration quantile computed on cal blocks
-- [ ] LOS validation: held-out points, per-orbit metrics
-- [ ] Product validation: GNSS comparison, decomposition quality
-- [ ] Baseline (regression-kriging) implemented and compared
-- [ ] Per-stratum performance analysis
-- [ ] Spatial maps and time series plots for key regions
+**Done:**
+- [x] Handpicked + random regions selected, EGMS/GNSS/GSE/WorldCover downloaded per region (`01_download_data.py`), resumable
+- [x] Train / dev / cal / val split assigned at region level
+
+**Next up (§3.6a prototype scope):**
+- [ ] Per-burst candidate pool: land-cover-stratified anchors, angular-balanced k-NN, sequential no-reuse sampling, edge buffer (§4.3 Step 3 / §4.4)
+- [ ] Per-year velocity extracted from raw EGMS date columns (self-fit, not the provided multi-year `mean_velocity`) (§3.6a)
+- [ ] GSE values fetched at candidate points only, that year's embedding (no year-pooling) (§3.6a)
+- [ ] Candidate pool + GSE + neighbour indices cached to disk per burst (`.pt`, `Dataset.process()` pattern) (§7.1)
+- [ ] `BurstGraphDataset` + `ConcatDataset` + `DataLoader(shuffle=True)` wired up, masking drawn fresh in `__getitem__` (§7.1)
+- [ ] Global normalization stats computed on train split only, applied at read time (§4.6)
+- [ ] Model architecture implemented (scalar head: `(mu_v, logvar_v)`, no basis coefficients yet) (§5, §3.6a)
+- [ ] Masked-target training loop working, bootstrap ensemble × M copies (§7.3)
+- [ ] Heteroscedastic NLL loss (§6.1) — MSE warmup still pending literature decision (§10.12)
+- [ ] Uncertainty propagation: scalar `G⁻¹` decomposition on `(mu_v, var_v)` per orbit (§6.4, §3.6a)
+- [ ] Conformal calibration quantile computed on cal blocks (§6.5)
+- [ ] LOS validation: held-out points, per-orbit metrics (§8.1 Tier 1)
+- [ ] Product validation: GNSS comparison, decomposition quality (§8.1 Tier 2)
+- [ ] Baseline (regression-kriging) implemented and compared (§8.2)
+- [ ] Per-stratum performance analysis, spatial maps and time series plots (§8.4)
+
+**Deferred until the single-year prototype works end-to-end:**
+- [ ] Full multi-year temporal basis fit (§3.5), reconstruction propagation (§6.3)
+- [ ] Reprojection loss (§7.2, parked)
+- [ ] Sparsity augmentation (§10.11), distance-binned calibration (§6.5), multi-node masking (§10.10)
+- [ ] GSE normalization/compression finalization — pending supervisor input (§10.13)
 
 ---
 
