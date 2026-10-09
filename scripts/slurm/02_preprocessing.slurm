@@ -15,4 +15,4 @@ cd ../python
 
 module load uv
 
-uv run s01_download_data.py --projectdir "/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE" --real_sub_buffer_value=150000 --n_rnd=35 --mindist_rnd=150000 --maxit_rnd=200
+uv run s01_download_data.py --projectdir "/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE" 

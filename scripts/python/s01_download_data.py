@@ -78,8 +78,8 @@ def study_areas_io(mode, gdf=None, base_path=None):
     json_path = base_path.parent / f"{base_path.stem}_complex.json"
 
     # the columns holding lists or dicts. gpkg can't store those, so they go into the json
-    complex_cols = ["bbox", "station_codes", "station_file_paths", 
-                    "gse_tiles_by_year", "gse_crop_paths", "large_bbox", "world_cover_tile_urls"]
+    complex_cols = ["bbox", "station_codes", "station_file_paths", "good_station_file_paths", 
+                     "large_bbox", "world_cover_tile_urls", "wc_paths", "station_velocities"]
 
     if mode == "write":
         # work on a copy so the uid column doesn't end up in the gdf of the caller
@@ -566,11 +566,10 @@ def pull_stations_in_bbox_data(row):
 
     return ts_file_paths
 
-#################################################
-#======= Section 4: GSE Download Helpers =======#
-#################################################
-# Used by download_gse, in the order they're first called there (bbox_per_csv and gs_uri_to_https
-# are placed right before the function that calls them: large_bbox and pull_gse_tiles).
+
+##################################################
+#======= Section 4: ESA Worldcover Helper =======#
+##################################################
 
 def bbox_per_csv(csv_file):
     """
@@ -622,156 +621,6 @@ def large_bbox(row):
     poly_4326 = gpd.GeoSeries([envelope], crs="EPSG:3035").to_crs("EPSG:4326").iloc[0]
     # Return it in the same format as the point_to_bbox function
     return [[x, y] for x, y in list(poly_4326.exterior.coords)[:-1]]
-
-def load_gse_index(index_url):
-    """
-    Loads the AlphaEarth tile index into a GeoDataFrame, geometry from its WKT column.
-
-    Arguments:
-        index_url -- URL to download the aef_index.csv tile index from
-
-    Returns:
-        index_gdf -- geopandas.GeoDataFrame, one row per tile, with year/utm_zone/path/geometry
-    """
-    # download the index file
-    index_file_path = pull_data_by_url(index_url, Path(__file__).parent / "../../assets/", "gse_index_file.csv"  )
-    # read the csv file and build geodata from wkt column
-    index_file_df = pd.read_csv(index_file_path, sep=",")
-    index_gdf = gpd.GeoDataFrame(index_file_df, geometry=gpd.GeoSeries.from_wkt(index_file_df["WKT"]), crs="EPSG:4326")
-
-    return index_gdf
-
-def tiles_for_row_gse(row, index_gdf, years):
-    """
-    Finds which AlphaEarth tiles intersect a study-area row's large_bbox, grouped by year.
-
-    Arguments:
-        row -- pandas.Series, a GeoDataFrame row with a large_bbox field (list of [lon, lat] corners)
-        index_gdf -- geopandas.GeoDataFrame, the loaded tile index (see load_gse_index)
-        years -- iterable of ints, which years to keep (e.g. range(2019, 2024) for the 5-year EGMS window)
-
-    Returns:
-        tiles_by_year -- dict, {year: [tile_dict, ...]} -- only years with at least one matching tile appear
-    """
-
-    # First we build a Polygon from the bbox column
-    bbox = Polygon(row["large_bbox"])
-    # Filtering the index gdf based on the wanted years first because that is cheap operation
-    index_gdf = index_gdf[index_gdf["year"].isin(years)]
-    # Now find all tiles that intersect with the bounding box
-    tiles = index_gdf[index_gdf.intersects(bbox)]
-
-    # Returning a dictionary to be able to add the years to the file names to make them distinguishable
-    tiles_by_year = {}
-    for year, group in tiles.drop(columns="geometry").groupby("year"):
-        tiles_by_year[year] = group.to_dict("records")
-
-    return tiles_by_year
-
-def gs_uri_to_https(gs_uri):
-    """
-    Converts a gs://bucket/key URI to its public HTTPS equivalent for plain download.
-
-    Arguments:
-        gs_uri -- string, e.g. "gs://alphaearth_foundations/satellite_embedding/v1/annual/2019/31N/x....tiff"
-
-    Returns:
-        https_url -- string, e.g. "https://storage.googleapis.com/alphaearth_foundations/..."
-    """
-
-    # cut off the gs:// prefix and split the rest into bucket and key
-    without_prefix = gs_uri.removeprefix("gs://")
-    bucket, key = without_prefix.split("/", 1)
-    # put both behind the public https address of google cloud storage
-    return f"https://storage.googleapis.com/{bucket}/{key}"
-
-def pull_gse_tiles(part_crop_path, crop_path, tile, row):
-    """
-    Crops a single AlphaEarth tile to row's large_bbox via a remote windowed read and writes it
-    to part_crop_path, renaming to crop_path on success.
-
-    Arguments:
-        part_crop_path -- Path, temporary path written to while cropping
-        crop_path -- Path, final path part_crop_path is renamed to on success
-        tile -- dict, one tile record from the GSE index (path, crs, ...)
-        row -- pandas.Series, a GeoDataFrame row with a large_bbox field (list of [lon, lat] corners)
-
-    Returns:
-        result -- string, crop_path if the tile overlapped large_bbox and was written; None if
-            the tile didn't overlap (nothing is written in that case)
-    """
-    # the public https url of the tile, rasterio can read from it directly
-    url = gs_uri_to_https(tile["path"])
-    with rasterio.open(url) as src:
-        # Reproject the study area's bbox into this tile's own CRS -- rio_mask needs
-        # the geometry in the same CRS as the raster, not lon/lat.
-        bbox_poly = gpd.GeoSeries([Polygon(row["large_bbox"])], crs="EPSG:4326").to_crs(tile["crs"]).iloc[0]
-    
-        try:
-            # Does the intersection + windowed read + crop in one call: reads only
-            # the pixels covering bbox_poly (not the whole tile), and returns them
-            # already cropped, along with the correct transform for just this crop.
-            data, out_transform = rio_mask(src, [bbox_poly], crop=True)
-        except ValueError:
-            # Raised when bbox_poly doesn't overlap this tile at all.
-            return None
-    
-        # the crop is smaller than the tile, so size and transform in the profile are adjusted
-        profile = src.profile.copy()
-        profile.update(height=data.shape[1], width=data.shape[2], transform=out_transform)
-    
-    # write the crop to the temporary file first
-    with rasterio.open(part_crop_path, "w", **profile) as dst:
-        dst.write(data)
-
-    # writing finished without error, so the temporary file gets its final name
-    part_crop_path.rename(crop_path)
-
-    return str(crop_path)
-
-
-def crop_gse_data(row):
-    """
-    Crops every AlphaEarth tile covering a study-area row's large_bbox directly over HTTPS
-    (COG range reads -- no full-tile download), saving only the needed pixels per tile/year.
-
-    Arguments:
-        row -- pandas.Series, a GeoDataFrame row with path and gse_tiles_by_year
-
-    Returns:
-        crop_paths -- list of strings, local file paths of the cropped GeoTIFFs written for this row
-    """
-    # defining path for output directory and list that catches all the paths to the files
-    out_dir = Path(row["path"])
-    crop_paths = []
-
-    for year, tiles in row["gse_tiles_by_year"].items():
-        for tile in tiles:
-            # to check whether a file is already successfully downloaded, 
-            # a temporary filename and a final file name are defined
-            crop_path = out_dir / f"{year}_{Path(tile['path']).stem}_crop.tif"
-            part_crop_path = out_dir / f"PART_{year}_{Path(tile['path']).stem}_crop.tif"
-
-            # checking three scenarios: 1) only stale file exists  
-            if part_crop_path.exists():
-                part_crop_path.unlink()
-                r = pull_gse_tiles(part_crop_path, crop_path, tile, row)
-                if r is not None:
-                    crop_paths.append(r) 
-            # 2) file does not exist at all (has never been downloaded before)
-            elif not crop_path.exists():
-                r = pull_gse_tiles(part_crop_path, crop_path, tile, row)
-                if r is not None:
-                    crop_paths.append(r) 
-            # complete file exists
-            elif crop_path.exists(): 
-                crop_paths.append(str(crop_path))
-
-    return crop_paths
-
-##################################################
-#======= Section 5: ESA Worldcover Helper =======#
-##################################################
 
 def pull_worldcover(row, index_gdf):
     """
@@ -957,51 +806,22 @@ def download_gnss(study_areas_gdf):
         
     return study_areas_gdf
 
-def download_gse(study_areas_gdf, years):
-    """
-    Crops the AlphaEarth satellite embedding tiles covering every study area's large_bbox (the
-    union of its downloaded burst footprints, not just the narrow query bbox), for every
-    requested year -- read directly over HTTPS (COG range reads), without downloading whole tiles.
-
-    Arguments:
-        study_areas_gdf -- geopandas.GeoDataFrame, from download_egms/download_gnss, with path set
-        years -- iterable of ints, which years to download (e.g. [2019, 2020, 2021, 2022, 2023])
-
-    Returns:
-        study_areas_gdf -- the same GeoDataFrame, with large_bbox, gse_tiles_by_year and
-            gse_crop_paths added
-    """
-
-    # Computing the larger bbox for the covariates on the dataframe
-    study_areas_gdf["large_bbox"] = study_areas_gdf.apply(large_bbox, axis=1)
-
-    # First download the index dataframe that contains information about the gse tiles and years
-    # index_gdf is the raw index_gdf only filtered by the years that are relevant here
-    index_gdf = load_gse_index("https://storage.googleapis.com/alphaearth_foundations/satellite_embedding/v1/annual/aef_index.csv")
-
-    # This adds the tiles per year as a new column to the gdf
-    study_areas_gdf["gse_tiles_by_year"] = study_areas_gdf.apply(tiles_for_row_gse, axis=1, index_gdf=index_gdf, years=years)
-
-    # Downloading the tiles into the location folder with year prefixes in filenames
-    study_areas_gdf["gse_crop_paths"] = study_areas_gdf.apply(crop_gse_data, axis=1)
-
-    # Saving the updated geodataframe
-    study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
-
-    return study_areas_gdf
 
 def download_esa_worldcover(study_areas_gdf, index_url):
     """
     Downloads the ESA WorldCover (v200, 2021) tiles covering every study area's large_bbox,
-    reusing the same large_bbox column download_gse computes.
+    computing that large_bbox column here (the union of the downloaded burst footprints).
 
     Arguments:
-        study_areas_gdf -- geopandas.GeoDataFrame, from download_gse, with large_bbox and path set
+        study_areas_gdf -- geopandas.GeoDataFrame, from download_gnss, with path set
         index_url -- URL to download the WorldCover tile grid geojson from
 
     Returns:
         None -- study_areas_gdf is updated and saved in place, not returned
     """
+    # the smallest rectangle spanning every downloaded burst's footprint, per study area
+    study_areas_gdf["large_bbox"] = study_areas_gdf.apply(large_bbox, axis=1)
+
     # download the index file with the tile grid
     index_path = pull_data_by_url(index_url, Path(__file__).parent / "../../assets/", "esa_world_cover_index.geojson")
 
@@ -1058,9 +878,6 @@ def main(real_sub_buffer_value, n_rnd, mindist_rnd, maxit_rnd):
     # Use the dataframe of the regions for which egms was downloaded to select and download
     # the GNSS stations and time series.
     study_areas_gdf = download_gnss(study_areas_gdf)
-
-    # download google satellite embeddings for every region
-    study_areas_gdf = download_gse(study_areas_gdf, [2019, 2020, 2021, 2022, 2023])
 
     # Download the ESA world cover for later land use stratification
     download_esa_worldcover(study_areas_gdf, index_url="https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/esa_worldcover_grid.geojson")
