@@ -617,42 +617,85 @@ This adapts coverage: points far from data get wider intervals.
 
 ### 7.1 Data loading and graph generation
 
-**Two-level caching, not one flat pre-generated graph set.** What's cached on disk and what's rebuilt every epoch are different things:
+**Not a star graph.** The mini-graph is not a fixed anchor with spokes to its neighbours. It is an interconnected network over a random subset of a candidate pool: every node is connected to its k nearest nodes in that subset (e.g. k=3), and any node can be the masked query. This is what makes it GNN kriging rather than weighted averaging around one centre: information reaches the query over several hops, through the neighbours' own neighbours.
 
-- **Cached once per burst, on disk** (via `Dataset.process()`'s `raw_file_names`/`processed_file_names` skip-if-exists mechanism, saved as `.pt` tensor bundles, not csv): the §4.3 Step 3 candidate pool itself — point coordinates, fetched GSE features per candidate point, land-cover class, and the angular-balanced neighbour indices for each anchor. This is the expensive part (k-NN search, GSE fetch) and never needs recomputing.
-- **Rebuilt fresh every call to `__getitem__`**: the actual masked `Data` graph — which cached neighbours are "known" vs "masked" this time. Cheap (just indexing + a random draw), and must **not** be cached, or masking stops varying across epochs.
+**Two levels: a fixed pool on disk, a fresh graph every draw.**
+
+- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: coordinates, velocity, incidence angle, GSE embedding, and land-cover class (stratification/eval metadata only, §4.1). This is the expensive part (angular selection, velocity fit, GSE sampling) and is never recomputed during training.
+- **Rebuilt fresh on every `__getitem__` call:**
+  1. draw a random subset of the pool's points,
+  2. pick one point of the subset as the query and hide its velocity,
+  3. connect every node to its k nearest nodes in the subset (symmetrised),
+  4. compute edge features (distance + unit direction) and the query's `dist_to_coherent` (distance to its nearest unmasked node) from the subset's coordinates.
+
+  The subset, the graph shape and the query all change between epochs. None of this may be cached, or that variation disappears.
+
+**Storage: few large files, not one per pool or per burst.** Scratch can't take thousands of small files. All pools of a shard (e.g. one region) go into one `.pt` file as flat tensors plus an offset array, so pool `p` is rows `pool_ptr[p]:pool_ptr[p+1]`. A pool never mixes bursts or orbits.
 
 ```python
-class BurstGraphDataset(torch.utils.data.Dataset):
-    """One per burst csv. Holds ONLY this burst's precomputed candidate pool."""
-    def __init__(self, csv_path, k=24, mask_rate=0.3):
-        super().__init__()
-        # process() pattern: build pool + cache k-NN + fetch GSE once,
-        # skip rebuilding if the processed .pt file already exists
-        self.pool = ...          # cached candidate points + their features
-        self.neighbours = ...    # cached angular-balanced neighbour indices per anchor
+bundle = {
+    "pos":        float32 (N, 2),   # EPSG:3035 metres; only ever used as differences
+    "velocity":   float32 (N,),     # single-year fit, §3.6a
+    "incidence":  float32 (N,),
+    "gse":        int8    (N, 64),  # raw quantised, de-quantised on read
+    "land_cover": uint8   (N,),     # metadata only, never a feature
+    "pool_ptr":   int64   (P + 1,), # pool p = rows pool_ptr[p]:pool_ptr[p+1]
+    "pool_burst": int32   (P,),     # index into burst_names
+    "burst_names": list[str],
+}
+torch.save(bundle, region_dir / "candidate_pools.pt")
+```
+
+**Edge features: lean towards computing them on the fly, not precomputing all pairs.** Distance and unit direction are a subtraction and a norm on ~10–20 coordinates, far cheaper than loading a precomputed pairwise array, and the edge set depends on the subset drawn anyway. Precomputing would store n² values per pool for no real saving. Not finalised.
+
+```python
+class PoolDataset(torch.utils.data.Dataset):
+    """One per persisted shard file. One item = one candidate pool."""
+    def __init__(self, bundle_path, k=3, subset_frac=(0.6, 0.9), stats=None):
+        self.b = torch.load(bundle_path, weights_only=False)
+        self.k, self.subset_frac, self.stats = k, subset_frac, stats
 
     def __len__(self):
-        return len(self.pool)
+        return len(self.b["pool_ptr"]) - 1
 
-    def __getitem__(self, idx):
-        cached_neighbours = self.neighbours[idx]           # fixed, no recompute
-        mask = np.random.rand(len(cached_neighbours)) > self.mask_rate  # FRESH every call
-        known_idx = cached_neighbours[mask]
-        return build_query_graph(idx, known_idx, self.pool, ...)
+    def __getitem__(self, p):
+        start, end = self.b["pool_ptr"][p], self.b["pool_ptr"][p + 1]
+        n = end - start
+        m = max(self.k + 2, int(n * random.uniform(*self.subset_frac)))
+        idx = start + torch.randperm(n)[:m]          # FRESH subset every call
+        q = random.randrange(m)                      # FRESH query every call
 
-burst_datasets = [BurstGraphDataset(csv) for csv in train_burst_csvs]
-full_dataset = torch.utils.data.ConcatDataset(burst_datasets)
+        pos = self.b["pos"][idx] - self.b["pos"][idx][q]          # relative to query
+        d = torch.cdist(pos, pos)
+        d.fill_diagonal_(float("inf"))
+        nbr = d.topk(self.k, largest=False).indices                # (m, k)
+        src = nbr.reshape(-1)
+        dst = torch.arange(m).repeat_interleave(self.k)
+        edge_index = to_undirected(torch.stack([src, dst]))       # plain torch, no torch_cluster needed
+        dvec = pos[edge_index[1]] - pos[edge_index[0]]
+        dist = dvec.norm(dim=1, keepdim=True)
+        edge_attr = torch.cat([dist, dvec / (dist + 1e-6)], dim=1)
+
+        vel = self.b["velocity"][idx].clone()
+        y = vel[q].clone()
+        vel[q] = 0.0                                              # hide the target
+        is_query = torch.zeros(m); is_query[q] = 1.0
+        # build x from [vel, is_query, incidence, dist_to_coherent, gse], normalised with self.stats
+        ...
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y,
+                    query_mask=is_query.bool())
+
+full_dataset = torch.utils.data.ConcatDataset([PoolDataset(f) for f in train_shard_files])
 loader = torch_geometric.loader.DataLoader(full_dataset, batch_size=64, shuffle=True)
 ```
 
-**Why masking actually varies per epoch — mechanism, not magic.** `shuffle=True` only randomizes the *order* anchors are visited in; it has nothing to do with the mask itself. The mask varies because `__getitem__(idx)` draws fresh randomness **every time it's called**, and `DataLoader` calls it again every epoch without caching the return value — same cached neighbour list, new random draw each time.
+**Why the graph actually varies per epoch — mechanism, not magic.** `shuffle=True` only randomizes the *order* pools are visited in. The subset, graph and query vary because `__getitem__(p)` draws fresh randomness **every time it's called**, and `DataLoader` calls it again every epoch without caching the return value — same persisted pool, new draw each time.
 
 **Caveat needing actual code, not automatic:** with `num_workers > 0`, forked/spawned worker processes can inherit identical RNG state, producing duplicated "random" masks across workers in the same epoch. Needs an explicit `worker_init_fn` that reseeds each worker (e.g. from `torch.utils.data.get_worker_info().seed`). Not an issue at `num_workers=0`.
 
 **Normalization placement:** compute mean/std per feature group (velocity, incidence, each GSE handling per §5.4/§10.13) once from the train split's cached pool, store separately, apply inside `__getitem__` on read — never bake normalized values into the cached raw tensors, so the stats can change without refetching anything.
 
-`ConcatDataset` is what combines the per-burst datasets into the one dataset a single `DataLoader` wraps — each burst's `__getitem__` only ever draws neighbours from its own cached pool, so batches can freely mix anchors from different bursts without ever mixing points *within* one graph across bursts.
+`ConcatDataset` is what combines the per-shard datasets into the one dataset a single `DataLoader` wraps — each `__getitem__` only ever draws points from one pool, and a pool never spans bursts or orbits, so batches can freely mix graphs from different bursts without ever mixing points *within* one graph across bursts.
 
 ### 7.2 Loss function
 
