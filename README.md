@@ -2,7 +2,7 @@
 
 # LOSTInPLACE
 
-**L**ine **O**f **S**ight **T**o **IN**SAR-derived continuous Dis**PLACE**ment
+**L**ine **O**f **S**ight **T**o **In**SAR-derived continuous Dis**PLACE**ment
 
 *Query-anywhere vertical and east-west displacement from LOS observation fields, learned with a graph neural network*
 
