@@ -31,28 +31,42 @@ Downloads, in order: EGMS products for the handpicked regions, EGMS for the rand
 ## Step 2 — Preprocessing
 
 ```bash
-uv run s02_preprocessing.py [--no-egms] [--no-gnss] [--no-worldcover]
+# thresholds given explicitly
+uv run s02_preprocessing.py --project-dir PROJECTDIR --egms-coherence 0.55 --egms-ampdisp-max 0.58
+# or thresholds derived from a sample of the data
+uv run s02_preprocessing.py --project-dir PROJECTDIR --egms-compute-thresholds
 ```
 
-| Argument | Description |
-|---|---|
-| `--no-egms` | Skip the EGMS preprocessing step |
-| `--no-gnss` | Skip the GNSS preprocessing step |
-| `--no-worldcover` | Skip the WorldCover tile merge |
+| Argument | Default | Description |
+|---|---|---|
+| `--project-dir` | required | Project root on scratch (same as Step 1's `--projectdir`); the parameter log goes to `PROJECTDIR/param_log/` |
+| `--no-egms` | runs | Skip the EGMS preprocessing |
+| `--no-gnss` | runs | Skip the GNSS preprocessing |
+| `--no-worldcover` | runs | Skip the WorldCover tile merge |
+| `--egms-coherence` | – | Minimum `temporal_coherence` to keep a point. Required unless `--egms-compute-thresholds` |
+| `--egms-ampdisp-max` | – | Maximum `amplitude_dispersion` to keep a point. Required unless `--egms-compute-thresholds` |
+| `--egms-compute-thresholds` | off | Derive both thresholds as quantiles instead. Can't be combined with the two values above |
+| `--egms-coherence-q` | `0.05` | Quantile used for the coherence threshold |
+| `--egms-ampdisp-q` | `0.95` | Quantile used for the amplitude dispersion threshold |
+| `--egms-sample-every` | `20` | For the quantiles, use every n-th row of each csv |
+| `--egms-file-every` | `3` | For the quantiles, use every n-th csv |
 
-All three run by default; each is independently skippable.
+All three steps run by default; each is independently skippable. Flags are switches without a value (`--no-gnss`, not `--no-gnss=True`).
 
-**Input:** `assets/study_areas_gdf` (from Step 1).
+**Input:** `assets/study_areas_gdf` and the raw EGMS csvs from Step 1.
 
-**Output:** `assets/study_areas_gdf` updated in place with `gnss_station_codes_filtered`/`gnss_station_paths_filtered`/`gnss_velocities`/`gnss_filter_params` (val regions) and `wc_merged_path` (one merged WorldCover GeoTIFF per region).
+**Output:**
+- `<burst>_PREPROCESSED.csv` next to every raw burst csv: only points passing both thresholds, only the columns `pid`, `latitude`, `longitude`, `easting`, `northing`, `incidence_angle`, `track_angle`, `los_east`, `los_north`, `los_up`, `mean_velocity`. Raw csvs stay untouched; dropped columns can be joined back via `pid`.
+- `assets/egms_norm_stats.json` (gitignored): mean/std of `mean_velocity` and `incidence_angle`, computed from the preprocessed csvs of **train regions only**, plus the thresholds used. The csvs keep raw values; normalization is applied later at read time.
+- `assets/study_areas_gdf` updated with `gnss_station_codes_filtered`/`gnss_station_paths_filtered`/`gnss_velocities`/`gnss_filter_params` (val regions) and `wc_merged_path`.
+- `PROJECTDIR/param_log/s02_preprocessing_log_<timestamp>.log`: all arguments of the run.
 
-Currently implemented:
-- **GNSS** (`preprocess_gnss`): drops val-region stations with <80% temporal coverage or a gap >120 days over 2019.0–2024.0, despikes the survivors (local median/MAD + Mann-Whitney test, see `remove_outlier`) and fits an east/north/up linear trend per station.
+What each part does:
+- **EGMS** (`preprocess_egms`): keeps points with `temporal_coherence >= --egms-coherence` and `amplitude_dispersion <= --egms-ampdisp-max` (`rmse` isn't used: it correlates at r≈−0.93 with coherence). Computed thresholds are pooled over all splits and printed to the job output.
+- **GNSS** (`preprocess_gnss`): drops val-region stations with <80% temporal coverage or a gap >120 days over 2019.0–2024.0, despikes the survivors (local median/MAD + Mann-Whitney test, see `remove_outlier`) and fits an east/north/up linear trend per station (`ve`/`vn`/`vu`, mm/yr).
 - **WorldCover** (`preprocess_esa10mwc`): merges each region's individual WorldCover tiles into one `worldcover_merged.tif`, safe to rerun.
 
-**Not yet implemented:** `preprocess_egms` is a stub. Per `project.md` §3.5/§4.6, this is where EGMS quality filtering (`rmse`/`temporal_coherence`/`amplitude_dispersion`/`mp_type` thresholds) and per-point temporal basis-coefficient fitting belong, ahead of Step 3.
-
-Run via `scripts/slurm/02_preprocessing.slurm`.
+Run via `scripts/slurm/02_preprocessing.slurm`. The raw EGMS csvs total ~1.1 TB, so the EGMS part reads a lot of data; check `--time` before submitting.
 
 ---
 
