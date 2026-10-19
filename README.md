@@ -40,6 +40,8 @@ Full design and rationale: [`project.md`](project.md). Full project name: *LOSTI
 
 Currently only the download stage is implemented; later stages follow the plan in `project.md`.
 
+For a step-by-step reference of each pipeline script (inputs, outputs, arguments, SLURM launch), see [`scripts/README.md`](scripts/README.md).
+
 ## Repository map
 
 | Path | Contents |
