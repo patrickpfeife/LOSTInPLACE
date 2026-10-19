@@ -15,4 +15,4 @@ cd ../python
 
 module load uv
 
-uv run s01_download_data.py --projectdir "/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE" 
+uv run s02_preprocessing.py 
