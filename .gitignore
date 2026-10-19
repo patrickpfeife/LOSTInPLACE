@@ -12,6 +12,7 @@ dummy_study_areas_gdf_complex.json
 dummy_study_areas_gdf.gpkg
 gnss_station_list.txt
 gse_index_file.csv
+backups/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
