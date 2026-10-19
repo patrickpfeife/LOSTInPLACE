@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=download_data
+#SBATCH --job-name=preprocessing
 #SBATCH --output=../logs/analysis_%j.out
 #SBATCH --error=../logs/analysis_%j.err
 #SBATCH --cpus-per-task=8
@@ -15,4 +15,4 @@ cd ../python
 
 module load uv
 
-uv run s02_preprocessing.py --no-gnss --no-worldcover
+uv run s02_preprocessing.py --no-gnss --no-worldcover --project-dir="/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE/"
