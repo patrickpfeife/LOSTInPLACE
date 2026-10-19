@@ -194,15 +194,19 @@ Over the rest of Europe, place **random burst-anchor points** with a **minimum s
 
 **Step 3: Within-burst candidate pool construction (angular-balanced k-NN, sequential, no point reuse).**
 
+Runs per burst csv (one orbit direction's file), train-split regions only — val is excluded entirely, since Tier 2 validation (§8.1) queries the model directly at GNSS station locations, not through a cached training-style pool; dev/cal may get their own pools later for their own separate uses, not as part of this step. Consumes the already quality-filtered EGMS output from preprocessing (`rmse`/`temporal_coherence`/`amplitude_dispersion`/`mp_type` thresholds) — filtering happens upstream, once, not redone here; this step should never need to re-examine a point it later has to discard for quality reasons.
+
 Within each selected burst csv, build the pool of mini-graph anchors as follows — this supersedes the simpler uniform-radius/min-distance idea originally sketched for this step (see §4.4 for what that radius concept is still used for):
 
-1. Stratify by dominant land-cover class (ESA WorldCover) so urban areas aren't overrepresented — same intent as before.
-2. Exclude a buffer margin along the burst's own boundary (sized like the §4.4 neighbourhood-radius estimate) so every candidate anchor has points available in every direction — no edge-starved anchors.
-3. Process points sequentially (order doesn't matter beyond determinism/reproducibility). For each still-unused point considered as an anchor: run **angular-balanced k-NN** — split the local neighbourhood into angular sectors, pick the nearest unused point(s) per sector — restricted to points **not already claimed by an earlier anchor's graph**.
-4. If a sector comes up short, either accept a smaller/uneven graph for this anchor (graphs don't need a fixed size — PyG batches variable-size graphs natively) or reject the anchor below some minimum-neighbour threshold. Open, decide empirically.
-5. On acceptance: mark the anchor and all its chosen neighbours as used, remove them from the pool, move to the next unused point.
+0. **Clip to the actual area of interest first**, separately from step 2's edge buffer below. EGMS downloads the *entire winning relative orbit* (§3.7/download design), which is routinely far larger than the original query bbox/`large_bbox` — especially for the handpicked real-subsidence regions, where most of a burst's million+ points can sit well outside the area actually of interest. Skipping this clip means wasting candidate-pool slots (and anchor budget, point 1 below) on irrelevant points. Distinct purpose and distinct (much larger) scale from step 2's edge buffer — conceptually two different clips, even if implemented in one function.
+1. **Cap the number of anchors drawn from this burst to a pre-determined budget, not exhaustive consumption.** Fully consuming every available point via steps 3-5 below would yield on the order of dozens to hundreds of millions of training examples pooled across all bursts — not tractable to store or train on. The budget-per-burst formula itself is undecided, see §10.14.
+2. Exclude a buffer margin along the burst's own (post-step-0) boundary (sized like the §4.4 neighbourhood-radius estimate) so every candidate anchor has points available in every direction — no edge-starved anchors.
+3. Stratify anchor selection by dominant land-cover class (ESA WorldCover) so urban areas aren't overrepresented. Land cover is used here only to pick a diverse set of anchors (and optionally retained as metadata for breaking down results by class later, §8.4) — it is never attached to points as a model feature; GSE embeddings remain the only covariate (§4.1).
+4. Process points sequentially within the step-1 budget (order doesn't matter beyond determinism/reproducibility), **as a single loop that threads anchor selection and neighbour consumption together** — not two independent passes, since a later anchor's available neighbours depend on exactly which points earlier anchors already claimed. For each still-unused point considered as an anchor: run **angular-balanced k-NN** — split the local neighbourhood into angular sectors, pick the nearest unused point(s) per sector — restricted to points **not already claimed by an earlier anchor's graph**.
+5. If a sector comes up short, either accept a smaller/uneven graph for this anchor (graphs don't need a fixed size — PyG batches variable-size graphs natively) or reject the anchor below some minimum-neighbour threshold. Open, decide empirically.
+6. On acceptance: mark the anchor and all its chosen neighbours as used, remove them from the pool, move to the next unused point (within budget).
 
-This replaces reserving a conservative worst-case min-distance around every anchor (which wastes points in dense areas) with directly tracking which points are already claimed — denser sampling, more training examples per burst, same no-shared-points-between-graphs guarantee.
+This replaces reserving a conservative worst-case min-distance around every anchor (which wastes points in dense areas) with directly tracking which points are already claimed — denser sampling, more training examples per burst for the same budget, same no-shared-points-between-graphs guarantee.
 
 **Sparsity augmentation — open, not yet decided.** The variable-graph-size support above is also what a future "simulate sparser regions" augmentation (dropping neighbours, possibly with its own point-level min-distance) would need. Tracked as open, see §10.11.
 
@@ -883,6 +887,12 @@ IGNNK (§3.2's source) doesn't just predict one masked node per training sample 
 Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5.4):
 - **Compression:** project a 64-dim embedding down via a small MLP before concatenating with other node features (rationale: dimensional balance, task-specific projection — see §5.4), vs. feeding it raw. Leaning toward compressing, not committed.
 - **Normalization:** the embedding is already roughly unit-scale post de-quantization and may encode meaningful relative geometry across its 64 dims; standardizing each dimension independently (the default treatment for every other feature group, §4.6) could distort that. Leaning toward skipping per-channel normalization for GSE specifically (or applying one shared scalar at most), unlike velocity/incidence/distance which get ordinary independent normalization. Not committed either way.
+
+### 10.14 OPEN — per-burst anchor budget for candidate pool construction
+
+**Status: confirmed necessary, formula not decided.**
+
+§4.3 Step 3's exhaustive version (consume every available point via sequential no-reuse k-NN) would produce on the order of dozens to hundreds of millions of training examples pooled across all bursts — not tractable to store or train on. A pre-determined per-burst budget (point 1 of that step) is required, not optional. Undecided: the actual formula -- fixed count per burst, density-based (target spacing, scaled by burst area), proportional to available post-clip/post-buffer point count, or something else. Whichever is chosen directly determines how balanced dataset composition is across bursts of very different size/density, so it's not a cosmetic parameter.
 
 ---
 
