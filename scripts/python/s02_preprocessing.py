@@ -12,11 +12,12 @@ import rasterio
 import s01_download_data as s01
 import pandas as pd
 import numpy as np
+import polars as pl
 
 from pathlib import Path
 from rasterio.merge import merge
 from scipy.stats import mannwhitneyu
-
+from datetime import datetime
 
 ##############################################################################
 #============================================================================#
@@ -27,35 +28,125 @@ from scipy.stats import mannwhitneyu
 ################################################
 #===== Section 1: Shared Helper Functions =====#
 ################################################
-"""
-2. What preprocessing needs to handle
-Grounding this in what project.md actually specifies for this stage, roughly in the order it'd naturally happen:
 
-Quality filtering first. Every EGMS point carries rmse, temporal_coherence, amplitude_dispersion, mp_type (PS vs DS). Decide thresholds and drop/flag low-quality points before anything downstream uses them — doing this after basis-fitting means you've wasted compute fitting curves to points you'll throw away anyway.
+def write_param_log(step_name, params):
+    """
+    Writes a short log file recording the runtime parameters a processing step was called with,
+    for provenance -- so a later rerun or a cached output can be checked against what parameters
+    actually produced it.
 
-Basis-coefficient fitting, per §3.5 — the centerpiece of this stage. Fit each point's LOS series to the small basis (linear trend + annual/semiannual sinusoids + ~3 cubic-spline knots) via lstsq, once, cached. Critically, fit ascending and descending separately, on each orbit's own native epochs — §3.5 is explicit that forcing both onto one shared epoch grid means guessing at dates one orbit never observed. Only after both are in coefficient space do they reconstruct onto a common grid via series = Φ @ coeffs.
+    Arguments:
+        step_name -- string, name of the processing step producing this log (e.g. "s02_preprocessing")
+        params -- dict, the runtime parameters to record (e.g. vars(args) from argparse)
 
-Global normalization, §4.6 — train split only. Mean/std for LOS coefficients, every predictor channel, and distances, computed by pooling all train-labeled regions together. Needs to happen after coefficient-fitting (you're normalizing coefficients, not raw series) and needs the split already assigned (which it is, via set).
+    Returns:
+        log_path -- Path, the log file that was written
+    """
 
-Predictor alignment — one real engineering task per source. AlphaEarth tiles are per-UTM-zone; ESA WorldCover and whatever DEM/hydro source you pick will each have their own native CRS and resolution. Every predictor needs to be sampled at each EGMS point's actual location, not just downloaded and left as-is. §4.1 says DEM should land on an "EPSG:3035 unified grid" — I'd apply that same discipline to all of them for consistency, even though §3.3 only forbids absolute coordinates in the graph itself, not a shared working CRS for sampling.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = PARAM_LOG_DIR / f"{step_name}_log_{timestamp}.log"
 
-AlphaEarth dequantization, before it's usable as a feature at all: x = ((v / 127.5) ** 2) * np.sign(v), int8 → unit-length float64. Also where you'd fix the full-tile-download issue above, if that gets addressed at this stage instead of in the download script — either point works, just needs to happen once, not per training step.
+    if log_path.exists():
+        log_path.unlink()
 
-§10.9's position-leakage tests, flagged explicitly as "cheap, do before scaling." Now that AlphaEarth is actually being downloaded, this is the moment to run the position probe and geographic ablation — before you've built a whole training pipeline around embeddings that might be smuggling absolute location back in.
+    with open(log_path, "w") as f:
+        f.write(f"step: {step_name}\n")
+        f.write(f"time: {datetime.now().isoformat()}\n")
+        f.write("parameters:\n")
+        for key, value in params.items():
+            f.write(f"  {key}: {value}\n")
 
-A sanity check on the split's geography, not just its labels. §4.5 wants train blocks spatially far from test/cal blocks so a test point's neighbours are never training points. The set column plus the 150km exclusion buffer should already guarantee this, but it's cheap to verify directly — compute the actual minimum distance between any train-labeled region and any cal/val-labeled region, and confirm it comfortably exceeds whatever k-NN neighbourhood radius you end up using.
+    return log_path
 
-Decide the output shape. Everything above collapses into one decision: what does a finished, per-point record actually look like (pid, projected coordinates, basis coefficients, predictor values, quality flags, split label), and in what file format — given hundreds of thousands of points per region, this is the first point where Parquet (you've already got polars) is probably worth it over CSV.
+def burst_csvs_for_region(region_path):
+    """
+    Lists every burst csv downloaded for one region, both orbit directions.
 
-# remember to crop the egms coverage to the actual bounding box defined. otherwise, too much surrounding 
-# points with barely any real displacement will be introduced through the regions that are actually just 
-# supposed to cover the real subsidence
+    Arguments:
+        region_path -- path (str or Path) to the region's folder (study_areas_gdf's region_path column)
 
-"""
+    Returns:
+        csv_paths -- list of Path, every "*.csv" under region_path/ascending and region_path/descending
+    """
+    region_path = Path(region_path)
+    return list(region_path.glob("ascending/*.csv")) + list(region_path.glob("descending/*.csv"))
+
+
+def all_burst_csvs(study_areas_gdf):
+    """
+    Lists every burst csv downloaded for every region in study_areas_gdf, pooled into one flat list.
+
+    Arguments:
+        study_areas_gdf -- geopandas.GeoDataFrame, with region_path set for every region
+
+    Returns:
+        csv_paths -- list of Path, every burst csv across every region (both orbit directions)
+    """
+    csvs = []
+    for region_path in study_areas_gdf["region_path"]:
+        csvs.extend(burst_csvs_for_region(region_path))
+
+    return csvs
+
 
 ################################################
 #====== Section 2: EGMS Helper Functions ======#
-################################################  
+################################################
+
+def compute_qa_stats(csvs, coherence_q=0.05, ampdisp_q=0.95):
+    """
+    Computes the given quantiles of temporal_coherence and amplitude_dispersion, pooled across
+    the given burst csvs. Used by preprocess_egms to derive thresholds when none are supplied.
+
+    Arguments:
+        csvs -- list of Path, burst csvs to pool (e.g. from all_burst_csvs)
+        coherence_q -- float, quantile to compute for temporal_coherence (the "bad" tail is low)
+        ampdisp_q -- float, quantile to compute for amplitude_dispersion (the "bad" tail is high)
+
+    Returns:
+        result -- dict, {"coherence_q": ..., "ampdisp_q": ...}, the two pooled quantile values
+    """
+    lf = pl.concat([
+        pl.scan_csv(csv_path).select(["temporal_coherence", "amplitude_dispersion"])
+        for csv_path in csvs
+    ])
+
+    result = lf.select([
+        pl.col("temporal_coherence").quantile(coherence_q).alias("coherence_q"),
+        pl.col("amplitude_dispersion").quantile(ampdisp_q).alias("ampdisp_q"),
+    ]).collect().row(0, named=True)
+
+    return result
+
+
+def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
+    """
+    Filters each given EGMS burst csv down to points passing both quality thresholds, writing
+    each result next to the original with "_PREPROCESSED" appended to the filename. Originals
+    are never touched, so a rerun with different thresholds is always possible. Any stale
+    filtered output from a previous run is removed first.
+
+    Arguments:
+        csvs -- list of Path, burst csvs to filter (e.g. from all_burst_csvs)
+        egms_coherence -- float, minimum temporal_coherence a point must have to be kept
+        egms_ampdisp_max -- float, maximum amplitude_dispersion a point may have to be kept
+
+    Returns:
+        None -- writes a "*_PREPROCESSED.csv" next to each input csv as a side effect
+    """
+    for csv in csvs:
+        csv = Path(csv)
+        out_path = csv.with_name(f"{csv.stem}_PREPROCESSED{csv.suffix}")
+
+        if out_path.exists():
+            out_path.unlink()
+
+        lf = pl.scan_csv(csv).filter(
+            (pl.col("temporal_coherence") >= egms_coherence) &
+            (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
+        )
+        lf.sink_csv(out_path)
+
 
 ################################################
 #====== Section 3: GNSS Helper Functions ======#
@@ -194,7 +285,7 @@ def find_quality_filtered_stations(row, coverag_frac_lim=0.8, max_gap_days_lim=1
 
     return good_stations, good_station_paths
 
-def compute_station_velovities(row, t0, t1):
+def compute_station_velocities(row, t0, t1):
     """
     Computes the east/north/up trend (mm/yr) for every (already quality-filtered) GNSS station
     in a region, over the given study period: despikes each component with remove_outlier, then
@@ -301,18 +392,38 @@ def merge_wc_tiles(row):
 #============================================================================#
 ##############################################################################
 
-def preprocess_egms():
+def preprocess_egms(study_areas_gdf, egms_coherence=None, egms_ampdisp_max=None, coherence_q=0.05, ampdisp_q=0.95):
     """
-    Placeholder for EGMS preprocessing -- not needed at this stage of the pipeline yet.
+    Filters every burst csv's points down to the ones passing quality thresholds on
+    temporal_coherence and amplitude_dispersion, writing each result as a sibling
+    "*_PREPROCESSED.csv" (see filter_egms). If egms_coherence/egms_ampdisp_max aren't given,
+    both are derived from the data itself as the given quantiles, pooled across every burst csv
+    in study_areas_gdf (see compute_qa_stats).
 
     Arguments:
-        None
+        study_areas_gdf -- geopandas.GeoDataFrame, with region_path set for every region
+        egms_coherence -- float or None, minimum temporal_coherence to keep a point; if None
+            (together with egms_ampdisp_max), computed from coherence_q
+        egms_ampdisp_max -- float or None, maximum amplitude_dispersion to keep a point; if None
+            (together with egms_coherence), computed from ampdisp_q
+        coherence_q -- float, quantile used to derive egms_coherence when it isn't given
+        ampdisp_q -- float, quantile used to derive egms_ampdisp_max when it isn't given
 
     Returns:
-        None
+        study_areas_gdf -- the same GeoDataFrame, unchanged (the filtered csvs are written to
+            disk as a side effect, not tracked as a new column yet)
     """
-    # actually doesnt need preprocessing at this point.
-    pass
+    csvs = all_burst_csvs(study_areas_gdf)
+
+    # if either threshold is missing, derive both from the data's own quantiles
+    if egms_coherence is None or egms_ampdisp_max is None:
+        qa_stats = compute_qa_stats(csvs, coherence_q=coherence_q, ampdisp_q=ampdisp_q)
+        egms_coherence = qa_stats["coherence_q"]
+        egms_ampdisp_max = qa_stats["ampdisp_q"]
+
+    filter_egms(csvs, egms_coherence, egms_ampdisp_max)
+
+    return study_areas_gdf
 
 def preprocess_gnss(study_areas_gdf):
     """
@@ -348,7 +459,7 @@ def preprocess_gnss(study_areas_gdf):
     # Computing the station velocities, on the filtered (quality-passing) stations only
     study_areas_gdf["gnss_velocities"] = None
     study_areas_gdf.loc[val_mask, "gnss_velocities"] = study_areas_gdf.loc[val_mask].apply(
-        compute_station_velovities, axis=1, t0=t0, t1=t1)
+        compute_station_velocities, axis=1, t0=t0, t1=t1)
 
     # Records the parameters this run used. Plain overwrite every run, no history kept on purpose.
     study_areas_gdf["gnss_filter_params"] = None
@@ -393,7 +504,8 @@ def preprocess_esa10mwc(study_areas_gdf):
 #============================================================================#
 ##############################################################################
 
-def main(run_egms=True, run_gnss=True, run_worldcover=True):
+def main(run_egms=True, run_gnss=True, run_worldcover=True, egms_coherence=None, egms_ampdisp_max=None,
+         coherence_q=0.05, ampdisp_q=0.95):
     """
     Loads study_areas_gdf, runs the EGMS/GNSS/ESA WorldCover preprocessing steps in sequence
     (each individually skippable), and saves the updated GeoDataFrame back to disk.
@@ -402,6 +514,10 @@ def main(run_egms=True, run_gnss=True, run_worldcover=True):
         run_egms -- bool, whether to run preprocess_egms
         run_gnss -- bool, whether to run preprocess_gnss
         run_worldcover -- bool, whether to run preprocess_esa10mwc
+        egms_coherence -- float or None, passed through to preprocess_egms
+        egms_ampdisp_max -- float or None, passed through to preprocess_egms
+        coherence_q -- float, passed through to preprocess_egms
+        ampdisp_q -- float, passed through to preprocess_egms
 
     Returns:
         None
@@ -410,7 +526,7 @@ def main(run_egms=True, run_gnss=True, run_worldcover=True):
     study_areas_gdf = s01.study_areas_io("read", base_path = Path(__file__).parent / "../../assets/study_areas_gdf")
 
     if run_egms:
-        preprocess_egms()
+        study_areas_gdf = preprocess_egms(study_areas_gdf, egms_coherence, egms_ampdisp_max, coherence_q, ampdisp_q)
 
     if run_gnss:
         study_areas_gdf = preprocess_gnss(study_areas_gdf)
@@ -433,8 +549,21 @@ if __name__ == '__main__':
                          help="skip the GNSS preprocessing step")
     parser.add_argument("--no-worldcover", dest="run_worldcover", action="store_false", default=True,
                          help="skip the WorldCover merge step")
+    parser.add_argument("--egms-coherence", dest="egms_coherence", type=float, default=None,
+                         help="minimum temporal_coherence to keep a point; omit to derive it from the data")
+    parser.add_argument("--egms-ampdisp-max", dest="egms_ampdisp_max", type=float, default=None,
+                         help="maximum amplitude_dispersion to keep a point; omit to derive it from the data")
+    parser.add_argument("--egms-coherence-q", dest="coherence_q", type=float, default=0.05,
+                         help="quantile used to derive --egms-coherence when it's omitted")
+    parser.add_argument("--egms-ampdisp-q", dest="ampdisp_q", type=float, default=0.95,
+                         help="quantile used to derive --egms-ampdisp-max when it's omitted")
 
     args = parser.parse_args()
 
-    main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover)
+    # Saving the important parameters in a log file
+    write_param_log("s02_preprocessing", vars(args))
+
+    main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover, 
+         egms_coherence=args.egms_coherence, egms_ampdisp_max=args.egms_ampdisp_max,
+         coherence_q=args.coherence_q, ampdisp_q=args.ampdisp_q)
 
