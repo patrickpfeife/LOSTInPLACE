@@ -55,6 +55,7 @@ def create_file_system():
     DEV_DIR.mkdir(parents=True, exist_ok=True)
     CAL_DIR.mkdir(parents=True, exist_ok=True)
     VAL_DIR.mkdir(parents=True, exist_ok=True)
+    PARAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 def study_areas_io(mode, gdf=None, base_path=None):
     """
@@ -911,6 +912,8 @@ if __name__ == '__main__':
     DEV_DIR = DATA_DIR / "dev"
     CAL_DIR = DATA_DIR / "cal"
     VAL_DIR = DATA_DIR / "val"
+    # For logging the processing parameter
+    PARAM_LOG_DIR = PROJECT_DIR / "param_log"
 
     # running the whole download
     main(real_sub_buffer_value = REAL_SUB_BUFFER_VALUE,
