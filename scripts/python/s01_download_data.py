@@ -78,8 +78,9 @@ def study_areas_io(mode, gdf=None, base_path=None):
     json_path = base_path.parent / f"{base_path.stem}_complex.json"
 
     # the columns holding lists or dicts. gpkg can't store those, so they go into the json
-    complex_cols = ["bbox", "station_codes", "station_file_paths", "good_station_file_paths", 
-                     "large_bbox", "world_cover_tile_urls", "wc_paths", "station_velocities"]
+    complex_cols = ["egms_query_bbox", "egms_union_bbox", "gnss_station_codes", "gnss_station_paths",
+                     "wc_tile_urls", "gnss_station_codes_filtered", "gnss_station_paths_filtered",
+                     "gnss_velocities", "gnss_filter_params"]
 
     if mode == "write":
         # work on a copy so the uid column doesn't end up in the gdf of the caller
@@ -272,7 +273,7 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
     Raises a RuntimeError if the search fails or is rejected (e.g. because of an invalid token).
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
+        row -- pandas.Series, a GeoDataFrame row with an egms_query_bbox field (list of [lon, lat] corners)
         headers -- dict, request headers carrying the bearer access token (see get_access_token)
         api_endpoint -- string, base URL of the EGMS API
 
@@ -283,7 +284,7 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
     
     # the search query: all L2B products of the 2019-2023 release that overlap the bbox
     query = {"id": None,
-         "bbox": row["bbox"],
+         "bbox": row["egms_query_bbox"],
          "levels" : ["L2B"],
          "releases" : ["2019-2023"]
          }
@@ -319,7 +320,7 @@ def pull_egms(row, token_path, orbit, failed_downloads):
     failed_downloads and skipped as well, so a single bad file doesn't stop the whole run.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with bbox, location and set
+        row -- pandas.Series, a GeoDataFrame row with egms_query_bbox, location and set
         token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
             a fresh access token and search id once they are close to expiring (both expire after
             1 hour, and a single row's files can take longer than that to all download)
@@ -361,7 +362,7 @@ def pull_egms(row, token_path, orbit, failed_downloads):
     result, links = query_egms(row=row, headers=headers)
 
     # the study area as polygon, to measure the overlap with the bursts below
-    study_area = Polygon(row["bbox"])
+    study_area = Polygon(row["egms_query_bbox"])
     # keep only the products of the wanted orbit direction, together with their links
     pairs = [(hit, link) for hit, link in zip(result["hits"], links)
                  if hit["direction"] == orbit]
@@ -526,14 +527,14 @@ def stations_in_bbox(row, stations):
     Returns the 4-digit station codes ("Sta") of the GNSS stations within a row's bbox polygon.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with a bbox field (list of [lon, lat] corners)
+        row -- pandas.Series, a GeoDataFrame row with an egms_query_bbox field (list of [lon, lat] corners)
         stations -- geopandas.GeoDataFrame, station points with a "Sta" column, same CRS as the bbox
 
     Returns:
         station_codes_within -- list of strings, the "Sta" codes of stations within the bbox
     """
     # create a polygon from the bbox col
-    bbox = Polygon(row["bbox"])
+    bbox = Polygon(row["egms_query_bbox"])
     # .within returns boolean, so selection on stations first
     # then return them as list to be added as col in the gdf
     station_codes_within = stations.loc[stations.within(bbox), "Sta"].tolist()
@@ -546,7 +547,7 @@ def pull_stations_in_bbox_data(row):
     station_codes, into the row's location folder.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with station_codes and path
+        row -- pandas.Series, a GeoDataFrame row with gnss_station_codes and region_path
 
     Returns:
         ts_file_paths -- list of strings, local file paths of the downloaded time series
@@ -556,11 +557,11 @@ def pull_stations_in_bbox_data(row):
     # empty list to catch the paths to the gnss files
     ts_file_paths = []
     # loop over all stations that were found within that region
-    for station_code in row["station_codes"]:
+    for station_code in row["gnss_station_codes"]:
        # create individual url for every station
        url = f"{base_url}{station_code}.EU.tenv3"
        # reuse the download function
-       ts_file_path = pull_data_by_url(url, Path(row["path"]), f"{str(station_code)}_gnss_time_series.tenv3")
+       ts_file_path = pull_data_by_url(url, Path(row["region_path"]), f"{str(station_code)}_gnss_time_series.tenv3")
        # catch the file paths to fill a new dataframe column
        ts_file_paths.append(ts_file_path)
 
@@ -601,7 +602,7 @@ def large_bbox(row):
     narrow query bbox -- enough to support points queried later, not just the original margins.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with path (the location folder containing
+        row -- pandas.Series, a GeoDataFrame row with region_path (the location folder containing
             ascending/ and descending/ subfolders of downloaded, unzipped EGMS csvs)
 
     Returns:
@@ -610,7 +611,7 @@ def large_bbox(row):
     # computes the footprint for every csv in the two orbit folders per location
     bboxes = []
     for folder in ["ascending", "descending"]:
-        csvs = (Path(row["path"]) / folder).glob("*.csv")
+        csvs = (Path(row["region_path"]) / folder).glob("*.csv")
         for csv_path in csvs:
             # A list with all the individual bbox is created
             bboxes.append(bbox_per_csv(csv_path))
@@ -628,7 +629,7 @@ def pull_worldcover(row, index_gdf):
     downloads each one into the row's location folder.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with large_bbox and path
+        row -- pandas.Series, a GeoDataFrame row with egms_union_bbox and region_path
         index_gdf -- geopandas.GeoDataFrame, the WorldCover tile grid, with an "ll_tile" column
             (see download_esa_worldcover)
 
@@ -636,7 +637,7 @@ def pull_worldcover(row, index_gdf):
         tile_urls -- list of strings, the download URL of every tile that intersects the row
     """
     # First we build a Polygon from the bbox column
-    bbox = Polygon(row["large_bbox"])
+    bbox = Polygon(row["egms_union_bbox"])
     # Find all tiles that intersect with that large bbox per location
     tiles = index_gdf[index_gdf.intersects(bbox)]
     # extract only the tile codes in that column to build the download urls for that tile
@@ -648,7 +649,7 @@ def pull_worldcover(row, index_gdf):
         tile_urls.append(url)
     # Pull the tiles reusing pull_data_by_url
     for tile_url in tile_urls:
-        pull_data_by_url(tile_url, Path(row["path"]), Path(tile_url).name)
+        pull_data_by_url(tile_url, Path(row["region_path"]), Path(tile_url).name)
 
     return tile_urls
 
@@ -674,7 +675,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     Returns:
         study_areas_gdf -- geopandas.GeoDataFrame, the real subsidence regions plus the randomly
-            sampled regions combined (EPSG:3035), with bbox and path set
+            sampled regions combined (EPSG:3035), with egms_query_bbox and region_path set
     """
 
     ################################################
@@ -690,7 +691,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     # Compute the bounding boxes for every real subsidence region
     t2projected = Transformer.from_crs(real_subsidence.crs, "EPSG:3035", always_xy=True)
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
-    real_subsidence["bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=real_subsidence.crs)
+    real_subsidence["egms_query_bbox"] = real_subsidence.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=real_subsidence.crs)
 
     # Collects every file that could not be downloaded, filled by pull_egms and written to disk below
     failed_downloads = []
@@ -698,8 +699,8 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     # Download the products with filter before
     # the set variable decides into which region the data goes
     # Generally:  0 = train    1 = dev   2 = cal   3 = val
-    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending", failed_downloads=failed_downloads)
-    real_subsidence["path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending", failed_downloads=failed_downloads)
+    real_subsidence["region_path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending", failed_downloads=failed_downloads)
+    real_subsidence["region_path"] = real_subsidence.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending", failed_downloads=failed_downloads)
 
     ################################################
     #=== Section 2: The Normal Training Regions ===#
@@ -730,11 +731,11 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random["location"] = egms_random["set"].map(set_names) + "_" + (egms_random.groupby("set").cumcount() + 1).astype(str)
 
     # Creating the bbox and querying the archive on the random point samples
-    egms_random["bbox"] = egms_random.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=egms_random.crs)
+    egms_random["egms_query_bbox"] = egms_random.apply(point_to_bbox, axis=1, result_type="reduce", t2projected=t2projected, t2wgs84=t2wgs84, source_crs=egms_random.crs)
     
     # downloading the egms data for the new areas
-    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending", failed_downloads=failed_downloads)
-    egms_random["path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending", failed_downloads=failed_downloads)
+    egms_random["region_path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "ascending", failed_downloads=failed_downloads)
+    egms_random["region_path"] = egms_random.apply(pull_egms, axis = 1, token_path=token_path, orbit = "descending", failed_downloads=failed_downloads)
 
     # Writing the files that could not be downloaded to disk so they are not lost silently
     if failed_downloads:
@@ -764,14 +765,14 @@ def download_gnss(study_areas_gdf):
     leaving station_codes/station_file_paths as None for train/dev/cal regions.
 
     Arguments:
-        study_areas_gdf -- geopandas.GeoDataFrame, from download_egms, with bbox/location/set/path
+        study_areas_gdf -- geopandas.GeoDataFrame, from download_egms, with egms_query_bbox/location/set/region_path
 
     Returns:
-        study_areas_gdf -- the same GeoDataFrame, with station_codes and station_file_paths added
+        study_areas_gdf -- the same GeoDataFrame, with gnss_station_codes and gnss_station_paths added
     """
     # Creating a col for the station codes. Only the val regions shall receive a valid entry
     # For the train and dev regions this stays None
-    study_areas_gdf["station_codes"] = None
+    study_areas_gdf["gnss_station_codes"] = None
 
     # pull the list of all stations
     gnss_station_list_path = pull_data_by_url("https://geodesy.unr.edu/NGLStationPages/DataHoldings.txt", 
@@ -790,15 +791,15 @@ def download_gnss(study_areas_gdf):
     # Creating a mask to apply stations_in_bbox only to the validation regions
     val_mask = study_areas_gdf["set"] == 3
     # apply the function and write the result back into the val row, leaving None for train/dev
-    study_areas_gdf.loc[val_mask, "station_codes"] = study_areas_gdf.loc[val_mask].apply(
+    study_areas_gdf.loc[val_mask, "gnss_station_codes"] = study_areas_gdf.loc[val_mask].apply(
         stations_in_bbox, axis=1, stations=stations)
 
     ##########################################################
     # Now downloading the actual time series
 
     # Again only compute on the validation areas
-    study_areas_gdf["station_file_paths"] = None
-    study_areas_gdf.loc[val_mask, "station_file_paths"] = study_areas_gdf.loc[val_mask].apply(
+    study_areas_gdf["gnss_station_paths"] = None
+    study_areas_gdf.loc[val_mask, "gnss_station_paths"] = study_areas_gdf.loc[val_mask].apply(
             pull_stations_in_bbox_data, axis=1)
 
     # Saving the updated geodataframe
@@ -813,14 +814,14 @@ def download_esa_worldcover(study_areas_gdf, index_url):
     computing that large_bbox column here (the union of the downloaded burst footprints).
 
     Arguments:
-        study_areas_gdf -- geopandas.GeoDataFrame, from download_gnss, with path set
+        study_areas_gdf -- geopandas.GeoDataFrame, from download_gnss, with region_path set
         index_url -- URL to download the WorldCover tile grid geojson from
 
     Returns:
         None -- study_areas_gdf is updated and saved in place, not returned
     """
     # the smallest rectangle spanning every downloaded burst's footprint, per study area
-    study_areas_gdf["large_bbox"] = study_areas_gdf.apply(large_bbox, axis=1)
+    study_areas_gdf["egms_union_bbox"] = study_areas_gdf.apply(large_bbox, axis=1)
 
     # download the index file with the tile grid
     index_path = pull_data_by_url(index_url, Path(__file__).parent / "../../assets/", "esa_world_cover_index.geojson")
@@ -829,7 +830,7 @@ def download_esa_worldcover(study_areas_gdf, index_url):
     index_gdf = gpd.read_file(index_path)
 
     # Downloading the tiles and adding their urls as a new column to the gdf
-    study_areas_gdf["world_cover_tile_urls"] = study_areas_gdf.apply(pull_worldcover, axis=1, index_gdf=index_gdf)
+    study_areas_gdf["wc_tile_urls"] = study_areas_gdf.apply(pull_worldcover, axis=1, index_gdf=index_gdf)
 
     # Saving the updated geodataframe
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")

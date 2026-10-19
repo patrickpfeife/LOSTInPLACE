@@ -168,7 +168,7 @@ def find_quality_filtered_stations(row, coverag_frac_lim=0.8, max_gap_days_lim=1
     tenv3 file.
 
     Arguments:
-        row -- pandas.Series, a study_areas_gdf row with station_codes and station_file_paths
+        row -- pandas.Series, a study_areas_gdf row with gnss_station_codes and gnss_station_paths
         coverag_frac_lim -- float, minimum fraction of the study period a station's data must span
         max_gap_days_lim -- float, largest allowed gap between consecutive epochs, in days
 
@@ -181,7 +181,7 @@ def find_quality_filtered_stations(row, coverag_frac_lim=0.8, max_gap_days_lim=1
     good_stations = []
     good_station_paths = []
 
-    for station_code, station_path in zip(row["station_codes"], row["station_file_paths"]):
+    for station_code, station_path in zip(row["gnss_station_codes"], row["gnss_station_paths"]):
 
         # load the time series data
         gnss_df = pd.read_csv(station_path, sep=r"\s+")
@@ -201,7 +201,8 @@ def compute_station_velovities(row, t0, t1):
     fits a straight line to what's left.
 
     Arguments:
-        row -- pandas.Series, a study_areas_gdf row with station_codes and station_file_paths
+        row -- pandas.Series, a study_areas_gdf row with gnss_station_codes_filtered and
+            gnss_station_paths_filtered (the quality-passing subset, see find_quality_filtered_stations)
         t0 -- float, start of the study period (decimal year, inclusive)
         t1 -- float, end of the study period (decimal year, exclusive)
 
@@ -212,7 +213,7 @@ def compute_station_velovities(row, t0, t1):
     # This function computes the velocities for the stations that passed the quality filter.
     velocities = []
 
-    for station_code, station_path in zip(row["station_codes"], row["station_file_paths"]):
+    for station_code, station_path in zip(row["gnss_station_codes_filtered"], row["gnss_station_paths_filtered"]):
         # load the time series data and filter for the time period of interest again
         gnss_df = pd.read_csv(station_path, sep=r"\s+")
         t = gnss_df["yyyy.yyyy"].to_numpy()
@@ -253,30 +254,31 @@ def compute_station_velovities(row, t0, t1):
 
 def merge_wc_tiles(row):
     """
-    Merges a region's individual ESA WorldCover tiles into one GeoTIFF and deletes the originals.
+    Merges a region's individual ESA WorldCover tiles into one GeoTIFF. The originals are kept
+    (not deleted) specifically so this step can be redone later -- deleting them would make a
+    rerun impossible, since there'd be nothing left to merge from.
     Safe to call again on an already-merged region (returns the existing merged file without
     redoing anything) or a region with zero or one tile downloaded (nothing to merge).
 
     Arguments:
-        row -- pandas.Series, a study_areas_gdf row with path (the region's folder)
+        row -- pandas.Series, a study_areas_gdf row with region_path (the region's folder)
 
     Returns:
-        wc_path -- Path or None, the merged GeoTIFF's path, the single tile's path if there was
-            only one, or None if no WorldCover tiles exist for this region at all
+        wc_merged_path -- Path or None, the merged GeoTIFF's path, the single tile's path if
+            there was only one, or None if no WorldCover tiles exist for this region at all
     """
     # This function merges the world cover tiles per location directory.
 
-    folder = Path(row["path"])
+    folder = Path(row["region_path"])
     tifs = list(folder.glob("ESA_WorldCover*.tif"))
 
-    wc_path = folder / "worldcover_merged.tif"
-    if wc_path.exists():
-        return wc_path          # already merged in an earlier run, reuse it, don't touch it
+    wc_merged_path = folder / "worldcover_merged.tif"
+    if wc_merged_path.exists():
+        return wc_merged_path    # already merged in an earlier run, reuse it, don't touch it
     if len(tifs) == 0:
         return None              # genuinely nothing downloaded for this region
     if len(tifs) == 1:
         return tifs[0]           # nothing to merge, the one file already is "the" worldcover file
-        
 
     datasets = [rasterio.open(f) for f in tifs]
     mosaic, transform = merge(datasets)
@@ -284,18 +286,14 @@ def merge_wc_tiles(row):
     profile = datasets[0].profile
     # only the shape of the new tif changes, the rest stays the same as in the input
     profile.update(height=mosaic.shape[1], width=mosaic.shape[2], transform=transform)
-    # New worldcover tif path
-    wc_path = folder / "worldcover_merged.tif"
     # uses the new profile to open a new tif in write mode
-    with rasterio.open(wc_path, "w", **profile) as dst:
+    with rasterio.open(wc_merged_path, "w", **profile) as dst:
         dst.write(mosaic)
-    # closes the opened datasets and deletes the individual tif files. 
+    # closes the opened datasets -- the individual tiles are deliberately NOT deleted, see docstring
     for ds in datasets:
         ds.close()
-    for f in tifs:
-        f.unlink()
 
-    return wc_path
+    return wc_merged_path
 
 ##############################################################################
 #============================================================================#
@@ -318,47 +316,75 @@ def preprocess_egms():
 
 def preprocess_gnss(study_areas_gdf):
     """
-    Runs the full GNSS preprocessing step for the val regions: filters out low-quality stations,
-    updates station_codes/station_file_paths to only the survivors, and computes each survivor's
-    east/north/up trend.
+    Runs the full GNSS preprocessing step for the val regions: filters out low-quality stations
+    into new gnss_station_codes_filtered/gnss_station_paths_filtered columns (the originals from
+    01_download_data.py are left untouched, so this can be rerun later with different thresholds),
+    computes each survivor's east/north/up trend, and records the thresholds this run used.
 
     Arguments:
-        study_areas_gdf -- geopandas.GeoDataFrame, with station_codes/station_file_paths already
-            populated for val (set==3) rows by 01_download_data.py
+        study_areas_gdf -- geopandas.GeoDataFrame, with gnss_station_codes/gnss_station_paths
+            already populated for val (set==3) rows by 01_download_data.py
 
     Returns:
-        study_areas_gdf -- the same GeoDataFrame, with station_codes/station_file_paths filtered
-            down to the quality-passing stations and a new station_velocities column added
+        study_areas_gdf -- the same GeoDataFrame, with gnss_station_codes_filtered,
+            gnss_station_paths_filtered, gnss_velocities, and gnss_filter_params added
     """
     # Filter the dataframe for the validation set because only there, gnss data is even available on disk
     val_mask = study_areas_gdf["set"] == 3
+    coverag_frac_lim, max_gap_days_lim = 0.8, 120
+    t0, t1 = 2019.0, 2024.0
+
     # Filter out the stations with insuffiecient temporal coverage or too large gaps
     result = study_areas_gdf.loc[val_mask].apply(find_quality_filtered_stations, axis=1,
-                                              coverag_frac_lim=0.8, max_gap_days_lim=120)
-    
-    # Putting the right result in the right column
-    study_areas_gdf.loc[val_mask, "station_codes"] = result.apply(lambda r: r[0])
-    study_areas_gdf.loc[val_mask, "station_file_paths"] = result.apply(lambda r: r[1])
+                                              coverag_frac_lim=coverag_frac_lim, max_gap_days_lim=max_gap_days_lim)
 
-    # Computing the station velocities
-    study_areas_gdf["station_velocities"] = study_areas_gdf.loc[val_mask].apply(compute_station_velovities, axis=1, t0=2019.0, t1=2024.0)
+    # New columns, not overwriting gnss_station_codes/gnss_station_paths -- keeps the original
+    # candidate list around so a future rerun with different thresholds has something to work from
+    study_areas_gdf["gnss_station_codes_filtered"] = None
+    study_areas_gdf["gnss_station_paths_filtered"] = None
+    study_areas_gdf.loc[val_mask, "gnss_station_codes_filtered"] = result.apply(lambda r: r[0])
+    study_areas_gdf.loc[val_mask, "gnss_station_paths_filtered"] = result.apply(lambda r: r[1])
+
+    # Computing the station velocities, on the filtered (quality-passing) stations only
+    study_areas_gdf["gnss_velocities"] = None
+    study_areas_gdf.loc[val_mask, "gnss_velocities"] = study_areas_gdf.loc[val_mask].apply(
+        compute_station_velovities, axis=1, t0=t0, t1=t1)
+
+    # Records the parameters this run used. Plain overwrite every run, no history kept on purpose.
+    study_areas_gdf["gnss_filter_params"] = None
+    study_areas_gdf.loc[val_mask, "gnss_filter_params"] = [
+        {"coverag_frac_lim": coverag_frac_lim, "max_gap_days_lim": max_gap_days_lim, "t0": t0, "t1": t1}
+        for _ in range(val_mask.sum())
+    ]
 
     return study_areas_gdf
 
 def preprocess_esa10mwc(study_areas_gdf):
     """
-    Merges every region's individual ESA WorldCover tiles into one GeoTIFF.
+    Merges every region's individual ESA WorldCover tiles into one GeoTIFF. Deletes any
+    previously-merged output first (never an original tile -- see the name check below), so
+    this step can genuinely be rerun instead of merge_wc_tiles silently skipping already-merged
+    regions.
 
     Arguments:
-        study_areas_gdf -- geopandas.GeoDataFrame, with path set for every region
+        study_areas_gdf -- geopandas.GeoDataFrame, with region_path set for every region
 
     Returns:
-        study_areas_gdf -- the same GeoDataFrame, with a new wc_path column (the merged GeoTIFF's
-            path per region)
+        study_areas_gdf -- the same GeoDataFrame, with a new wc_merged_path column (the merged
+            GeoTIFF's path per region)
     """
+    # clear stale merged output so merge_wc_tiles' own "already merged" check doesn't skip the redo.
+    # only ever deletes files actually named worldcover_merged.tif -- never an original tile, which
+    # is what wc_merged_path holds instead when a region only ever had exactly one tile to begin with
+    if "wc_merged_path" in study_areas_gdf.columns:
+        for p in study_areas_gdf["wc_merged_path"].dropna():
+            p = Path(p)
+            if p.name == "worldcover_merged.tif" and p.exists():
+                p.unlink()
+
     # merging the individual esa worldcover tiles
-    study_areas_gdf["wc_path"] = study_areas_gdf.apply(merge_wc_tiles, axis = 1)
-    
+    study_areas_gdf["wc_merged_path"] = study_areas_gdf.apply(merge_wc_tiles, axis = 1)
+
     return study_areas_gdf
 
 ##############################################################################
@@ -367,13 +393,15 @@ def preprocess_esa10mwc(study_areas_gdf):
 #============================================================================#
 ##############################################################################
 
-def main():
+def main(run_egms=True, run_gnss=True, run_worldcover=True):
     """
-    Loads study_areas_gdf, runs the EGMS/GNSS/ESA WorldCover preprocessing steps in sequence,
-    and saves the updated GeoDataFrame back to disk.
+    Loads study_areas_gdf, runs the EGMS/GNSS/ESA WorldCover preprocessing steps in sequence
+    (each individually skippable), and saves the updated GeoDataFrame back to disk.
 
     Arguments:
-        None
+        run_egms -- bool, whether to run preprocess_egms
+        run_gnss -- bool, whether to run preprocess_gnss
+        run_worldcover -- bool, whether to run preprocess_esa10mwc
 
     Returns:
         None
@@ -381,23 +409,32 @@ def main():
     # Import the gdf again to have access to all the file paths
     study_areas_gdf = s01.study_areas_io("read", base_path = Path(__file__).parent / "../../assets/study_areas_gdf")
 
-    preprocess_egms()
+    if run_egms:
+        preprocess_egms()
 
-    study_areas_gdf = preprocess_gnss(study_areas_gdf)
+    if run_gnss:
+        study_areas_gdf = preprocess_gnss(study_areas_gdf)
 
-    study_areas_gdf = preprocess_esa10mwc(study_areas_gdf)
+    if run_worldcover:
+        study_areas_gdf = preprocess_esa10mwc(study_areas_gdf)
 
     s01.study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
-        
+
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--projectdir", required=True)
+    # every step runs by default -- pass the matching --no-... flag to skip just that one
+    parser.add_argument("--no-egms", dest="run_egms", action="store_false", default=True,
+                         help="skip the EGMS preprocessing step")
+    parser.add_argument("--no-gnss", dest="run_gnss", action="store_false", default=True,
+                         help="skip the GNSS preprocessing step")
+    parser.add_argument("--no-worldcover", dest="run_worldcover", action="store_false", default=True,
+                         help="skip the WorldCover merge step")
 
     args = parser.parse_args()
 
-    main() 
+    main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover)
 
