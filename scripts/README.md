@@ -72,17 +72,19 @@ Run via `scripts/slurm/02_preprocessing.slurm`. The raw EGMS csvs total ~1.1 TB,
 
 ## Step 3 — Build Training Dataset
 
-**Status: design only, not yet implemented** (`s03_build_training_dataset.py` is pseudocode/skeleton). Documented here so the intended shape is in one place; see `project.md` §4.3–§4.4 and §10.14 for the full rationale and open questions.
+**Status: design only, not yet implemented** (`s03_build_training_dataset.py` is a skeleton). Documented here so the intended shape is in one place; see `project.md` §4.3–§4.4, §7.1 and §10.14–§10.16 for rationale and open questions.
 
-**Input:** per-burst EGMS CSVs already quality-filtered by Step 2's `preprocess_egms`, for train-split regions only (`set == 0`). Val regions are excluded entirely — Tier 2 validation (§8.1) queries the model directly at GNSS station locations, not through a cached pool.
+**Input:** per-burst `*_PREPROCESSED.csv` files from Step 2, for train-split regions only (`set == 0`). Val regions are excluded: Tier 2 validation (§8.1) queries the model at GNSS station locations, not through candidate pools.
 
-**Output (planned):** one cached tensor bundle per burst csv — coordinates, per-year velocity, GSE embedding, land-cover class, and precomputed angular-balanced neighbour indices for every selected anchor, saved as `.pt`. The masked PyG `Data` graph itself is rebuilt fresh at `__getitem__` time every epoch, not cached, since the mask must vary per epoch (§7.1).
+**Output (planned):** a few large shard files, one per region, each holding many **candidate pools** as flat arrays plus an offset array (`pool_ptr`): `lat`/`lon` (float64), `mean_velocity` (float32), `incidence` (float32), `gse` (int8, 64 per point), `land_cover` (uint8, metadata only), and the burst each pool came from. A pool never mixes bursts or orbits. No graph is stored.
+
+**What happens at training time, not in this step:** every `__getitem__` draws a random subset of one pool, picks a random query point in it and hides its velocity, computes all pairwise geodesic distances/bearings from lat/lon, connects every node to its k nearest nodes (k=3 assumed) and builds the edge features. So the graph is an interconnected network, not a star around a fixed centre, and the subset, the graph and the query change every epoch (§7.1).
 
 Planned per-burst steps:
-1. Clip to the actual area of interest (EGMS downloads the whole winning relative orbit, far larger than the original query bbox), then buffer in from the burst's edges so every anchor has full neighbourhood coverage.
-2. Cap the number of anchors drawn from this burst to a pre-determined budget — exhaustive consumption would yield on the order of 10⁸ examples pooled across all bursts (§10.14, formula still open).
-3. Select anchors stratified by dominant land-cover class, for a spatially/class-diverse sample — land cover is never a model feature, only used here and optionally for per-class evaluation breakdown (§8.4).
-4. Build each anchor's candidate pool via angular-balanced k-NN (sector-wise nearest unused point), sequentially, with no point reused across graphs.
-5. Attach node/edge features (GSE embedding per point, edge distance + direction) and save the tensor bundle.
+1. Clip to the area of interest (EGMS downloads the whole winning relative orbit), then cut a buffer off the burst edges so every seed has neighbours in all directions.
+2. Cap the number of seeds drawn from the burst to a pre-determined budget (§10.14, formula open).
+3. Pick seeds stratified by land cover, with a grid or minimum spacing for spatial spread. Land cover is never a model feature.
+4. For each seed, gather its pool by angular selection (about 8 sectors, nearest unused point per sector), sequentially in one loop with no point reused across pools.
+5. Sample GSE at the pool points from a transient windowed read per region and keep only the int8 vectors (§10.16). Write the region's shard.
 
 No SLURM script or CLI arguments exist yet.
