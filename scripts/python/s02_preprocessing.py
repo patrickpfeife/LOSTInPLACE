@@ -28,6 +28,9 @@ EGMS_KEEP_COLS = ["pid", "latitude", "longitude", "easting", "northing", "incide
                   "track_angle", "los_east", "los_north", "los_up", "mean_velocity"]
 EGMS_NORM_COLS = ["mean_velocity", "incidence_angle"]
 EGMS_NORM_STATS_PATH = Path(__file__).parent / "../../assets/egms_norm_stats.json"
+EGMS_FLOAT_COLS = {c: pl.Float64 for c in ["latitude", "longitude", "easting", "northing", "incidence_angle", "track_angle",
+                                            "los_east", "los_north", "los_up", "mean_velocity",
+                                            "temporal_coherence", "amplitude_dispersion"]}
 
 ##############################################################################
 #============================================================================#
@@ -75,7 +78,7 @@ def burst_csvs_for_region(region_path):
         csv_paths -- list of Path
     """
     region_path = Path(region_path)
-    csvs = list(region_path.glob("ascending/*.csv")) + list(region_path.glob("descending/*.csv"))
+    csvs = sorted(region_path.glob("ascending/*.csv")) + sorted(region_path.glob("descending/*.csv"))
 
     return [c for c in csvs if not c.stem.endswith("_PREPROCESSED")]
 
@@ -128,7 +131,7 @@ def compute_qa_stats(csvs, coherence_q=0.05, ampdisp_q=0.95, sample_every=20):
         result -- dict, {"coherence_q": ..., "ampdisp_q": ...}
     """
     lf = pl.concat([
-        pl.scan_csv(csv_path).select(["temporal_coherence", "amplitude_dispersion"]).gather_every(sample_every)
+        pl.scan_csv(csv_path, schema_overrides=EGMS_FLOAT_COLS).select(["temporal_coherence", "amplitude_dispersion"]).gather_every(sample_every)
         for csv_path in csvs
     ], how="vertical_relaxed")
 
@@ -156,10 +159,12 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
     for csv in csvs:
         out_path = preprocessed_path(csv)
 
+        # Deleting existing files if there
         if out_path.exists():
             out_path.unlink()
 
-        lf = pl.scan_csv(csv).filter(
+        # Filter rows based on thresholds, then select only the needed cols
+        lf = pl.scan_csv(csv, schema_overrides=EGMS_FLOAT_COLS).filter(
             (pl.col("temporal_coherence") >= egms_coherence) &
             (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
         ).select(EGMS_KEEP_COLS)
@@ -179,17 +184,20 @@ def compute_norm_stats(study_areas_gdf, egms_coherence, egms_ampdisp_max, stats_
     Returns:
         stats -- dict, mean/std per column plus counts and thresholds
     """
+    # Statistics for normalization are only computed from the training set
     train_gdf = study_areas_gdf.loc[study_areas_gdf["set"] == 0]
     csvs = [preprocessed_path(c) for c in all_burst_csvs(train_gdf)]
 
-    lf = pl.concat([pl.scan_csv(c).select(EGMS_NORM_COLS) for c in csvs], how="vertical_relaxed")
+    lf = pl.concat([pl.scan_csv(c, schema_overrides=EGMS_FLOAT_COLS).select(EGMS_NORM_COLS) for c in csvs], how="vertical_relaxed")
 
+    # compute the mean and std for the columns that need normalization
     row = lf.select([
         pl.len().alias("n_points"),
         *[pl.col(c).mean().alias(f"{c}_mean") for c in EGMS_NORM_COLS],
         *[pl.col(c).std().alias(f"{c}_std") for c in EGMS_NORM_COLS],
-    ]).collect().row(0, named=True)
+    ]).collect(engine="streaming").row(0, named=True)
 
+    # save the stats in assets directory
     stats = {
         "source": "preprocessed csvs of train regions (set == 0)",
         "n_csvs": len(csvs),
@@ -226,11 +234,10 @@ def remove_outlier(values, n=10, alpha=0.05, k=5):
     # This function removes outliers from the GNSS time series without touching real steps
     # caused by earthquakes for example
     # Work on a copy of the real values
-    values_cp = np.asarray(values, dtype = float).copy()
-
     values = np.asarray(values, dtype=float)
     values_cp = values.copy()
 
+    # windowed approach with n values before and after the one that is being checked 
     for i in range(n, len(values)-n):
         before = values[i-n:i]
         after = values[i+1:i+1+n]
