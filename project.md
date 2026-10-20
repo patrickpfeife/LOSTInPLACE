@@ -121,8 +121,8 @@ Stage 2: CLASSICAL GEOMETRIC DECOMPOSITION (closed-form)
 
 **Status: active working scope, not a permanent architecture change.** To get a first end-to-end pipeline running, several of the above mechanisms are deliberately narrowed. The fuller versions they defer are kept everywhere else in this document, not deleted — the prototype choices below are a strict subset of them, chosen so the later, fuller version reuses the same code rather than requiring a rewrite.
 
-- **Target: single-year velocity, not the full time series or §3.5's multi-year basis coefficients.** Fit velocity from one year's date columns in the raw EGMS series (self-computed, via the same `lstsq` machinery as §3.5, just restricted to one year's dates). EGMS's own `mean_velocity` field spans the *entire* downloaded 2019–2023 window, so it can't be reused directly for a single-year target.
-- **Covariate: that same year's AlphaEarth embedding, not averaged across years.** No year-pooling needed for the prototype — §5.3's `AnnualEncoder` (mean-pool over years) becomes relevant again only once the target moves beyond one year.
+- **Target: EGMS's own `mean_velocity` (mean LOS velocity over the full 2019–2023 window), not the full time series or §3.5's basis coefficients.** Decided 2026-10-20; this replaces the earlier single-year self-fit. It is already a column in the preprocessed csvs, so no velocity-fitting step exists anywhere in the pipeline, and it spans the same window as the GNSS validation trends (2019.0–2024.0), so the comparison is like for like.
+- **Covariate: AlphaEarth embedding; which year(s) is open (§10.16).** With a 5-year target, a single year's embedding no longer matches the target window by construction. Options: one representative year, or an embedding pooled over 2019–2023 (§5.3's `AnnualEncoder` idea becomes relevant again).
 - **Node features, simplified accordingly:** `[velocity (1), is_query (1), incidence_angle (1), dist_to_coherent (1), encoded GSE static vector]` — no `p`-dimensional basis coefficients. Output head is scalar `(mu, logvar)` instead of `ℝ^p`.
 - **Uncertainty propagation (§6.3/6.4), scalar version:** no basis-reconstruction step (`Φ @ coeffs`) needed, since there's no coefficient vector. The asc/desc decomposition (§6.4) applies the same `G⁻¹` once to `(mu_v, var_v)` per orbit, instead of looping over `T` epochs.
 - **Deferred, revisit once this works end-to-end:** full multi-year time series target; reprojection loss (§7.2 — parked, not on the near-term roadmap); MSE-warmup before switching to NLL (§7.4 — pending literature justification, see §10.12); GSE per-channel normalization and the compression-MLP choice (§5.4 — both flagged for supervisor discussion, not finalized, see §10.13).
@@ -165,7 +165,7 @@ Verified against EGMS's own `los_*` columns: agreement to 6e-4. The asc/desc sig
 
 ### 4.2 Coordinate system & distances
 
-For the **European training panel**, EPSG:3035 (ETRS89-LAEA) is fine for distance/neighbour operations. Distances are in metres. Convert to/from lat/lon only at I/O edges (user query, output metadata).
+**Decision (2026-10-20): every model-facing distance and bearing (angular selection, k-NN, edge features, `dist_to_coherent`) is computed geodesically from latitude/longitude** (`pyproj.Geod(ellps="WGS84").inv`, as in the tutorial notebook), not in EPSG:3035. This keeps the pipeline identical inside and outside Europe, which the transferability claim of the thesis depends on (see below and §10.7). The EPSG:3035 columns (`easting`/`northing`) stay in the preprocessed csvs and may still be used for purely internal geometry that never reaches the model: AOI clip, edge buffer, spatial indexing.
 
 **Resolved (Section 10.7): the CRS choice itself doesn't matter for global transfer.** Because the architecture only ever consumes *relative* distance + unit-direction on edges (Section 3.3) — never absolute position — there is no need for one continent-spanning projected CRS. What matters is only that each pairwise distance/bearing is computed with a method that's metrically valid for that specific pair of points, e.g. geodesic distance/azimuth (`pyproj.Geod`, CRS-agnostic, valid anywhere) or a per-query local azimuthal-equidistant projection centred on the target. Outside Europe, swap EPSG:3035 for one of those; no architecture change needed. Raster predictors (DEM/AEF/hydrogeology, Section 4.1) still need *some* locally-appropriate grid per region, but that's a data-engineering detail, not a modelling constraint.
 
@@ -325,7 +325,7 @@ class TemporalEncoder(nn.Module):
 
 ### 5.3 Annual predictor encoding
 
-**Prototype note (§3.6a):** with a single-year velocity target, there's only one year of AEF data per point — no pooling needed. Feed the (64,) vector directly into §5.4's `StaticEncoder`. This encoder becomes relevant again once the target moves to multi-year.
+**Prototype note (§3.6a):** the target is the 2019–2023 mean velocity, so whether one year's embedding or a pooled one is used is open (§10.16). Either way a single (64,) vector per point goes directly into §5.4's `StaticEncoder`; this `AnnualEncoder` is only needed if several years are fed in separately.
 
 ```python
 class AnnualEncoder(nn.Module):
@@ -539,7 +539,7 @@ This is the honest "I'm unsure where you are" signal.
 
 ### 6.3 Propagation through basis reconstruction
 
-**Prototype note (§3.6a):** not needed for now — with a scalar single-year velocity target there's no coefficient vector to reconstruct. Skip straight to §6.4, applied to `(mu_v, var_v)` directly. Revisit this section once the target moves to multi-year/full time series.
+**Prototype note (§3.6a):** not needed for now — with a scalar mean-velocity target there's no coefficient vector to reconstruct. Skip straight to §6.4, applied to `(mu_v, var_v)` directly. Revisit this section once the target moves to multi-year/full time series.
 
 Basis coefficients → LOS series:
 ```
@@ -558,7 +558,7 @@ var_los_epistemic = Phi @ diag(var_epistemic) @ Phi.T
 
 ### 6.4 Propagation through decomposition
 
-**Prototype note (§3.6a):** for the single-year velocity target, `G⁻¹` is applied once to `(mu_v_asc, var_v_asc)` / `(mu_v_desc, var_v_desc)` — the scalar case of the same formula below, no per-epoch loop. Run it twice (once for aleatoric variances, once for epistemic) to keep the split alive into the final EW/Up numbers.
+**Prototype note (§3.6a):** for the scalar mean-velocity target, `G⁻¹` is applied once to `(mu_v_asc, var_v_asc)` / `(mu_v_desc, var_v_desc)` — the scalar case of the same formula below, no per-epoch loop. Run it twice (once for aleatoric variances, once for epistemic) to keep the split alive into the final EW/Up numbers.
 
 Decomposition at the query point:
 ```
@@ -621,23 +621,24 @@ This adapts coverage: points far from data get wider intervals.
 
 **Two levels: a fixed pool on disk, a fresh graph every draw.**
 
-- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: coordinates, velocity, incidence angle, GSE embedding, and land-cover class (stratification/eval metadata only, §4.1). This is the expensive part (angular selection, velocity fit, GSE sampling) and is never recomputed during training.
+- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: lat/lon, `mean_velocity` (EGMS's own 2019–2023 field, no fitting needed, §3.6a), incidence angle, GSE embedding, and land-cover class (stratification/eval metadata only, §4.1). This is the expensive part (angular selection, GSE sampling) and is never recomputed during training. **GSE is sampled once, here, from a transient windowed COG read per region; only the per-point 64-dim int8 vectors are kept and no raster tiles are stored (§10.16).**
 - **Rebuilt fresh on every `__getitem__` call:**
   1. draw a random subset of the pool's points,
   2. pick one point of the subset as the query and hide its velocity,
-  3. connect every node to its k nearest nodes in the subset (symmetrised),
-  4. compute edge features (distance + unit direction) and the query's `dist_to_coherent` (distance to its nearest unmasked node) from the subset's coordinates.
+  3. compute all pairwise geodesic distances and bearings of the subset from lat/lon (`pyproj.Geod`, as in the tutorial notebook, §4.2) and connect every node to its k nearest nodes (symmetrised),
+  4. take the edge features (distance + unit direction of the bearing) from those same matrices, plus the query's `dist_to_coherent` (distance to its nearest unmasked node), and normalise them (see below).
 
   The subset, the graph shape and the query all change between epochs. None of this may be cached, or that variation disappears.
 
-**Storage: few large files, not one per pool or per burst.** Scratch can't take thousands of small files. All pools of a shard (e.g. one region) go into one `.pt` file as flat tensors plus an offset array, so pool `p` is rows `pool_ptr[p]:pool_ptr[p+1]`. A pool never mixes bursts or orbits.
+**Storage: few large files, not one per pool or per burst.** Scratch can't take thousands of small files. All pools of a shard go into one `.pt` file as flat tensors plus an offset array, so pool `p` is rows `pool_ptr[p]:pool_ptr[p+1]`. A pool never mixes bursts or orbits. **A shard is simply one such file holding many pools.** Working choice: one shard per region (a few dozen files, each loaded whole into RAM and regenerable on its own); per burst would mean 1000+ files, one per split a single file that can't be regenerated per region.
 
 ```python
 bundle = {
-    "pos":        float32 (N, 2),   # EPSG:3035 metres; only ever used as differences
-    "velocity":   float32 (N,),     # single-year fit, §3.6a
+    "lat":        float64 (N,),     # WGS84; only used for pairwise distances/bearings
+    "lon":        float64 (N,),
+    "velocity":   float32 (N,),     # EGMS mean_velocity 2019–2023, raw mm/yr, §3.6a
     "incidence":  float32 (N,),
-    "gse":        int8    (N, 64),  # raw quantised, de-quantised on read
+    "gse":        int8    (N, 64),  # raw quantised, de-quantised on read; year handling open, §10.16
     "land_cover": uint8   (N,),     # metadata only, never a feature
     "pool_ptr":   int64   (P + 1,), # pool p = rows pool_ptr[p]:pool_ptr[p+1]
     "pool_burst": int32   (P,),     # index into burst_names
@@ -646,7 +647,7 @@ bundle = {
 torch.save(bundle, region_dir / "candidate_pools.pt")
 ```
 
-**Edge features: lean towards computing them on the fly, not precomputing all pairs.** Distance and unit direction are a subtraction and a norm on ~10–20 coordinates, far cheaper than loading a precomputed pairwise array, and the edge set depends on the subset drawn anyway. Precomputing would store n² values per pool for no real saving. Not finalised.
+**Edge features: computed on the fly from the subset's pairwise geodesic matrices, not precomputed per pool.** The edge set depends on the subset drawn anyway, and precomputing would store n² values per pool for no real saving. The unit direction is bounded in [−1, 1] and needs no scaling. **Distance does need normalising, and its mean/std can't be read off stored values because the edges only exist per draw. They don't have to be exact:** run the same sampling function offline over a random sample of train pools (a few thousand draws give hundreds of thousands of edges, far more than a stable mean/std needs), store the result as a separate stats entry, and recompute only when the sampling parameters (k, subset fraction) change. Distances are heavy-tailed (dense urban pools vs sparse rural ones), so standardise `log1p(distance)` rather than raw metres; same treatment for `dist_to_coherent`. Do not normalise per graph (e.g. by the graph's median edge length): that removes the absolute scale, which is what tells the model how far the nearest evidence is.
 
 ```python
 class PoolDataset(torch.utils.data.Dataset):
@@ -665,16 +666,21 @@ class PoolDataset(torch.utils.data.Dataset):
         idx = start + torch.randperm(n)[:m]          # FRESH subset every call
         q = random.randrange(m)                      # FRESH query every call
 
-        pos = self.b["pos"][idx] - self.b["pos"][idx][q]          # relative to query
-        d = torch.cdist(pos, pos)
-        d.fill_diagonal_(float("inf"))
-        nbr = d.topk(self.k, largest=False).indices                # (m, k)
+        lat, lon = self.b["lat"][idx].numpy(), self.b["lon"][idx].numpy()
+        ii, jj = np.meshgrid(np.arange(m), np.arange(m), indexing="ij")
+        az, _, dist = Geod(ellps="WGS84").inv(lon[ii.ravel()], lat[ii.ravel()],   # all ordered pairs i -> j
+                                              lon[jj.ravel()], lat[jj.ravel()])
+        dist = torch.tensor(dist, dtype=torch.float32).view(m, m)                 # metres
+        az = torch.tensor(np.radians(az), dtype=torch.float32).view(m, m)         # bearing i -> j, clockwise from north
+
+        d = dist.clone(); d.fill_diagonal_(float("inf"))
+        nbr = d.topk(self.k, largest=False).indices                # (m, k) nearest, however far they are
         src = nbr.reshape(-1)
         dst = torch.arange(m).repeat_interleave(self.k)
         edge_index = to_undirected(torch.stack([src, dst]))       # plain torch, no torch_cluster needed
-        dvec = pos[edge_index[1]] - pos[edge_index[0]]
-        dist = dvec.norm(dim=1, keepdim=True)
-        edge_attr = torch.cat([dist, dvec / (dist + 1e-6)], dim=1)
+        s, t = edge_index                                         # attributes looked up after symmetrising,
+        edge_attr = torch.stack([torch.log1p(dist[s, t]),         # so each direction gets its own bearing
+                                 torch.sin(az[s, t]), torch.cos(az[s, t])], dim=1)  # distance standardised with self.stats
 
         vel = self.b["velocity"][idx].clone()
         y = vel[q].clone()
@@ -689,11 +695,15 @@ full_dataset = torch.utils.data.ConcatDataset([PoolDataset(f) for f in train_sha
 loader = torch_geometric.loader.DataLoader(full_dataset, batch_size=64, shuffle=True)
 ```
 
+**Connectivity with k=3.** Every node gets its 3 nearest neighbours however far away they are, so the query always has 3 incoming edges and never sees an empty neighbourhood. That does not make the graph a single connected component: any group of ≥4 points whose three nearest neighbours all lie inside the group is cut off from the rest, no matter how far away the rest is. Harmless for the prediction itself, since nodes outside the query's component cannot influence it, but multi-hop information only flows within the query's component. One more reason to keep the subset large enough (§10.15).
+
+**Edge queries.** A random query near the edge of a pool has neighbours on one side only; the angular balance around the seed doesn't hold for it, so it is an extrapolation case. Allowed by default (uniform choice of query), since it is a realistic "query anywhere" situation. To keep in mind: record the query's largest angular gap per draw so errors can be broken down by it, and consider weighting the query choice later if edge queries turn out to dominate (§10.15).
+
 **Why the graph actually varies per epoch — mechanism, not magic.** `shuffle=True` only randomizes the *order* pools are visited in. The subset, graph and query vary because `__getitem__(p)` draws fresh randomness **every time it's called**, and `DataLoader` calls it again every epoch without caching the return value — same persisted pool, new draw each time.
 
 **Caveat needing actual code, not automatic:** with `num_workers > 0`, forked/spawned worker processes can inherit identical RNG state, producing duplicated "random" masks across workers in the same epoch. Needs an explicit `worker_init_fn` that reseeds each worker (e.g. from `torch.utils.data.get_worker_info().seed`). Not an issue at `num_workers=0`.
 
-**Normalization placement:** compute mean/std per feature group (velocity, incidence, each GSE handling per §5.4/§10.13) once from the train split's cached pool, store separately, apply inside `__getitem__` on read — never bake normalized values into the cached raw tensors, so the stats can change without refetching anything.
+**Normalization placement:** stats are stored separately and applied inside `__getitem__` on read; normalized values are never baked into the cached raw tensors, so the stats can change without refetching anything. Velocity and incidence stats are exact (computed by `s02` from the filtered train csvs, `assets/egms_norm_stats.json`). Edge-distance and `dist_to_coherent` stats are sampled estimates (see above). GSE handling per §5.4/§10.13.
 
 `ConcatDataset` is what combines the per-shard datasets into the one dataset a single `DataLoader` wraps — each `__getitem__` only ever draws points from one pool, and a pool never spans bursts or orbits, so batches can freely mix graphs from different bursts without ever mixing points *within* one graph across bursts.
 
@@ -865,7 +875,7 @@ The single-CRS concern raised in Section 4.2 turned out to be a non-issue: the a
 
 ### 10.8 OPEN — temporal representation for irregular / non-EGMS series
 
-**Status: moot for now.** With the §3.6a prototype scoped to a single-year scalar velocity target, no temporal basis fitting is happening at all — this only becomes relevant again once the target moves back to multi-year/full time series. Shelved until then, not resolved.
+**Status: moot for now.** With the §3.6a prototype scoped to a scalar mean-velocity target, no temporal basis fitting is happening at all — this only becomes relevant again once the target moves back to multi-year/full time series. Shelved until then, not resolved.
 
 **Original concern, unchanged below:**
 
@@ -937,6 +947,14 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 §4.3 Step 3's exhaustive version (consume every available point via sequential no-reuse k-NN) would produce on the order of dozens to hundreds of millions of training examples pooled across all bursts — not tractable to store or train on. A pre-determined per-burst budget (point 1 of that step) is required, not optional. Undecided: the actual formula -- fixed count per burst, density-based (target spacing, scaled by burst area), proportional to available post-clip/post-buffer point count, or something else. Whichever is chosen directly determines how balanced dataset composition is across bursts of very different size/density, so it's not a cosmetic parameter.
 
+### 10.15 OPEN — pool and graph parameters
+
+**Status: starting values only, to be tuned empirically.** Angular sectors for the pool: probably 8. Pool size (~20 points assumed), subset fraction per draw, k (3 assumed), minimum neighbours below which a seed is rejected (§4.3 Step 3.5): all undecided. Two behaviours to keep in mind rather than solve now: (1) k=3 does not guarantee one connected component (§7.1), (2) queries near a pool's edge are extrapolation cases (§7.1); whether to restrict or reweight them is open, and implementing that control is non-trivial. Seed spatial spread (land-cover stratification alone won't do it, since PS points are rare in forest/fields) needs a grid or minimum spacing on top, with per-class caps rather than equal counts per class.
+
+### 10.16 OPEN — GSE year(s) and sampling strategy
+
+**Status: working plan, not verified.** (1) *Which year(s):* the target is the 2019–2023 mean velocity (§3.6a), so a single year's embedding doesn't match it by construction. Options: one representative year (64 B/point), or a pooled embedding over 2019–2023 (average then renormalise, or all five years kept and pooled in the model: 320 B/point). Interacts with §10.13. (2) *Sampling:* GSE is not stored as rasters (full tiles ~4.3 GB, regional windows ~200 MB per year). `s03` samples it once per region from a transient windowed COG read at the pool points and keeps only the int8 vectors. Sampling per `__getitem__` during training is **not** viable: remote range requests per draw would stall the data loader, and compute nodes may not have outbound HTTPS. As of 2026-10-20 the GSE download is not implemented in `s01` (only the tile index exists), so this is a prerequisite for `s03`'s feature step.
+
 ---
 
 ---
@@ -974,11 +992,11 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 **Next up (§3.6a prototype scope):**
 - [ ] Per-burst candidate pool: land-cover-stratified anchors, angular-balanced k-NN, sequential no-reuse sampling, edge buffer (§4.3 Step 3 / §4.4)
-- [ ] Per-year velocity extracted from raw EGMS date columns (self-fit, not the provided multi-year `mean_velocity`) (§3.6a)
-- [ ] GSE values fetched at candidate points only, that year's embedding (no year-pooling) (§3.6a)
-- [ ] Candidate pool + GSE + neighbour indices cached to disk per burst (`.pt`, `Dataset.process()` pattern) (§7.1)
-- [ ] `BurstGraphDataset` + `ConcatDataset` + `DataLoader(shuffle=True)` wired up, masking drawn fresh in `__getitem__` (§7.1)
-- [ ] Global normalization stats computed on train split only, applied at read time (§4.6)
+- [x] Target is EGMS's own `mean_velocity` (2019–2023), a column in the preprocessed csvs, no fitting step (§3.6a)
+- [ ] GSE sampled once at candidate points only from a transient windowed read, vectors kept, no rasters stored; year choice decided (§10.16)
+- [ ] Candidate pools (lat/lon, velocity, incidence, GSE vectors, land cover, pool offsets) written to a few shard files, one per region (§7.1)
+- [ ] `PoolDataset` + `ConcatDataset` + `DataLoader(shuffle=True)` wired up, subset/graph/query drawn fresh in `__getitem__` (§7.1)
+- [ ] Normalization applied at read time: velocity/incidence stats from s02 (done), edge-distance and `dist_to_coherent` stats estimated from sampled draws (§4.6, §7.1)
 - [ ] Model architecture implemented (scalar head: `(mu_v, logvar_v)`, no basis coefficients yet) (§5, §3.6a)
 - [ ] Masked-target training loop working, bootstrap ensemble × M copies (§7.3)
 - [ ] Heteroscedastic NLL loss (§6.1) — MSE warmup still pending literature decision (§10.12)
@@ -989,7 +1007,7 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 - [ ] Baseline (regression-kriging) implemented and compared (§8.2)
 - [ ] Per-stratum performance analysis, spatial maps and time series plots (§8.4)
 
-**Deferred until the single-year prototype works end-to-end:**
+**Deferred until the scalar mean-velocity prototype works end-to-end:**
 - [ ] Full multi-year temporal basis fit (§3.5), reconstruction propagation (§6.3)
 - [ ] Reprojection loss (§7.2, parked)
 - [ ] Sparsity augmentation (§10.11), distance-binned calibration (§6.5), multi-node masking (§10.10)
