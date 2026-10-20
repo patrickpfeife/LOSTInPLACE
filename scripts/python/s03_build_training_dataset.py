@@ -7,8 +7,13 @@
 #============================================================================#
 ##############################################################################
 
-import s01_download_data as s01
+import Path
+import argparse
 
+import s01_download_data as s01
+import s02_preprocessing as s02
+
+from datetime import datetime
 
 
 ##############################################################################
@@ -17,9 +22,28 @@ import s01_download_data as s01
 #============================================================================#
 ##############################################################################
 
+
+
+""""
+Decide the anchor-budget formula (§10.14) — needed before find_n_points() can be real code, not just a placeholder. 
+
+Pick an approach (fixed count / density-based / proportional to post-clip point count) and write down why.
+
+Restructure select_center_nodes() + select_candidate_pool() into one interleaved, stateful loop in s03 — 
+the two-phase split risks breaking the no-reuse guarantee, as flagged.
+
+Fix main()'s split filtering — restrict to train rows only.
+"""
 ################################################
 #===== Section 1: Shared Helper Functions =====#
 ################################################
+
+
+
+
+
+
+
 
 def select_area_and_buffer_burst_edges():
     # This function buffers the burst edges so points too close to the edges are not included
@@ -44,8 +68,9 @@ def build_tensor_bundle():
     # builds the minigraphs in a particular way
     pass
 
-
-
+def combine_burst_train_sets():
+    # takes many csv based train sets and puts them into one.
+    pass
 
 ##############################################################################
 #============================================================================#
@@ -53,7 +78,7 @@ def build_tensor_bundle():
 #============================================================================#
 ##############################################################################
 
-def build_train_dataset_per_burst():
+def build_train_dataset_per_burst(csv):
     # per set per region there are multiple bursts. This function is applied to every
     # individual burst building a training dataset for it. 
     # saves this training dataset as cache to build the global dataset from many small ones later.
@@ -99,6 +124,24 @@ def build_train_dataset_per_burst():
     build_tensor_bundle()
     pass
 
+def build_train_dataset_per_region(row):
+    # This collects the sets per burst and puts them in one file and returns
+    # the path to that file
+
+    # This returns a list with all paths to the csvs per region (ascending and descending)
+    csvs_for_region = [s02.preprocessed_path(c) for c in s02.burst_csvs_for_region(row["region_path"])]
+
+    # Per csv, the training build is done and collected in a list 
+    train_sets_burst = [build_train_dataset_per_burst(csv) for csv in csvs_for_region]
+
+    # The per burst sets are combined to one per region
+    # returns the file path to that file
+    train_file = combine_burst_train_sets()
+
+    return train_file
+
+
+
 ##############################################################################
 #============================================================================#
 # 4) Main
@@ -110,16 +153,18 @@ def main():
     
     # Import the gdf again to have access to all the file paths
     study_areas_gdf = s01.study_areas_io("read", base_path = Path(__file__).parent / "../../assets/study_areas_gdf")
+    # Select the training regions only 
+    train_mask = study_areas_gdf["set"] == 0
 
-
-
+    study_areas_gdf.loc[train_mask, "train_file"] = study_areas_gdf.loc[train_mask].apply(build_train_dataset_per_region, axis=1)
+    
     # !!!! Determine the paths to every csv in ascending and descending in the region folder
     # So loop over the region_paths with apply in gdf, build a list to every egms csv and then loop over every csv using the function below
     # BUILDING the tensor bundle per burst. Takes in one region row from gdf and builds paths to csv from that 
     # !!!! Do not apply to validation regions, since they only need the gnss stations.
     # INPUT: path to a egms csv
     # OUTPUT: Saved tensor bundle
-    build_train_dataset_per_burst()
+    
 
 
 if __name__ == '__main__':
@@ -128,7 +173,12 @@ if __name__ == '__main__':
 
     parser.add_argument("--projectdir", required=True)
 
+
+
+
     args = parser.parse_args()
 
+    # Saving the important parameters in a log file
+    s02.write_param_log("s03_build_training_dataset", vars(args))
+    
     main() 
-
