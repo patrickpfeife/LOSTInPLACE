@@ -199,12 +199,12 @@ Runs per burst csv (one orbit direction's file), train-split regions only — va
 Within each selected burst csv, build the pool of mini-graph anchors as follows — this supersedes the simpler uniform-radius/min-distance idea originally sketched for this step (see §4.4 for what that radius concept is still used for):
 
 0. **Clip to the actual area of interest first**, separately from step 2's edge buffer below. EGMS downloads the *entire winning relative orbit* (§3.7/download design), which is routinely far larger than the original query bbox/`large_bbox` — especially for the handpicked real-subsidence regions, where most of a burst's million+ points can sit well outside the area actually of interest. Skipping this clip means wasting candidate-pool slots (and anchor budget, point 1 below) on irrelevant points. Distinct purpose and distinct (much larger) scale from step 2's edge buffer — conceptually two different clips, even if implemented in one function.
-1. **Cap the number of anchors drawn from this burst to a pre-determined budget, not exhaustive consumption.** Fully consuming every available point via steps 3-5 below would yield on the order of dozens to hundreds of millions of training examples pooled across all bursts — not tractable to store or train on. The budget-per-burst formula itself is undecided, see §10.14.
-2. Exclude a buffer margin along the burst's own (post-step-0) boundary (sized like the §4.4 neighbourhood-radius estimate) so every candidate anchor has points available in every direction — no edge-starved anchors.
-3. Stratify anchor selection by dominant land-cover class (ESA WorldCover) so urban areas aren't overrepresented. Land cover is used here only to pick a diverse set of anchors (and optionally retained as metadata for breaking down results by class later, §8.4) — it is never attached to points as a model feature; GSE embeddings remain the only covariate (§4.1).
-4. Process points sequentially within the step-1 budget (order doesn't matter beyond determinism/reproducibility), **as a single loop that threads anchor selection and neighbour consumption together** — not two independent passes, since a later anchor's available neighbours depend on exactly which points earlier anchors already claimed. For each still-unused point considered as an anchor: run **angular-balanced k-NN** — split the local neighbourhood into angular sectors, pick the nearest unused point(s) per sector — restricted to points **not already claimed by an earlier anchor's graph**.
-5. If a sector comes up short, either accept a smaller/uneven graph for this anchor (graphs don't need a fixed size — PyG batches variable-size graphs natively) or reject the anchor below some minimum-neighbour threshold. Open, decide empirically.
-6. On acceptance: mark the anchor and all its chosen neighbours as used, remove them from the pool, move to the next unused point (within budget).
+1. **Cap the number of seeds drawn from this burst.** Fully consuming every available point would yield dozens to hundreds of millions of training examples pooled across all bursts. The budget is the capacity formula plus the region weighting, see §4.9 and §4.10.
+2. Exclude a buffer margin along the burst's own (post-step-0) boundary (`buffer_m`, 1000 m) so every seed has points available in every direction. Margin points can still be pool neighbours; only seeds are restricted to the centre.
+3. **Seed selection (separate step, §4.9):** grid share + land-cover stratified share with a global minimum distance. Land cover is used here only to pick a diverse set of seeds. It is **not stored with the pools** and never a model feature; GSE embeddings remain the only covariate (§4.1). Land cover is sampled again later at the query points of the val regions, to evaluate in which land-cover types the model performs best (§8.4). The seed step returns the burst table with a `seed` flag column (1 = seed).
+4. **Pool construction (separate step, after seed selection, decided 2026-10-21):** go through the seeds (random order as the neutral default; earlier seeds get the better neighbours). For each seed, select its neighbours by **angular-balanced selection** (split the neighbourhood into angular sectors, probably 8, take the nearest point(s) per sector) from points that are **not seeds** and **not already assigned to an earlier seed** (no point reuse between pools). Every selected point gets the seed's `pid` in a new column `seed_pid`; the seed carries its own pid. One pool = all rows with the same `seed_pid`. The pool is built burst by burst, so pids only have to be unique within a burst, which they are.
+5. **Selection criteria still open** (user will propose): a **maximum radius** around the seed (25 nearest points span ~30 m in dense cities but several km in sparse rural areas) and a **minimum number of points** below which a seed is rejected; points per sector. `k_nearest` (25) is the working pool size the capacity formula assumes. Graphs don't need a fixed size (PyG batches variable-size graphs natively).
+6. On acceptance the seed's pool is fixed; its points are unavailable for all later seeds.
 
 This replaces reserving a conservative worst-case min-distance around every anchor (which wastes points in dense areas) with directly tracking which points are already claimed — denser sampling, more training examples per burst for the same budget, same no-shared-points-between-graphs guarantee.
 
@@ -270,6 +270,75 @@ xy = np.c_[df["longitude"], df["latitude"]]  # or use easting/northing (EPSG:303
 ```
 
 Then project to EPSG:3035 and fit the temporal basis.
+
+### 4.8 Overlap between neighbouring bursts (measured 2026-10-21, judged negligible)
+
+**Decision: the overlap between neighbouring bursts is not handled (no de-duplication across bursts).** Measured with `test/burst_overlap.py` over all 1,091 downloaded bursts (convex hull of each preprocessed csv, EPSG:3035, pairs within the same region and orbit direction; tables in `test/figs/burst_overlap/`).
+
+| Pair type | pairs | overlap depth, km (p10 / median / p90) | share of a burst's outer edge inside the other burst (median) |
+|---|---|---|---|
+| same orbit, along-track neighbour (next burst, same subswath) | 871 | 1.26 / 1.62 / 2.25 | 41% |
+| same orbit, across-track (adjacent subswath) | 399 | 1.80 / 2.06 / 2.59 | 7% |
+| same orbit, diagonal | 381 | 1.66 / 2.01 / 2.55 | 5% |
+| different relative orbit | 191 | 2.2 / 11.5 / 15.9 | 34% |
+
+- "Depth" is the short side of the minimum rotated rectangle around the overlap, i.e. how far one burst reaches into its neighbour. Along-track overlaps are long strips (median ~84 km, ~8% of a burst's area); across-track overlaps are short (~13 km, <2% of the area). Ascending and descending behave the same (along-track median 1.58 / 1.65 km, across-track 2.05 / 2.07 km).
+- **Edge margin (§4.3 Step 3.2, `buffer_m` = 1000 m):** the strips are only slightly deeper than the margin. For bursts with a same-orbit neighbour (1,087 of 1,091), a median of 41% of the margin zone (p10 16%, p90 65%) is covered by the centre of a neighbour.
+- **Are the overlapping points the same?** Only partly. Pids differ per burst (0% match), so pids cannot be used to find duplicates. Matched by nearest coordinates in 12 random same-orbit pairs: 6 pairs had 94–100% of the points within 1 m of a partner (velocity difference 0.0 mm/yr); the other 6 had only 5–17% within 1 m, median nearest distance 4–14 m, velocity differences 0.4–3.1 mm/yr (different pixel grid, so different measurements). The identical cases were mostly along-track neighbours of the same subswath.
+- **Why this is not a concern:** the 1000 m margin already keeps seeds out of most of the overlap strips, and the remaining variability across bursts and regions is large. A seed pair or pool in the overlap is a negligible share of the data. Removing duplicates would need a distance tolerance (~5–15 m) and would not remove truly identical measurements reliably, so it is not worth the complexity.
+
+
+### 4.9 Seed selection within a burst (implemented in s03, tested 2026-10-20/21)
+
+A **seed** is the starting point of one candidate pool, so one seed = one training graph (§7.1). Seed selection per accepted burst, as implemented in `s03` (`select_area_and_buffer_burst_edges`, `find_n_seed_points`, `select_center_nodes`):
+
+1. **Overlap and rejection.** Burst hull ∩ AOI (EPSG:3035). A burst is rejected if the overlap is < 4 km² (`MIN_AREA`) or holds < 10,000 points (`MIN_PTS`).
+2. **Edge margin.** Points within `buffer_m` (default 1000 m) of the overlap's edge are flagged `in_center = 0`; they can be pool neighbours but never seeds. `n_center` = points outside the margin.
+3. **Capacity.** `n_seeds = (n_center // (POOL_FACTOR * k_nearest)) * density`. `POOL_FACTOR` (so far hardcoded as 4, to become a parameter) reserves room so that every seed can find its neighbours without point reuse. Working values: `k_nearest` = 25, `density` = 0.66 (must be in (0, 1]).
+4. **Placement** (`select_center_nodes`): 2/3 of the seeds spread over a 2 × 2 km grid with the same quota per occupied cell (random within the cell), 1/3 stratified over six WorldCover classes (Built-up, Grassland, Tree cover, Shrubland, Bare/sparse, Cropland) with weight = class size ^ `strat_exponent` (0.5; 0 = equal per class, 1 = proportional). In both phases every seed must keep `min_dist_m` (one global value, default 100 m) to all seeds chosen so far (spatial hash). Shortfalls are not redistributed; intended vs real counts are appended to the s03 log.
+
+**Test results** (`test/seed_selection_test.py`, 15 accepted train bursts, k 25, density 0.66 unless stated; share of intended seeds that survive the minimum distance):
+
+| min distance | density | mean surviving | worst burst |
+|---|---|---|---|
+| 0 m | 0.66 | 99.4% | 97.9% |
+| 50 m | 0.66 | 98.4% | 94.2% |
+| **100 m** | 0.66 | 97.2% | 89.2% |
+| 200 m | 0.66 | 89.8% | 37.7% |
+| 300 m | 0.66 | 82.4% | 17.4% |
+| 100 m | 1.00 | 95.4% | 78.8% |
+| 100 m | 0.30 | 98.9% | 95.0% |
+
+Losses come from dense bursts: a 2 × 2 km cell holds at most ~(2000 / min_dist)² seeds. Equal shares per land-cover class (exponent 0) lose most in the stratified phase (rare classes run out). Choice: 100 m, density ≤ 0.66, exponent 0.5–1.0.
+
+**Land cover of EGMS points** (`test/landcover_distribution.py`, 10 random bursts, 2.65 M points): Built-up 44.6%, Grassland 22.0%, Tree cover 17.2%, Shrubland 6.3%, Bare 4.8%, Cropland 1.9%, Moss/lichen 1.9%, Water 0.9%, Snow 0.4%, Wetland 0.04%. Cropland, water and wetland are nearly absent, which is why the stratification weights small classes up but not to equal shares.
+
+**Full train split, per-burst capacity only** (`test/seed_total_estimate.py`, all 470 train bursts, min distance 100 m, buffer 1000 m): 178 bursts (37.9%) rejected (124 for both area and points, 53 for points only, 1 for area only; 31% of all train points). The 292 accepted bursts give 576,177 intended and **538,790 real seeds** (93.5%; dense bursts 92%, others 96%). Very unequal: train_9 and train_13 alone give 58% of all graphs, the 9 handpicked regions only 20%, the median accepted burst 526 seeds. This motivated the region weighting in §4.10.
+
+### 4.10 Region weighting and the share of real deformation (decided 2026-10-21)
+
+**Goal.** The handpicked real-subsidence (real-sub) regions must carry enough weight. Target split about 50/50 between real-sub and random train regions, rather more real-sub than less; not strict. Uplift counts as well: what matters is that the training data is not dominated by flat background.
+
+**Schema** (to be implemented when s03 is reworked):
+1. Train regions only (`set == 0`); random regions are the `train_N` directories, every other train region is real-sub. No extra flag needed.
+2. Real-sub regions are processed first: every accepted burst gets its capacity (§4.9, from `n_center`, i.e. edge margin excluded). Their sum is `S`.
+3. Random regions get the target `R = RATIO * S` (RATIO 1.0 = 50/50, adjustable). `R` is spread by **water-filling**: the same level per random region, capped at the region's capacity, the unused remainder passed on to regions that still have room. `R` is never exceeded; small regions simply give what they have. Equal shares per region are not possible because many small regions cannot hold enough data.
+4. Within a region, its allocation is split over the bursts in proportion to their `n_center`.
+
+Rejected alternatives: per-burst capacity only (two random regions dominate), an equal budget per region in points instead of seeds (unit error: the capacity always won, nothing changed), equal budget per region without redistribution (total halves), proportional allocation of the random half (train_9 + train_13 = 74% of the random half).
+
+**Result of the schema** (`test/sampling_schema_velocity.py`, run for real, k 25, density 0.66, pool factor 4, min distance 100 m, buffer 1000 m): real-sub 110,460 seeds (49.7%), random 111,749 (50.3%), total ~222 k graphs. Water level 9,977 seeds per random region; 12 of 17 random regions are below it and give everything they have.
+
+**mean_velocity at the seeds** (LOS, mm/yr):
+
+| set | median | std | abs(v) > 2 | abs(v) > 5 | abs(v) > 10 | v < −5 |
+|---|---|---|---|---|---|---|
+| real-sub seeds | −0.50 | 6.34 | 34.2% | 14.3% | 7.1% | 8.0% |
+| random seeds | −0.40 | 5.07 | 28.7% | 8.3% | 3.1% | 2.8% |
+
+Real-sub regions carry clearly more deformation (strong subsidence ~3× as common), but two thirds of their seeds are stable background (abs(v) < 2): the AOIs are much larger than the actual deformation. Per region (share abs(v) > 5): Tagebau NRW 23.7% (strongest subsidence), Napoli 18.4% (mostly uplift, Campi Flegrei), Larisa 14.2%, Cottbus 6.2%, Murcia 5.8% (AOI mostly outside the Lorca subsidence), Northern England 2.1% and Austria 1.6% (practically stable). **Samos** (93.7%, mean +12.7 mm/yr over the whole region) and the random region **train_3** (mean +6) show region-wide offsets, plausibly co-seismic steps (Samos M7.0, Oct 2020) or reference offsets inside the 2019–2023 linear velocity, not local deformation. Conclusion: raising the real-sub share only helps proportionally; tight AOIs around the actual deformation are the stronger lever.
+
+**Tight AOIs and new regions (in progress, 2026-10-21).** Method: EGMS L3 ORTHO-UP (mean vertical velocity, 100 m, 100 km tiles; the GeoTIFF in each zip) for all 743 EEA tiles of the EGMS coverage (`test/l3_scan_download.py`). Scan (`test/l3_subsidence_scan.py`): a cell deforms if abs(v) ≥ 5 mm/yr and at least half of its 5 × 5 neighbourhood deforms in the same direction; 3 × 3 closing, 8-connected clusters ≥ 2 km². Each cluster is compared with a ring 1–5 km around it (contrast = median abs(v − ring median)); region-wide offsets have low contrast and are excluded. Candidate AOI = deforming cells + 1000 m buffer, holes filled, overlapping clusters merged, labelled with known sites from the literature (Lorca, Granada, Valle Umbra, Pistoia/Prato, Po delta, Thessaloniki, LGOM, Bełchatów, Ostrava-Karviná, Groningen, ...) and flagged near 2019–2023 earthquakes/volcanic unrest. `test/build_new_study_areas.py` then tightens the existing train regions to their deforming parts (drops regions without), adds new regions (contrast ≥ 4 mm/yr, core ≥ 3 km², AOI ≥ 20 km², ≥ 25 km from val regions), keeps val regions unchanged (GNSS validation), and writes an s01-compatible `real_subsidence_pointbased.gpkg` (rectangle = AOI bounding box + 1 km) plus `real_subsidence_aoi.gpkg` with the tight polygons, which s03 must use as AOI instead of the rectangle. Results to be added here once the scan has finished.
 
 ---
 
@@ -621,7 +690,7 @@ This adapts coverage: points far from data get wider intervals.
 
 **Two levels: a fixed pool on disk, a fresh graph every draw.**
 
-- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: lat/lon, `mean_velocity` (EGMS's own 2019–2023 field, no fitting needed, §3.6a), incidence angle, GSE embedding, and land-cover class (stratification/eval metadata only, §4.1). This is the expensive part (angular selection, GSE sampling) and is never recomputed during training. **GSE is sampled once, here, from a transient windowed COG read per region; only the per-point 64-dim int8 vectors are kept and no raster tiles are stored (§10.16).**
+- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: `pid`, `seed_pid` (the pool it belongs to), lat/lon, `mean_velocity` (EGMS's own 2019–2023 field, no fitting needed, §3.6a), incidence angle and GSE embedding. Land cover is not stored (§4.3 Step 3.3). This is the expensive part (angular selection, GSE sampling) and is never recomputed during training. **GSE is sampled once, here, from a transient windowed COG read per region; only the per-point 64-dim int8 vectors are kept and no raster tiles are stored (§10.16).**
 - **Rebuilt fresh on every `__getitem__` call:**
   1. draw a random subset of the pool's points,
   2. pick one point of the subset as the query and hide its velocity,
@@ -630,30 +699,33 @@ This adapts coverage: points far from data get wider intervals.
 
   The subset, the graph shape and the query all change between epochs. None of this may be cached, or that variation disappears.
 
-**Storage: few large files, not one per pool or per burst.** Scratch can't take thousands of small files. All pools of a shard go into one `.pt` file as flat tensors plus an offset array, so pool `p` is rows `pool_ptr[p]:pool_ptr[p+1]`. A pool never mixes bursts or orbits. **A shard is simply one such file holding many pools.** Working choice: one shard per region (a few dozen files, each loaded whole into RAM and regenerable on its own); per burst would mean 1000+ files, one per split a single file that can't be regenerated per region.
+**Storage: one table per region, decided 2026-10-21.** Scratch can't take thousands of small files, so all pools of a region (both orbits, all bursts) go into one table, saved as Parquet (columnar, compressed, inspectable with polars). One row per pool point:
 
-```python
-bundle = {
-    "lat":        float64 (N,),     # WGS84; only used for pairwise distances/bearings
-    "lon":        float64 (N,),
-    "velocity":   float32 (N,),     # EGMS mean_velocity 2019–2023, raw mm/yr, §3.6a
-    "incidence":  float32 (N,),
-    "gse":        int8    (N, 64),  # raw quantised, de-quantised on read; year handling open, §10.16
-    "land_cover": uint8   (N,),     # metadata only, never a feature
-    "pool_ptr":   int64   (P + 1,), # pool p = rows pool_ptr[p]:pool_ptr[p+1]
-    "pool_burst": int32   (P,),     # index into burst_names
-    "burst_names": list[str],
-}
-torch.save(bundle, region_dir / "candidate_pools.pt")
-```
+| column | type | meaning |
+|---|---|---|
+| `pid` | str | EGMS point id |
+| `seed_pid` | str | pid of the pool's seed; one pool = all rows with the same value |
+| `burst` | str | burst csv the point comes from (pids are only unique within a burst; a pool never spans bursts or orbits) |
+| `lat`, `lon` | float64 | WGS84, only used for pairwise distances/bearings |
+| `mean_velocity` | float32 | raw mm/yr, 2019–2023 (§3.6a) |
+| `incidence_angle` | float32 | raw degrees |
+| `gse_0` ... `gse_63` | int8 | raw quantised embedding, de-quantised on read; year handling open (§10.16) |
+
+When the Dataset is created, the table is sorted once by (`burst`, `seed_pid`) and turned into flat tensors plus an offset array `pool_ptr` (pool `p` = rows `pool_ptr[p]:pool_ptr[p+1]`). That offset form is only an in-memory detail of the training code: fast slicing, variable pool sizes, no padding.
 
 **Edge features: computed on the fly from the subset's pairwise geodesic matrices, not precomputed per pool.** The edge set depends on the subset drawn anyway, and precomputing would store n² values per pool for no real saving. The unit direction is bounded in [−1, 1] and needs no scaling. **Distance does need normalising, and its mean/std can't be read off stored values because the edges only exist per draw. They don't have to be exact:** run the same sampling function offline over a random sample of train pools (a few thousand draws give hundreds of thousands of edges, far more than a stable mean/std needs), store the result as a separate stats entry, and recompute only when the sampling parameters (k, subset fraction) change. Distances are heavy-tailed (dense urban pools vs sparse rural ones), so standardise `log1p(distance)` rather than raw metres; same treatment for `dist_to_coherent`. Do not normalise per graph (e.g. by the graph's median edge length): that removes the absolute scale, which is what tells the model how far the nearest evidence is.
 
 ```python
 class PoolDataset(torch.utils.data.Dataset):
-    """One per persisted shard file. One item = one candidate pool."""
-    def __init__(self, bundle_path, k=3, subset_frac=(0.6, 0.9), stats=None):
-        self.b = torch.load(bundle_path, weights_only=False)
+    """One per region table. One item = one candidate pool."""
+    def __init__(self, table_path, k=3, subset_frac=(0.6, 0.9), stats=None):
+        t = pl.read_parquet(table_path).sort(["burst", "seed_pid"])
+        sizes = t.group_by(["burst", "seed_pid"], maintain_order=True).len()["len"].to_numpy()
+        gse = t.select([f"gse_{i}" for i in range(64)]).to_numpy()
+        self.b = {"lat": torch.from_numpy(t["lat"].to_numpy()), "lon": torch.from_numpy(t["lon"].to_numpy()),
+                  "velocity": torch.from_numpy(t["mean_velocity"].to_numpy()),
+                  "incidence": torch.from_numpy(t["incidence_angle"].to_numpy()), "gse": torch.from_numpy(gse),
+                  "pool_ptr": torch.from_numpy(np.concatenate([[0], np.cumsum(sizes)]))}
         self.k, self.subset_frac, self.stats = k, subset_frac, stats
 
     def __len__(self):
@@ -691,13 +763,13 @@ class PoolDataset(torch.utils.data.Dataset):
         return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y,
                     query_mask=is_query.bool())
 
-full_dataset = torch.utils.data.ConcatDataset([PoolDataset(f) for f in train_shard_files])
+full_dataset = torch.utils.data.ConcatDataset([PoolDataset(f) for f in train_region_tables])
 loader = torch_geometric.loader.DataLoader(full_dataset, batch_size=64, shuffle=True)
 ```
 
 **Connectivity with k=3.** Every node gets its 3 nearest neighbours however far away they are, so the query always has 3 incoming edges and never sees an empty neighbourhood. That does not make the graph a single connected component: any group of ≥4 points whose three nearest neighbours all lie inside the group is cut off from the rest, no matter how far away the rest is. Harmless for the prediction itself, since nodes outside the query's component cannot influence it, but multi-hop information only flows within the query's component. One more reason to keep the subset large enough (§10.15).
 
-**Edge queries.** A random query near the edge of a pool has neighbours on one side only; the angular balance around the seed doesn't hold for it, so it is an extrapolation case. Allowed by default (uniform choice of query), since it is a realistic "query anywhere" situation. To keep in mind: record the query's largest angular gap per draw so errors can be broken down by it, and consider weighting the query choice later if edge queries turn out to dominate (§10.15).
+**Edge queries (known concern, kept as is for now, §10.17).** A random query near the edge of a pool has neighbours on one side only; the angular balance around the seed doesn't hold for it, so predicting it is extrapolation, not interpolation. Since most of a pool's points lie further out than the seed, many queries are at least partly like this. Kept as is (uniform choice of query): it is a realistic "query anywhere" situation.
 
 **Why the graph actually varies per epoch — mechanism, not magic.** `shuffle=True` only randomizes the *order* pools are visited in. The subset, graph and query vary because `__getitem__(p)` draws fresh randomness **every time it's called**, and `DataLoader` calls it again every epoch without caching the return value — same persisted pool, new draw each time.
 
@@ -705,7 +777,7 @@ loader = torch_geometric.loader.DataLoader(full_dataset, batch_size=64, shuffle=
 
 **Normalization placement:** stats are stored separately and applied inside `__getitem__` on read; normalized values are never baked into the cached raw tensors, so the stats can change without refetching anything. Velocity and incidence stats are exact (computed by `s02` from the filtered train csvs, `assets/egms_norm_stats.json`). Edge-distance and `dist_to_coherent` stats are sampled estimates (see above). GSE handling per §5.4/§10.13.
 
-`ConcatDataset` is what combines the per-shard datasets into the one dataset a single `DataLoader` wraps — each `__getitem__` only ever draws points from one pool, and a pool never spans bursts or orbits, so batches can freely mix graphs from different bursts without ever mixing points *within* one graph across bursts.
+`ConcatDataset` is what combines the per-region datasets into the one dataset a single `DataLoader` wraps — each `__getitem__` only ever draws points from one pool, and a pool never spans bursts or orbits, so batches can freely mix graphs from different bursts without ever mixing points *within* one graph across bursts.
 
 ### 7.2 Loss function
 
@@ -943,13 +1015,13 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 ### 10.14 OPEN — per-burst anchor budget for candidate pool construction
 
-**Status: confirmed necessary, formula not decided.**
+**Status: decided 2026-10-21, see §4.9 (per-burst capacity) and §4.10 (region weighting).** The text below is the original problem statement.
 
 §4.3 Step 3's exhaustive version (consume every available point via sequential no-reuse k-NN) would produce on the order of dozens to hundreds of millions of training examples pooled across all bursts — not tractable to store or train on. A pre-determined per-burst budget (point 1 of that step) is required, not optional. Undecided: the actual formula -- fixed count per burst, density-based (target spacing, scaled by burst area), proportional to available post-clip/post-buffer point count, or something else. Whichever is chosen directly determines how balanced dataset composition is across bursts of very different size/density, so it's not a cosmetic parameter.
 
 ### 10.15 OPEN — pool and graph parameters
 
-**Status: starting values only, to be tuned empirically.** Angular sectors for the pool: probably 8. Pool size (~20 points assumed), subset fraction per draw, k (3 assumed), minimum neighbours below which a seed is rejected (§4.3 Step 3.5): all undecided. Two behaviours to keep in mind rather than solve now: (1) k=3 does not guarantee one connected component (§7.1), (2) queries near a pool's edge are extrapolation cases (§7.1); whether to restrict or reweight them is open, and implementing that control is non-trivial. Seed spatial spread (land-cover stratification alone won't do it, since PS points are rare in forest/fields) needs a grid or minimum spacing on top, with per-class caps rather than equal counts per class.
+**Status: starting values only, to be tuned empirically.** Seed-selection parameters are settled for now (k_nearest 25, density 0.66, pool factor 4, min distance 100 m, buffer 1000 m, §4.9). Angular sectors for the pool: probably 8. Pool size (~20 points assumed), subset fraction per draw, k (3 assumed), minimum neighbours below which a seed is rejected (§4.3 Step 3.5): all undecided. Two behaviours to keep in mind rather than solve now: (1) k=3 does not guarantee one connected component (§7.1), (2) queries near a pool's edge are extrapolation cases (§7.1); whether to restrict or reweight them is open, and implementing that control is non-trivial. Seed spatial spread (land-cover stratification alone won't do it, since PS points are rare in forest/fields) needs a grid or minimum spacing on top, with per-class caps rather than equal counts per class.
 
 ### 10.16 OPEN — GSE year(s) and sampling strategy
 
@@ -958,6 +1030,10 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 ---
 
 ---
+
+### 10.17 CONCERN — extrapolation queries at the pool edge
+
+**Status: accepted for now, possible reason for poor performance later (noted 2026-10-21).** Pools are built angular-balanced around their seed (§4.3 Step 3), but at training time any point of the drawn subset can be the query (§7.1). Points on the rim of a pool have all their neighbours on one side, so a large share of the training queries is extrapolation rather than interpolation. Consequences to watch: (1) the model may learn a blurred mix of both tasks and interpolate worse than it could; (2) validation errors may be dominated by such cases without it being visible. If performance is poor, check this first: record the query's largest angular gap to its neighbours per draw, break errors down by it, and then restrict queries to inner points or reweight the query choice.
 
 ## 11. Thesis Positioning & Novelty
 
