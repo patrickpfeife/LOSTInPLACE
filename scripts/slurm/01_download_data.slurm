@@ -15,4 +15,13 @@ cd ../python
 
 module load uv
 
-uv run s01_download_data.py --projectdir "/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE" --real_sub_buffer_value=150000 --n_rnd=35 --mindist_rnd=150000 --maxit_rnd=200
+ARGS=(
+    --projectdir "/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE"   # root of the data tree, data/{train,dev,cal,val}/ is created under it
+    --real_sub_buffer_value=150000   # minimum gap (m) between the query areas of the real subsidence and the random regions
+    --n_rnd=35                       # number of random regions sampled across the EGMS coverage area
+    --mindist_rnd=150000             # minimum distance (m) between the random region centres
+    --maxit_rnd=200                  # upper bound on sampling attempts for the random regions
+    --egms_rand_extension=15000      # half side length (m) of the square core of a random region (15000 -> 30 x 30 km)
+)
+
+uv run s01_download_data.py "${ARGS[@]}"
