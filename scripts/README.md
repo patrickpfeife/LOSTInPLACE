@@ -9,20 +9,25 @@ Every step runs with [uv](https://docs.astral.sh/uv/) from `scripts/python/` (`m
 ## Step 1 — Download Data
 
 ```bash
-uv run s01_download_data.py --projectdir PROJECTDIR --real_sub_buffer_value=150000 --n_rnd=35 --mindist_rnd=150000 --maxit_rnd=200
+uv run s01_download_data.py --projectdir PROJECTDIR --real_sub_buffer_value=150000 --n_rnd=35 --mindist_rnd=150000 --maxit_rnd=200 --egms_rand_extension=15000
 ```
 
 | Argument | Example | Description |
 |---|---|---|
 | `--projectdir` | `/dss/.../LOSTInPLACE` | Root of the project's data tree (needs tens of GB free); `data/{train,dev,cal,val}/` is created under it |
-| `--real_sub_buffer_value` | `150000` | Buffer radius in metres around each handpicked real-subsidence point excluded from random sampling |
-| `--n_rnd` | `35` | Number of extra random study areas to sample across the EGMS coverage area |
-| `--mindist_rnd` | `150000` | Minimum distance in metres required between those random areas |
-| `--maxit_rnd` | `200` | Upper bound on sampling attempts for the random areas |
+| `--real_sub_buffer_value` | `150000` | Minimum gap in metres between the query areas of the real-subsidence regions and those of the random regions |
+| `--n_rnd` | `35` | Number of random regions to sample across the EGMS coverage area |
+| `--mindist_rnd` | `150000` | Minimum distance in metres between the random region centres; keep it ≥ 2 · (`egms_rand_extension` · √2 + `POOL_BUFFER_M`) so their query areas can't overlap |
+| `--maxit_rnd` | `200` | Upper bound on sampling attempts for the random regions |
+| `--egms_rand_extension` | `15000` | Half side length in metres of the square core of a random region (15000 → 30 × 30 km) |
 
-**Input:** `assets/real_subsidence_pointbased.gpkg` (handpicked regions), `assets/token.jwt` (EGMS API service-account key), `assets/egms_coverage_countries.geojson`.
+**Regions:** every region is a **core polygon** (seeds) plus a ring of `POOL_BUFFER_M` = 2000 m (module constant in s01, pool candidates may also come from there). EGMS is queried with core + ring. The EGMS search only uses the min/max lon/lat of the query polygon, so every returned burst is checked against the actual query area; per orbit direction, all intersecting bursts of the relative orbit with the largest overlap are downloaded (the minimum-overlap check follows in s02). Random regions are squares around random points, sampled outside a zone around the real-subsidence cores so that no query areas overlap. GNSS stations are taken from the core of the val regions only.
 
-**Output:** EGMS L2b CSVs (one relative orbit per direction per region) under `data/{train,dev,cal,val}/<location>/{ascending,descending}/`; GNSS time series for val-region stations; ESA WorldCover tiles per region; `assets/study_areas_gdf.gpkg` + `assets/study_areas_gdf_complex.json` (the region table everything downstream reads).
+**Input:** `assets/real_subsidence_polygonbased.gpkg` (handpicked regions, gitignored), `assets/token.jwt` (EGMS API service-account key), `assets/egms_coverage_countries.geojson`.
+
+The real-subsidence gpkg **must be in EPSG:3035** and hold one single-part polygon per region (the core area where seeds are placed; the `POOL_BUFFER_M` ring is added by s01 for the EGMS query), with the columns `location` (unique name) and `set` (0 = train, 1 = dev, 2 = cal, 3 = val). The tracked `assets/real_subsidence_pointbased.gpkg` is the original point-based version and is not read anymore.
+
+**Output:** EGMS L2b CSVs (one relative orbit per direction per region) under `data/{train,dev,cal,val}/<location>/{ascending,descending}/`; GNSS time series for val-region stations; ESA WorldCover tiles per region; `assets/study_areas_gdf_local.gpkg` + `assets/study_areas_gdf_local_complex.json` (the region table everything downstream reads). `study_areas_io` always writes these gitignored `_local` files and reads them if present, otherwise the tracked `assets/study_areas_gdf.gpkg` + `_complex.json`, which therefore stay unchanged.
 
 Downloads, in order: EGMS products for the handpicked regions, EGMS for the randomly sampled regions (train/dev/cal only), GNSS station time series (val regions only), ESA WorldCover tiles. Needs outbound HTTPS. Run via `scripts/slurm/01_download_data.slurm`.
 
