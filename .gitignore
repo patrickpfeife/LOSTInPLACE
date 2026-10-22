@@ -14,6 +14,9 @@ gnss_station_list.txt
 gse_index_file.csv
 backups/
 egms_norm_stats.json
+assets/real_subsidence_polygonbased.gpkg
+assets/*_local.gpkg
+assets/*_local_complex.json
 
 
 # Byte-compiled / optimized / DLL files
