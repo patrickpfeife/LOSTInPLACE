@@ -17,6 +17,7 @@
 9. [Implementation Stack](#9-implementation-stack)
 10. [Known Issues & Caveats](#10-known-issues--caveats)
 11. [Thesis Positioning & Novelty](#11-thesis-positioning--novelty)
+12. [Coding Conventions](#12-coding-conventions)
 
 ---
 
@@ -348,7 +349,7 @@ Existing train regions: tightened Napoli (to Campi Flegrei, uplift), Larisa, Tag
 
 **Scan v2 (2026-10-22), after the Crete check:** v1 only kept cells ≥ 5 mm/yr with local support plus 1 km, which missed the weaker parts of deformation fields (e.g. the uplift lobe of the Arkalochori earthquake dipole, visible in the EGMS viewer). v2 (`test/l3_subsidence_scan_v2.py`, developed on known sites in `test/aoi_refine_dev.py`): regional background removed (40 km median on 2 km blocks), normalised Gaussian smoothing (300 m), hysteresis per sign (strong ≥ 5 mm/yr growing over connected cells ≥ 2 mm/yr), weak regions of either sign within 3 km of a core attached (dipoles, halos), closing 1 km, holes filled, ≥ 3 km². Result: Crete now covers both lobes; Thessaly the whole earthquake field. Build with v2: 121 train regions (8 existing incl. Sisak, Austria dropped; 108 scan regions; 5 GIA windows from v1), polygons total ~48,500 km² (median 130 km²). Estimate (same parameters, 50/50): real-sub 151,865 seeds (33.2% abs(v) > 5, 18.1% > 10; 11.1% below −5, 22.0% above +5), total ~304 k graphs, 20.8% abs(v) > 5 overall. Seed shares of the real-sub half: existing regions 34%, other scan regions 27%, **Iceland 24%**, GIA windows 15%. Problems: the Iceland regions are mostly relative patches inside the strong regional glacial uplift (long convex hulls over the highlands), not local deformation; convex hulls of far-apart parts inflate some polygons; v2's background removal did not remove the Fennoscandian uplift (excluded by the country rule anyway); broad weak fields (UK, Ireland, ~−4 mm/yr) are now included; Sisak still gives 0 seeds. Only the vertical component is scanned; horizontal (E-W) motion is not seen.
 
-**s01 input format (decided 2026-10-22).** The regions are now picked by hand in QGIS (on the 250 m L3 vertical / east-west mosaics and the GNSS station gpkg) and stored in `assets/real_subsidence_polygonbased.gpkg` (gitignored): any CRS (converted to EPSG:3035 when read), one single-part polygon per region = the core area for seeds, columns `location` and `set`. s01 adds `clip_buffer_m` = `CLIP_BUFFER_M` (5000 m, module constant) and queries EGMS with core + buffer; right after unzipping, every burst csv is clipped in place to core + 5 km (rows only, bursts never deleted, so reruns don't download them again). The raw bursts are therefore gone, but the pool buffer of s03 (`--buffer-m`, default 2000 m) can still vary up to 5 km; s03 refuses larger values. **The EGMS search only uses the min/max lon/lat of the query polygon** (tested 2026-10-22: an L-shape and a thin diagonal strip give the same hits as their lon/lat envelope, and only 22 of 30 resp. 24 of 44 hits actually intersect the shape; vertex count up to 18k makes no difference). Therefore `pull_egms` checks every returned burst against the actual query area (core + buffer, EPSG:3035) and picks the relative orbit with the largest overlap; densifying the query ring is not needed. The minimum-overlap check (≥ 4 km² and ≥ 10,000 points) is done in s03 (`select_area_and_buffer_burst_edges`), so s01 always downloads something and every region folder exists. Random regions are handled the same way (square core of half side `egms_rand_extension`). The exclusion buffer for the random sampling is `real_sub_buffer_value + egms_rand_extension·√2 + 2·CLIP_BUFFER_M` around the real-sub cores, so `real_sub_buffer_value` is the minimum gap between real-sub and random query areas; overlapping query areas would put the same points into train and dev/cal (leakage). For the same reason, handpicked regions of different sets must be ≥ 10 km apart and `mindist_rnd` ≥ 2·(e·√2 + 5 km). The tracked `real_subsidence_pointbased.gpkg` and `study_areas_gdf.gpkg`/`_complex.json` stay as the original versions; `study_areas_io` writes and reads gitignored `study_areas_gdf_local*` copies.
+**s01 input format (decided 2026-10-22).** The regions are now picked by hand in QGIS (on the 250 m L3 vertical / east-west mosaics and the GNSS station gpkg) and stored in `assets/real_subsidence_polygonbased.gpkg` (tracked in git): any CRS (converted to EPSG:3035 when read), one single-part polygon per region = the core area for seeds, columns `location` and `set`. s01 adds `clip_buffer_m` = `CLIP_BUFFER_M` (5000 m, module constant) and queries EGMS with core + buffer; right after unzipping, every burst csv is clipped in place to core + 5 km (rows only, bursts never deleted, so reruns don't download them again). The raw bursts are therefore gone, but the pool buffer of s03 (`--buffer-m`, default 2000 m) can still vary up to 5 km; s03 refuses larger values. **The EGMS search only uses the min/max lon/lat of the query polygon** (tested 2026-10-22: an L-shape and a thin diagonal strip give the same hits as their lon/lat envelope, and only 22 of 30 resp. 24 of 44 hits actually intersect the shape; vertex count up to 18k makes no difference). Therefore `pull_egms` checks every returned burst against the actual query area (core + buffer, EPSG:3035) and picks the relative orbit with the largest overlap; densifying the query ring is not needed. The minimum-overlap check (≥ 4 km² and ≥ 10,000 points) is done in s03 (`select_area_and_buffer_burst_edges`), so s01 always downloads something and every region folder exists. Random regions are handled the same way (square core of half side `egms_rand_extension`). The exclusion buffer for the random sampling is `real_sub_buffer_value + egms_rand_extension·√2 + 2·CLIP_BUFFER_M` around the real-sub cores, so `real_sub_buffer_value` is the minimum gap between real-sub and random query areas; overlapping query areas would put the same points into train and dev/cal (leakage). For the same reason, handpicked regions of different sets must be ≥ 10 km apart and `mindist_rnd` ≥ 2·(e·√2 + 5 km). Git only holds what is needed to start the process (this gpkg, the coverage geojson); `study_areas_io` writes and reads the region table only as gitignored `study_areas_gdf_local*` files.
 
 ---
 
@@ -1078,10 +1079,111 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 ---
 
+## 12. Coding Conventions
+
+How the pipeline code is written, so that every script looks and behaves the same. New code follows this; deviations are fixed, not copied.
+
+### 12.1 Tooling and running
+
+- Python only through **uv** (`module load uv`), with the project venv in `scripts/python/.venv`; never `pip` directly.
+- Pipeline steps run from `scripts/python/`. Anything longer than a few minutes or resource-heavy goes through SLURM, never on the login node.
+- `scripts/slurm/NN_<step>.slurm` holds the pipeline steps only. Test and exploration scripts, with their slurm files, live in `test/`.
+- Code stays lean: write complete, working code, but add a function, argument or column only when it is actually needed.
+
+### 12.2 Script layout
+
+- File name `sNN_<verb>_<object>.py`. The first lines are a banner with the same name: `# sNN_<verb>_<object>`.
+- Fixed top-level sections, each with the double banner (`#====#` between `####` lines):
+  1. **Import Statements**, followed by `# 1.1) Constants`
+  2. **Helper Functions**, split into numbered sub-sections (`#=== Section n: ... ===#`) per processing step. Within a sub-section, helpers are ordered by first call, and a helper's own helpers come right after it.
+  3. **Processing**: one function per processing step (e.g. `download_egms`, `preprocess_gnss`).
+  4. **Main**: `main(...)` plus the `if __name__ == '__main__':` block with argparse.
+- Values that several scripts need are **module constants** in `UPPER_SNAKE_CASE` in the script that defines them (e.g. `s01.CLIP_BUFFER_M`). Later scripts import them via `import s01_download_data as s01`; they never copy the number.
+- Functions and variables are `snake_case`. Counts start with `n_`, file paths end with `_path`, distances end with `_m` and areas with `_m2`.
+
+### 12.3 Docstrings and comments
+
+Every function has a docstring in this form:
+
+```
+    """
+    What the function does, in one to a few sentences (including why, if not obvious).
+
+    Arguments:
+        name -- type, meaning (unit)
+
+    Returns:
+        name -- type, meaning      (or: None -- what is written to disk)
+    """
+```
+
+Inline comments explain the *why* of each step. They are short, lowercase sentences above the line they explain, as dense as in the existing scripts.
+
+### 12.4 Command-line arguments and parameter logs
+
+- Every argument is written as `parser.add_argument("--kebab-case", dest="snake_case", type=..., required=True | default=..., help="meaning (unit)")`.
+- Validity checks (value ranges, `--buffer-m` ≤ `s01.CLIP_BUFFER_M`, mutually exclusive options) use `parser.error(...)` right after `parse_args()`.
+- Every step records its arguments with `s01.write_param_log("<script name>", s01.PARAM_LOG_DIR, vars(args))` (inside s01 without the prefix). The logs go to `assets/param_logs/` (gitignored); the folder is created if missing.
+- In the slurm scripts the arguments are a bash array `ARGS=( ... )`, one argument per line with a comment, followed by `uv run <script>.py "${ARGS[@]}"`.
+
+### 12.5 CRS, units and geometry
+
+- **EPSG:3035** for everything metric: geometries, distances, areas, buffers, clipping.
+- **EPSG:4326** only at the interfaces that need it (EGMS search, WorldCover index, NGL station list). Transformers are always built with `always_xy=True`, and coordinate lists are `[lon, lat]`.
+- Distances in metres, areas in m², velocities in mm/yr.
+- Distances for the model's edge features are geodesic (§4.2).
+
+### 12.6 Data layout and file names
+
+- **Project tree:**
+  - `<project-dir>/data/{train,dev,cal,val}/<location>/{ascending,descending}/<burst>.csv`
+  - GNSS series and WorldCover tiles sit directly in `<location>/`.
+- **File names:**
+  - `PART_<file>` for an unfinished download;
+  - `<burst>_PREPROCESSED.csv` for the s02 output next to the (clipped) raw csv;
+  - `worldcover_merged.tif`;
+  - `<Sta>_gnss_time_series.tenv3`.
+- **The region table** is read and written only through `s01.study_areas_io`. It writes and reads only the gitignored `assets/study_areas_gdf_local.gpkg` + `_local_complex.json`; the region table is a run result and never goes into git.
+- **Other `assets/` files:**
+  - Inputs, tracked in git: `real_subsidence_polygonbased.gpkg` (handpicked regions) and `egms_coverage_countries.geojson`.
+  - Secret: `token.jwt` (gitignored).
+  - Generated or downloaded on the fly: `egms_norm_stats.json`, `failed_egms_downloads.csv`, `gnss_station_list.txt`, `esa_world_cover_index.geojson`.
+
+### 12.7 Column names
+
+**Region table (`study_areas_gdf`)**, one row per region:
+
+| Column | Set by | Meaning |
+|---|---|---|
+| `geometry` | input gpkg / s01 | core polygon (seeds), EPSG:3035 |
+| `location` | input gpkg / s01 (random: `train_n`, `dev_n`, `cal_n`) | unique region name = folder name |
+| `set` | input gpkg / s01 | 0 = train, 1 = dev, 2 = cal, 3 = val |
+| `clip_buffer_m` | s01 | ring around the core that was downloaded and kept (= `CLIP_BUFFER_M`) |
+| `egms_query_bbox` | s01 | `[lon, lat]` ring of core + `clip_buffer_m`, the EGMS search polygon |
+| `region_path` | s01 | `data/<set>/<location>/` |
+| `gnss_station_codes`, `gnss_station_paths` | s01 (val only) | NGL stations inside the core and their downloaded series |
+| `egms_union_bbox`, `wc_tile_urls` | s01 | `[lon, lat]` extent of all clipped bursts, WorldCover tiles |
+| `wc_merged_path` | s02 | merged WorldCover raster |
+| `gnss_station_codes_filtered`, `gnss_station_paths_filtered`, `gnss_velocities`, `gnss_filter_params` | s02 (val only) | stations passing the quality filter and their velocities |
+| `n_points_region`, `n_seed_points_per_region`, `train_file` | s03 (train only) | point count, seed budget, output file |
+
+List or dict columns go into the `_complex.json`. A new list column must be added to `complex_cols` in `study_areas_io`. `uid` is internal to `study_areas_io` and only used to match the two files.
+
+**EGMS point tables:**
+- The original EGMS column names are kept (`pid`, `latitude`, `longitude`, `easting`, `northing`, `incidence_angle`, `track_angle`, `los_east`, `los_north`, `los_up`, `mean_velocity`, `temporal_coherence`, `amplitude_dispersion`, ...). The preprocessed csvs keep `s02.EGMS_KEEP_COLS`.
+- Floats are read as Float64 via `s02.EGMS_FLOAT_COLS`, and `pid` as String.
+- `pid` is only unique within a burst, so a point is identified by burst + `pid`.
+- Columns that s03 adds: `in_center` (int8, 1 = outside the edge margin, may be a seed), `seed` (int8, 1 = seed), and `seed_pid` in the pool tables (planned, §7.1).
+- Flags are int8 0/1.
+
+**GNSS:** the velocity keys are `ve`, `vn`, `vu` (mm/yr, east/north/up).
+
+---
+
 ## Quick Reference Checklist
 
 **Done:**
-- [x] Handpicked + random regions selected, EGMS/GNSS/GSE/WorldCover downloaded per region (`01_download_data.py`), resumable
+- [x] Handpicked + random regions selected, EGMS/GNSS/WorldCover downloaded per region (`s01_download_data.py`), resumable
 - [x] Train / dev / cal / val split assigned at region level
 
 **Next up (§3.6a prototype scope):**

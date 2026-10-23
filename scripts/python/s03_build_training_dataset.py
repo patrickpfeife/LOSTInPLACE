@@ -1,5 +1,5 @@
 #######################################
-# 03_build_training_dataset
+# s03_build_training_dataset
 
 ##############################################################################
 #============================================================================#
@@ -424,8 +424,6 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--project-dir", dest="project_dir", type=str, required=True,
-                        help="project root (same as in s01), the parameter log goes to <project-dir>/param_log/")
     parser.add_argument("--k-nearest", dest="k_nearest", type=int, required=True,
                         help="number of pool points per seed")
     parser.add_argument("--density", dest="density", type=float, required=True,
@@ -446,7 +444,7 @@ if __name__ == '__main__':
         parser.error("--density must be in (0, 1]")
 
     # Saving the important parameters in a log file
-    log_path = s02.write_param_log("s03_build_training_dataset", Path(args.project_dir) / "param_log", vars(args))
+    log_path = s01.write_param_log("s03_build_training_dataset", s01.PARAM_LOG_DIR, vars(args))
     
     main(args.k_nearest, args.density, log_path, args.min_dist, args.buffer_m)
  

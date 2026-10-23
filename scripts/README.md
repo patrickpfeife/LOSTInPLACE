@@ -23,11 +23,11 @@ uv run s01_download_data.py --project-dir PROJECTDIR --real-sub-buffer-value=150
 
 **Regions:** every region is a **core polygon** (seeds) plus a ring of `CLIP_BUFFER_M` = 5000 m (module constant in s01, stored per region as `clip_buffer_m`). EGMS is queried with core + ring. The EGMS search only uses the min/max lon/lat of the query polygon, so every returned burst is checked against the actual query area; per orbit direction, all intersecting bursts of the relative orbit with the largest overlap are downloaded. Right after unzipping, every burst csv is **clipped in place** to its region's core + ring (rows only, all columns kept unchanged); bursts are never deleted, the minimum-overlap check follows in s03. The pool buffer of s03 (`--buffer-m`) may vary but must not exceed `CLIP_BUFFER_M`, since no data exists beyond it. Random regions are squares around random points, sampled outside a zone around the real-subsidence cores so that no query areas overlap. GNSS stations are taken from the core of the val regions only.
 
-**Input:** `assets/real_subsidence_polygonbased.gpkg` (handpicked regions, gitignored), `assets/token.jwt` (EGMS API service-account key), `assets/egms_coverage_countries.geojson`.
+**Input:** `assets/real_subsidence_polygonbased.gpkg` (handpicked regions, tracked in git), `assets/token.jwt` (EGMS API service-account key), `assets/egms_coverage_countries.geojson`.
 
 The real-subsidence gpkg may be in any CRS (s01 converts it to EPSG:3035 when reading) and holds one single-part polygon per region (the core area where seeds are placed; the `CLIP_BUFFER_M` ring is added by s01 for the EGMS query and the clipping), with the columns `location` (unique name) and `set` (0 = train, 1 = dev, 2 = cal, 3 = val). The tracked `assets/real_subsidence_pointbased.gpkg` is the original point-based version and is not read anymore.
 
-**Output:** EGMS L2b CSVs clipped to core + `CLIP_BUFFER_M` (one relative orbit per direction per region) under `data/{train,dev,cal,val}/<location>/{ascending,descending}/`; GNSS time series for val-region stations; ESA WorldCover tiles per region; `assets/study_areas_gdf_local.gpkg` + `assets/study_areas_gdf_local_complex.json` (the region table everything downstream reads). `study_areas_io` always writes these gitignored `_local` files and reads them if present, otherwise the tracked `assets/study_areas_gdf.gpkg` + `_complex.json`, which therefore stay unchanged.
+**Output:** EGMS L2b CSVs clipped to core + `CLIP_BUFFER_M` (one relative orbit per direction per region) under `data/{train,dev,cal,val}/<location>/{ascending,descending}/`; GNSS time series for val-region stations; ESA WorldCover tiles per region; `assets/study_areas_gdf_local.gpkg` + `assets/study_areas_gdf_local_complex.json` (the region table everything downstream reads). `study_areas_io` writes and reads only these gitignored `_local` files; the region table is a run result, git only holds the inputs needed to start (the handpicked gpkg and the coverage geojson).
 
 Downloads, in order: EGMS products for the handpicked regions, EGMS for the randomly sampled regions (train/dev/cal only), GNSS station time series (val regions only), ESA WorldCover tiles. Needs outbound HTTPS. Run via `scripts/slurm/01_download_data.slurm`.
 
@@ -37,14 +37,13 @@ Downloads, in order: EGMS products for the handpicked regions, EGMS for the rand
 
 ```bash
 # thresholds given explicitly
-uv run s02_preprocessing.py --project-dir PROJECTDIR --egms-coherence 0.55 --egms-ampdisp-max 0.58
+uv run s02_preprocessing.py --egms-coherence 0.55 --egms-ampdisp-max 0.58
 # or thresholds derived from a sample of the data
-uv run s02_preprocessing.py --project-dir PROJECTDIR --egms-compute-thresholds
+uv run s02_preprocessing.py --egms-compute-thresholds
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `--project-dir` | required | Project root on scratch (same as Step 1's `--project-dir`); the parameter log goes to `PROJECTDIR/param_log/` |
 | `--no-egms` | runs | Skip the EGMS preprocessing |
 | `--no-gnss` | runs | Skip the GNSS preprocessing |
 | `--no-worldcover` | runs | Skip the WorldCover tile merge |
@@ -64,7 +63,7 @@ All three steps run by default; each is independently skippable. Flags are switc
 - `<burst>_PREPROCESSED.csv` next to every raw burst csv: only points passing both thresholds, only the columns `pid`, `latitude`, `longitude`, `easting`, `northing`, `incidence_angle`, `track_angle`, `los_east`, `los_north`, `los_up`, `mean_velocity`. Raw csvs stay untouched; dropped columns can be joined back via `pid`.
 - `assets/egms_norm_stats.json` (gitignored): mean/std of `mean_velocity` and `incidence_angle`, computed from the preprocessed csvs of **train regions only**, plus the thresholds used. The csvs keep raw values; normalization is applied later at read time.
 - `assets/study_areas_gdf` updated with `gnss_station_codes_filtered`/`gnss_station_paths_filtered`/`gnss_velocities`/`gnss_filter_params` (val regions) and `wc_merged_path`.
-- `PROJECTDIR/param_log/s02_preprocessing_log_<timestamp>.log`: all arguments of the run.
+- `assets/param_logs/s02_preprocessing_log_<timestamp>.log`: all arguments of the run (gitignored).
 
 What each part does:
 - **EGMS** (`preprocess_egms`): keeps points with `temporal_coherence >= --egms-coherence` and `amplitude_dispersion <= --egms-ampdisp-max` (`rmse` isn't used: it correlates at r≈−0.93 with coherence). Computed thresholds are pooled over all splits and printed to the job output.

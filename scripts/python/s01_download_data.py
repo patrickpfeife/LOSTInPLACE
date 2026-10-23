@@ -21,6 +21,7 @@ import argparse
 import shapely
 
 from pathlib import Path
+from datetime import datetime
 from pyproj import Transformer
 from shapely.geometry import Polygon
 from shapely import union_all
@@ -28,12 +29,14 @@ from shapely.geometry import box
 from shapely.ops import transform
 
 ################################################
-# Section 1.1: Constants
+# 1.1) Constants
 ################################################
 
 # Buffer (metres) around each region's core that is downloaded and kept when the bursts are clipped.
 # The pool buffer of the later steps may vary, but must not be larger than this.
 CLIP_BUFFER_M = 5000
+# Parameter logs of all steps, kept with the repo (gitignored) instead of the data tree
+PARAM_LOG_DIR = Path(__file__).parent / "../../assets/param_logs"
 
 ##############################################################################
 #============================================================================#
@@ -46,6 +49,33 @@ CLIP_BUFFER_M = 5000
 #===== Section 1: Shared Helper Functions =====#
 ################################################
 # Used across more than one processing step below, in the order they're first called.
+
+def write_param_log(step_name, param_log_dir, params):
+    """
+    Writes the runtime parameters of a processing step to a timestamped log file.
+
+    Arguments:
+        step_name -- str, name of the step, used in the file name (e.g. "s02_preprocessing")
+        param_log_dir -- Path, folder the log is written to (created if missing)
+        params -- dict, parameters to record (e.g. vars(args))
+
+    Returns:
+        log_path -- Path, the written log file
+    """
+    # the folder may not exist yet, e.g. on the very first s01 run
+    param_log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = param_log_dir / f"{step_name}_log_{timestamp}.log"
+
+    with open(log_path, "w") as f:
+        f.write(f"step: {step_name}\n")
+        f.write(f"time: {datetime.now().isoformat()}\n")
+        f.write("parameters:\n")
+        for key, value in params.items():
+            f.write(f"  {key}: {value}\n")
+
+    return log_path
+
 
 def create_file_system():
     """
@@ -64,7 +94,6 @@ def create_file_system():
     DEV_DIR.mkdir(parents=True, exist_ok=True)
     CAL_DIR.mkdir(parents=True, exist_ok=True)
     VAL_DIR.mkdir(parents=True, exist_ok=True)
-    PARAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def requests_get(url, part_file_path, file_path, headers=None):
@@ -117,14 +146,13 @@ def study_areas_io(mode, gdf=None, base_path=None):
     columns gpkg can't store), or reconstructs it from both files. Rows are matched by a dedicated
     "uid" column generated fresh on every write, rather than by index or "location" (which isn't
     guaranteed unique), so the two files can never get mismatched against each other.
-    Writes always go to a "_local" copy (base_path_local.gpkg / base_path_local_complex.json, gitignored),
-    so the git-tracked original files are never overwritten. Reads take the "_local" copy if it exists,
-    otherwise the original.
+    Both modes use the "_local" files (base_path_local.gpkg / base_path_local_complex.json, gitignored):
+    the region table is a run result and never goes into git.
 
     Arguments:
         mode -- string, "write" to split and save gdf, "read" to load and recombine
         gdf -- geopandas.GeoDataFrame, required when mode is "write"; the frame to split and save
-        base_path -- path (str or Path) without extension, the shared filename stem of the original files
+        base_path -- path (str or Path) without extension, the filename stem without "_local"
 
     Returns:
         result -- on "write": None, writes base_path_local.gpkg and base_path_local_complex.json to disk.
@@ -133,9 +161,6 @@ def study_areas_io(mode, gdf=None, base_path=None):
     # building the paths of the two files from the shared filename stem
     base_path = Path(base_path)
     local_path = base_path.parent / f"{base_path.stem}_local"
-    # reading falls back to the tracked original as long as no local copy has been written yet
-    if mode == "read" and not local_path.with_suffix(".gpkg").exists():
-        local_path = base_path
     gpkg_path = local_path.with_suffix(".gpkg")
     json_path = local_path.parent / f"{local_path.stem}_complex.json"
 
@@ -656,7 +681,6 @@ def bbox_per_csv(csv_file):
     if crs_cols["min_easting"] is None:
         return None
 
-
     bbox = box(crs_cols["min_easting"], crs_cols["min_northing"],
                crs_cols["max_easting"], crs_cols["max_northing"])
 
@@ -809,7 +833,6 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
         for csv_path in Path(row["region_path"]).glob("*/*.csv"):
             if "_PREPROCESSED" not in csv_path.name:    # s02 outputs, in case s01 is rerun after s02
                 clip_to_query_area(csv_path, query_area)
-
 
     # Saving the geodataframe
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
@@ -968,8 +991,9 @@ if __name__ == '__main__':
     DEV_DIR = DATA_DIR / "dev"
     CAL_DIR = DATA_DIR / "cal"
     VAL_DIR = DATA_DIR / "val"
-    # For logging the processing parameter
-    PARAM_LOG_DIR = PROJECT_DIR / "param_log"
+
+    # Saving the important parameters in a log file
+    write_param_log("s01_download_data", PARAM_LOG_DIR, vars(args))
 
     # running the whole download
     main(real_sub_buffer_value=args.real_sub_buffer_value, n_rnd=args.n_rnd, mindist_rnd=args.mindist_rnd,

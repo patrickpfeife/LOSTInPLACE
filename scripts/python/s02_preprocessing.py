@@ -1,5 +1,5 @@
 #######################################
-# 02_preprocessing
+# s02_preprocessing
 
 ##############################################################################
 #============================================================================#
@@ -18,7 +18,6 @@ import json
 from pathlib import Path
 from rasterio.merge import merge
 from scipy.stats import mannwhitneyu
-from datetime import datetime
 
 ################################################
 # 1.1) Constants
@@ -41,31 +40,6 @@ EGMS_FLOAT_COLS = {c: pl.Float64 for c in ["latitude", "longitude", "easting", "
 ################################################
 #===== Section 1: Shared Helper Functions =====#
 ################################################
-
-def write_param_log(step_name, param_log_dir , params):
-    """
-    Writes the runtime parameters of a processing step to a timestamped log file.
-
-    Arguments:
-        step_name -- str, name of the step, used in the file name (e.g. "s02_preprocessing")
-        param_log_dir -- Path, folder the log is written to (must exist)
-        params -- dict, parameters to record (e.g. vars(args))
-
-    Returns:
-        log_path -- Path, the written log file
-    """
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = param_log_dir / f"{step_name}_log_{timestamp}.log"
-
-    with open(log_path, "w") as f:
-        f.write(f"step: {step_name}\n")
-        f.write(f"time: {datetime.now().isoformat()}\n")
-        f.write("parameters:\n")
-        for key, value in params.items():
-            f.write(f"  {key}: {value}\n")
-
-    return log_path
 
 def burst_csvs_for_region(region_path):
     """
@@ -384,9 +358,9 @@ def compute_station_velocities(row, t0, t1):
     return velocities
 
 
-#################################################
-#===== Section 4: ESA10wc Helper Functions =====#
-#################################################
+################################################
+#= Section 4: ESA WorldCover Helper Functions =#
+################################################
 
 def merge_wc_tiles(row):
     """
@@ -598,8 +572,6 @@ if __name__ == '__main__':
                          help="for the quantiles, keep every n-th row of each sampled csv")
     parser.add_argument("--egms-file-every", dest="file_every", type=int, default=3,
                          help="for the quantiles, use every n-th csv")
-    parser.add_argument("--project-dir", dest="project_dir", type=str, required=True,
-                         help="project root (same as in s01), the parameter log goes to <project-dir>/param_log/")
 
     args = parser.parse_args()
 
@@ -612,8 +584,7 @@ if __name__ == '__main__':
             parser.error("--egms-coherence and --egms-ampdisp-max are required unless --egms-compute-thresholds is set")
 
     # Saving the important parameters in a log file
-    param_log_dir = Path(args.project_dir) / "param_log"
-    write_param_log("s02_preprocessing",param_log_dir , vars(args))
+    s01.write_param_log("s02_preprocessing", s01.PARAM_LOG_DIR, vars(args))
 
     main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover,
          egms_coherence=args.egms_coherence, egms_ampdisp_max=args.egms_ampdisp_max,
