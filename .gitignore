@@ -17,6 +17,7 @@ egms_norm_stats.json
 assets/real_subsidence_polygonbased.gpkg
 assets/*_local.gpkg
 assets/*_local_complex.json
+esa_world_cover_index.geojson
 
 
 # Byte-compiled / optimized / DLL files
