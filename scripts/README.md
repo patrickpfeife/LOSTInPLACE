@@ -9,25 +9,25 @@ Every step runs with [uv](https://docs.astral.sh/uv/) from `scripts/python/` (`m
 ## Step 1 — Download Data
 
 ```bash
-uv run s01_download_data.py --projectdir PROJECTDIR --real_sub_buffer_value=150000 --n_rnd=35 --mindist_rnd=150000 --maxit_rnd=200 --egms_rand_extension=15000
+uv run s01_download_data.py --project-dir PROJECTDIR --real-sub-buffer-value=150000 --n-rnd=35 --mindist-rnd=150000 --maxit-rnd=200 --egms-rand-extension=15000
 ```
 
 | Argument | Example | Description |
 |---|---|---|
-| `--projectdir` | `/dss/.../LOSTInPLACE` | Root of the project's data tree (needs tens of GB free); `data/{train,dev,cal,val}/` is created under it |
-| `--real_sub_buffer_value` | `150000` | Minimum gap in metres between the query areas of the real-subsidence regions and those of the random regions |
-| `--n_rnd` | `35` | Number of random regions to sample across the EGMS coverage area |
-| `--mindist_rnd` | `150000` | Minimum distance in metres between the random region centres; keep it ≥ 2 · (`egms_rand_extension` · √2 + `POOL_BUFFER_M`) so their query areas can't overlap |
-| `--maxit_rnd` | `200` | Upper bound on sampling attempts for the random regions |
-| `--egms_rand_extension` | `15000` | Half side length in metres of the square core of a random region (15000 → 30 × 30 km) |
+| `--project-dir` | `/dss/.../LOSTInPLACE` | Root of the project's data tree (needs tens of GB free); `data/{train,dev,cal,val}/` is created under it |
+| `--real-sub-buffer-value` | `150000` | Minimum gap in metres between the query areas of the real-subsidence regions and those of the random regions |
+| `--n-rnd` | `35` | Number of random regions to sample across the EGMS coverage area |
+| `--mindist-rnd` | `150000` | Minimum distance in metres between the random region centres; keep it ≥ 2 · (`egms-rand-extension` · √2 + `CLIP_BUFFER_M`) so their query areas can't overlap |
+| `--maxit-rnd` | `200` | Upper bound on sampling attempts for the random regions |
+| `--egms-rand-extension` | `15000` | Half side length in metres of the square core of a random region (15000 → 30 × 30 km) |
 
-**Regions:** every region is a **core polygon** (seeds) plus a ring of `POOL_BUFFER_M` = 2000 m (module constant in s01, pool candidates may also come from there). EGMS is queried with core + ring. The EGMS search only uses the min/max lon/lat of the query polygon, so every returned burst is checked against the actual query area; per orbit direction, all intersecting bursts of the relative orbit with the largest overlap are downloaded (the minimum-overlap check follows in s02). Random regions are squares around random points, sampled outside a zone around the real-subsidence cores so that no query areas overlap. GNSS stations are taken from the core of the val regions only.
+**Regions:** every region is a **core polygon** (seeds) plus a ring of `CLIP_BUFFER_M` = 5000 m (module constant in s01, stored per region as `clip_buffer_m`). EGMS is queried with core + ring. The EGMS search only uses the min/max lon/lat of the query polygon, so every returned burst is checked against the actual query area; per orbit direction, all intersecting bursts of the relative orbit with the largest overlap are downloaded. Right after unzipping, every burst csv is **clipped in place** to its region's core + ring (rows only, all columns kept unchanged); bursts are never deleted, the minimum-overlap check follows in s03. The pool buffer of s03 (`--buffer-m`) may vary but must not exceed `CLIP_BUFFER_M`, since no data exists beyond it. Random regions are squares around random points, sampled outside a zone around the real-subsidence cores so that no query areas overlap. GNSS stations are taken from the core of the val regions only.
 
 **Input:** `assets/real_subsidence_polygonbased.gpkg` (handpicked regions, gitignored), `assets/token.jwt` (EGMS API service-account key), `assets/egms_coverage_countries.geojson`.
 
-The real-subsidence gpkg **must be in EPSG:3035** and hold one single-part polygon per region (the core area where seeds are placed; the `POOL_BUFFER_M` ring is added by s01 for the EGMS query), with the columns `location` (unique name) and `set` (0 = train, 1 = dev, 2 = cal, 3 = val). The tracked `assets/real_subsidence_pointbased.gpkg` is the original point-based version and is not read anymore.
+The real-subsidence gpkg may be in any CRS (s01 converts it to EPSG:3035 when reading) and holds one single-part polygon per region (the core area where seeds are placed; the `CLIP_BUFFER_M` ring is added by s01 for the EGMS query and the clipping), with the columns `location` (unique name) and `set` (0 = train, 1 = dev, 2 = cal, 3 = val). The tracked `assets/real_subsidence_pointbased.gpkg` is the original point-based version and is not read anymore.
 
-**Output:** EGMS L2b CSVs (one relative orbit per direction per region) under `data/{train,dev,cal,val}/<location>/{ascending,descending}/`; GNSS time series for val-region stations; ESA WorldCover tiles per region; `assets/study_areas_gdf_local.gpkg` + `assets/study_areas_gdf_local_complex.json` (the region table everything downstream reads). `study_areas_io` always writes these gitignored `_local` files and reads them if present, otherwise the tracked `assets/study_areas_gdf.gpkg` + `_complex.json`, which therefore stay unchanged.
+**Output:** EGMS L2b CSVs clipped to core + `CLIP_BUFFER_M` (one relative orbit per direction per region) under `data/{train,dev,cal,val}/<location>/{ascending,descending}/`; GNSS time series for val-region stations; ESA WorldCover tiles per region; `assets/study_areas_gdf_local.gpkg` + `assets/study_areas_gdf_local_complex.json` (the region table everything downstream reads). `study_areas_io` always writes these gitignored `_local` files and reads them if present, otherwise the tracked `assets/study_areas_gdf.gpkg` + `_complex.json`, which therefore stay unchanged.
 
 Downloads, in order: EGMS products for the handpicked regions, EGMS for the randomly sampled regions (train/dev/cal only), GNSS station time series (val regions only), ESA WorldCover tiles. Needs outbound HTTPS. Run via `scripts/slurm/01_download_data.slurm`.
 
@@ -44,7 +44,7 @@ uv run s02_preprocessing.py --project-dir PROJECTDIR --egms-compute-thresholds
 
 | Argument | Default | Description |
 |---|---|---|
-| `--project-dir` | required | Project root on scratch (same as Step 1's `--projectdir`); the parameter log goes to `PROJECTDIR/param_log/` |
+| `--project-dir` | required | Project root on scratch (same as Step 1's `--project-dir`); the parameter log goes to `PROJECTDIR/param_log/` |
 | `--no-egms` | runs | Skip the EGMS preprocessing |
 | `--no-gnss` | runs | Skip the GNSS preprocessing |
 | `--no-worldcover` | runs | Skip the WorldCover tile merge |

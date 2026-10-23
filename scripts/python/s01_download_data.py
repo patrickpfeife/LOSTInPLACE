@@ -1,7 +1,6 @@
 #######################################
 # s01_download_data
 
-
 ##############################################################################
 #============================================================================#
 # 1) Import Statements
@@ -19,6 +18,7 @@ import pandas as pd
 import polars as pl
 import zipfile
 import argparse
+import shapely
 
 from pathlib import Path
 from pyproj import Transformer
@@ -31,10 +31,9 @@ from shapely.ops import transform
 # Section 1.1: Constants
 ################################################
 
-# Buffer (metres) around each region's core: seeds lie in the core, pool candidates may also come from this ring.
-# A module constant because s02/s03 need exactly the same value.
-POOL_BUFFER_M = 2000
-
+# Buffer (metres) around each region's core that is downloaded and kept when the bursts are clipped.
+# The pool buffer of the later steps may vary, but must not be larger than this.
+CLIP_BUFFER_M = 5000
 
 ##############################################################################
 #============================================================================#
@@ -225,14 +224,14 @@ def polygon_to_coords(geom, t2wgs84):
 def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
     """
     Downloads the EGMS bursts of one orbit direction for one region. The search hits are checked against
-    the actual query area (core + buffer_m, EPSG:3035), since the API only searches its lon/lat bounding box.
+    the actual query area (core + clip_buffer_m, EPSG:3035), since the API only searches its lon/lat bounding box.
     Of the intersecting bursts, only the relative orbit with the largest combined overlap is kept, and all
     of its bursts are downloaded, however small their overlap (the minimum-overlap check is done in s02).
     Files already on disk are skipped. Files the server refuses are recorded in failed_downloads and
     skipped as well, so a single bad file doesn't stop the whole run.
 
     Arguments:
-        row -- pandas.Series, a GeoDataFrame row with geometry (core, EPSG:3035), buffer_m,
+        row -- pandas.Series, a GeoDataFrame row with geometry (core, EPSG:3035), clip_buffer_m,
             egms_query_bbox, location and set
         token_path -- path (str or Path) to the EGMS API service-account key file, used to fetch
             a fresh access token and search id once they are close to expiring (both expire after
@@ -278,7 +277,7 @@ def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
     result, links = query_egms(row=row, headers=headers)
 
     # the query area (core + buffer) in EPSG:3035, to check and measure the overlap with the bursts below
-    study_area = row.geometry.buffer(row["buffer_m"])
+    study_area = row.geometry.buffer(row["clip_buffer_m"])
 
     # keep only the products of the wanted orbit direction, together with their links,
     # and only those that really intersect the query area, not just its lon/lat bounding box
@@ -524,6 +523,30 @@ def unzip(data_dir):
         zip_path.unlink()
 
 
+def clip_to_query_area(csv_path, query_area):
+    """
+    Clips an EGMS burst csv in place to the points inside a region's query area (core + CLIP_BUFFER_M).
+    All columns are read as text, so the kept rows are written back unchanged.
+
+    Arguments:
+        csv_path -- path (str or Path) to the unzipped EGMS csv, with easting and northing (EPSG:3035)
+        query_area -- shapely Polygon in EPSG:3035, ideally prepared with shapely.prepare
+
+    Returns:
+        None -- overwrites csv_path
+    """
+    # cheap lazy pre-filter on the bounding box of the query area
+    xmin, ymin, xmax, ymax = query_area.bounds
+    df = (pl.scan_csv(csv_path, infer_schema_length=0)
+            .filter(pl.col("easting").cast(pl.Float64).is_between(xmin, xmax)
+                    & pl.col("northing").cast(pl.Float64).is_between(ymin, ymax))
+            .collect())
+    # exact point-in-polygon test on what is left
+    inside = shapely.contains_xy(query_area, df["easting"].cast(pl.Float64).to_numpy(),
+                                 df["northing"].cast(pl.Float64).to_numpy())
+    df.filter(pl.Series(inside)).write_csv(csv_path)
+
+
 ################################################
 #====== Section 3: GNSS Download Helpers ======#
 ################################################
@@ -601,6 +624,8 @@ def large_bbox(row):
             # A list with all the individual bbox is created
             bboxes.append(bbox_per_csv(csv_path))
 
+    bboxes = [b for b in bboxes if b is not None]
+
     # The union over the bboxes and their envelope
     envelope = union_all(bboxes).envelope
     # Transform to lat/lon. Index df for the gse data is also in lat/lon
@@ -626,6 +651,11 @@ def bbox_per_csv(csv_file):
                                             pl.col("easting").max().alias("max_easting"),
                                             pl.col("northing").min().alias("min_northing"),
                                             pl.col("northing").max().alias("max_northing")).collect().row(0, named=True)
+
+    # a burst clipped to zero points has no extent
+    if crs_cols["min_easting"] is None:
+        return None
+
 
     bbox = box(crs_cols["min_easting"], crs_cols["min_northing"],
                crs_cols["max_easting"], crs_cols["max_northing"])
@@ -674,14 +704,14 @@ def pull_worldcover(row, index_gdf):
 def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, maxit_rnd, egms_rand_extension, real_sub_buffer_value = 400000):
     """
     Downloads EGMS L2b data for the real subsidence regions and for extra randomly sampled regions, for both orbit directions.
-    Every region is a core polygon (geometry, EPSG:3035) plus buffer_m = POOL_BUFFER_M; EGMS is queried with
+    Every region is a core polygon (geometry, EPSG:3035) plus clip_buffer_m = CLIP_BUFFER_M; EGMS is queried with
     core + buffer. The random regions are squares around random points, sampled outside a zone around the
     real subsidence regions so that no query areas overlap. Files that could not be downloaded are listed
     in assets/failed_egms_downloads.csv.
 
     Arguments:
-        real_sub_path -- path (str or Path) to the real_subsidence_polygonbased.gpkg file (EPSG:3035,
-            one single-part core polygon per region, columns location and set)
+        real_sub_path -- path (str or Path) to the real_subsidence_polygonbased.gpkg file (any CRS,
+            converted to EPSG:3035; one single-part core polygon per region, columns location and set)
         token_path -- path (str or Path) to the EGMS API service-account key file
         egms_coverage -- path (str or Path) to the geojson of the EGMS coverage area
         n_rnd -- int, number of random regions to sample across the EGMS coverage area
@@ -693,7 +723,7 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     Returns:
         study_areas_gdf -- geopandas.GeoDataFrame, the real subsidence regions plus the random regions
-            (EPSG:3035), with buffer_m, egms_query_bbox and region_path set
+            (EPSG:3035), with clip_buffer_m, egms_query_bbox and region_path set
     """
 
     ################################################
@@ -704,10 +734,10 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     # (set column of the gpkg: 0 = train, 1 = dev, 2 = cal, 3 = val)
     real_subsidence = gpd.read_file(real_sub_path).to_crs("EPSG:3035")
     # stored per region, the later steps use it to tell the core from the buffer ring
-    real_subsidence["buffer_m"] = POOL_BUFFER_M
+    real_subsidence["clip_buffer_m"] = CLIP_BUFFER_M
     t2wgs84 = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
     # the query area = core + buffer, only kept as [lon, lat] list, the geometry column stays the core
-    query_geoms = real_subsidence.geometry.buffer(real_subsidence["buffer_m"])
+    query_geoms = real_subsidence.geometry.buffer(real_subsidence["clip_buffer_m"])
     real_subsidence["egms_query_bbox"] = [polygon_to_coords(g, t2wgs84) for g in query_geoms]
 
     # Collects every file that could not be downloaded, filled by pull_egms and written to disk below
@@ -727,9 +757,9 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     coverage_egms = gpd.read_file(egms_coverage).to_crs("EPSG:3035").union_all()
     # No random centre within this zone around the real subsidence cores, so real_sub_buffer_value is the
     # minimum gap between the query areas: the random square reaches egms_rand_extension * sqrt(2) from its
-    # centre (corner), and both query areas add POOL_BUFFER_M. Overlapping query areas would put the same
+    # centre (corner), and both query areas add CLIP_BUFFER_M. Overlapping query areas would put the same
     # points into two regions, possibly of different sets
-    real_sub_buffer = real_subsidence.buffer(real_sub_buffer_value + egms_rand_extension * np.sqrt(2) + 2 * POOL_BUFFER_M).union_all()
+    real_sub_buffer = real_subsidence.buffer(real_sub_buffer_value + egms_rand_extension * np.sqrt(2) + 2 * CLIP_BUFFER_M).union_all()
     # egms coverage area without the zones around the real subsidence regions
     allowed_area = coverage_egms.difference(real_sub_buffer)
 
@@ -738,10 +768,10 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
 
     # the random cores: squares with half side length egms_rand_extension (metres) around the sampled points
     egms_random["geometry"] = egms_random.geometry.buffer(egms_rand_extension, cap_style="square")
-    egms_random["buffer_m"] = POOL_BUFFER_M
+    egms_random["clip_buffer_m"] = CLIP_BUFFER_M
 
     # Query geometry = core + buffer, exactly as for the real subsidence regions
-    query_geoms = egms_random.geometry.buffer(egms_random["buffer_m"])
+    query_geoms = egms_random.geometry.buffer(egms_random["clip_buffer_m"])
     egms_random["egms_query_bbox"] = [polygon_to_coords(g, t2wgs84) for g in query_geoms]
 
     # the random regions only go into train, dev and cal (0, 1, 2), with a fixed seed for the split
@@ -771,6 +801,15 @@ def download_egms(real_sub_path, token_path, egms_coverage, n_rnd, mindist_rnd, 
     egms_random = egms_random.to_crs("EPSG:3035")
 
     study_areas_gdf = pd.concat([real_subsidence, egms_random], ignore_index=True)
+
+    # clip every burst to its region's query area, only the points there are ever used
+    for _, row in study_areas_gdf.iterrows():
+        query_area = row.geometry.buffer(row["clip_buffer_m"])
+        shapely.prepare(query_area)     # speeds up the many point-in-polygon tests
+        for csv_path in Path(row["region_path"]).glob("*/*.csv"):
+            if "_PREPROCESSED" not in csv_path.name:    # s02 outputs, in case s01 is rerun after s02
+                clip_to_query_area(csv_path, query_area)
+
 
     # Saving the geodataframe
     study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
@@ -906,26 +945,23 @@ if __name__ == '__main__':
     # reading the command line arguments that the slurm script passes
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--projectdir", required=True, help="root of the project's data tree")
-    parser.add_argument("--real_sub_buffer_value", required=True,
-                        help="minimum gap (m) between the query areas of real subsidence and random regions")
-    parser.add_argument("--n_rnd", required=True, help="number of random regions")
-    parser.add_argument("--mindist_rnd", required=True, help="minimum distance (m) between the random region centres")
-    parser.add_argument("--maxit_rnd", required=True, help="upper bound on sampling attempts for the random regions")
-    parser.add_argument("--egms_rand_extension", required=True,
+    parser.add_argument("--project-dir", dest="project_dir", type=str, required=True,
+                        help="root of the project's data tree, data/{train,dev,cal,val}/ is created under it")
+    parser.add_argument("--real-sub-buffer-value", dest="real_sub_buffer_value", type=int, required=True,
+                        help="minimum gap (m) between the query areas of the real subsidence and the random regions")
+    parser.add_argument("--n-rnd", dest="n_rnd", type=int, required=True,
+                        help="number of random regions sampled across the EGMS coverage area")
+    parser.add_argument("--mindist-rnd", dest="mindist_rnd", type=int, required=True,
+                        help="minimum distance (m) between the random region centres")
+    parser.add_argument("--maxit-rnd", dest="maxit_rnd", type=int, required=True,
+                        help="upper bound on sampling attempts for the random regions")
+    parser.add_argument("--egms-rand-extension", dest="egms_rand_extension", type=int, required=True,
                         help="half side length (m) of the square core of a random region")
 
     args = parser.parse_args()
 
-    # the arguments arrive as strings, so the numeric ones are converted to int
-    REAL_SUB_BUFFER_VALUE = int(args.real_sub_buffer_value)
-    N_RND = int(args.n_rnd)
-    MINDIST_RND = int(args.mindist_rnd)
-    MAXIT_RND = int(args.maxit_rnd)
-    EGMS_RAND_EXTENSION = int(args.egms_rand_extension)
-
     # the paths of the project's file system, used as globals by the functions above
-    PROJECT_DIR = Path(args.projectdir)
+    PROJECT_DIR = Path(args.project_dir)
     DATA_DIR = PROJECT_DIR / "data"
     # For the data split between training, dev and validation regions
     TRAIN_DIR = DATA_DIR / "train"
@@ -936,5 +972,5 @@ if __name__ == '__main__':
     PARAM_LOG_DIR = PROJECT_DIR / "param_log"
 
     # running the whole download
-    main(real_sub_buffer_value = REAL_SUB_BUFFER_VALUE,
-          n_rnd=N_RND, mindist_rnd=MINDIST_RND, maxit_rnd=MAXIT_RND, egms_rand_extension = EGMS_RAND_EXTENSION)
+    main(real_sub_buffer_value=args.real_sub_buffer_value, n_rnd=args.n_rnd, mindist_rnd=args.mindist_rnd,
+         maxit_rnd=args.maxit_rnd, egms_rand_extension=args.egms_rand_extension)

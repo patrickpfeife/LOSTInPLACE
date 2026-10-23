@@ -424,14 +424,23 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--project-dir", required=True)
-    parser.add_argument("--k_nearest", type=int, required=True)    # without type it's a str: 4 * "25" breaks
-    parser.add_argument("--density", type=float, required=True)
-    parser.add_argument("--min_dist", type=float, default=100.0)     # minimum distance between any two seeds
-    parser.add_argument("--buffer_m", type=float, default=1000.0)    # edge margin: no seeds within this distance of the burst edge
+    parser.add_argument("--project-dir", dest="project_dir", type=str, required=True,
+                        help="project root (same as in s01), the parameter log goes to <project-dir>/param_log/")
+    parser.add_argument("--k-nearest", dest="k_nearest", type=int, required=True,
+                        help="number of pool points per seed")
+    parser.add_argument("--density", dest="density", type=float, required=True,
+                        help="share (0, 1] of the burst capacity that is used for seeds")
+    parser.add_argument("--min-dist", dest="min_dist", type=float, default=100.0,
+                        help="minimum distance (m) between any two seeds")
+    parser.add_argument("--buffer-m", dest="buffer_m", type=float, default=2000.0,
+                        help="ring (m) around the core that pool points may come from, also the edge margin without seeds; "
+                             "must not exceed s01.CLIP_BUFFER_M")
 
     args = parser.parse_args()
 
+    # the bursts are clipped to core + s01.CLIP_BUFFER_M, a larger buffer would reach beyond the downloaded data
+    if args.buffer_m > s01.CLIP_BUFFER_M:
+        parser.error(f"--buffer-m must not be larger than s01.CLIP_BUFFER_M ({s01.CLIP_BUFFER_M} m)")
     # Make sure density has the right value range
     if not 0 < args.density <= 1:
         parser.error("--density must be in (0, 1]")

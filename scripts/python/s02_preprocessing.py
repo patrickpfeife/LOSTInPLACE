@@ -598,7 +598,8 @@ if __name__ == '__main__':
                          help="for the quantiles, keep every n-th row of each sampled csv")
     parser.add_argument("--egms-file-every", dest="file_every", type=int, default=3,
                          help="for the quantiles, use every n-th csv")
-    parser.add_argument("--project-dir", dest="PROJECT_DIR", required=True)
+    parser.add_argument("--project-dir", dest="project_dir", type=str, required=True,
+                         help="project root (same as in s01), the parameter log goes to <project-dir>/param_log/")
 
     args = parser.parse_args()
 
@@ -611,7 +612,7 @@ if __name__ == '__main__':
             parser.error("--egms-coherence and --egms-ampdisp-max are required unless --egms-compute-thresholds is set")
 
     # Saving the important parameters in a log file
-    param_log_dir = Path(args.PROJECT_DIR) / "param_log"
+    param_log_dir = Path(args.project_dir) / "param_log"
     write_param_log("s02_preprocessing",param_log_dir , vars(args))
 
     main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover,
