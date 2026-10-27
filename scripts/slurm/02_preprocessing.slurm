@@ -15,4 +15,4 @@ cd ../python
 
 module load uv
 
-uv run s02_preprocessing.py --no-gnss --no-worldcover --egms-compute-thresholds
+uv run s02_preprocessing.py --egms-compute-thresholds

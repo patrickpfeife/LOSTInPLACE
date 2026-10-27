@@ -7,7 +7,7 @@
 #============================================================================#
 ##############################################################################
 
-import argparse 
+import argparse
 import rasterio
 import s01_download_data as s01
 import pandas as pd
@@ -16,6 +16,7 @@ import polars as pl
 import json
 
 from pathlib import Path
+from datetime import datetime
 from rasterio.merge import merge
 from scipy.stats import mannwhitneyu
 
@@ -211,7 +212,7 @@ def remove_outlier(values, n=10, alpha=0.05, k=5):
     values = np.asarray(values, dtype=float)
     values_cp = values.copy()
 
-    # windowed approach with n values before and after the one that is being checked 
+    # windowed approach with n values before and after the one that is being checked
     for i in range(n, len(values)-n):
         before = values[i-n:i]
         after = values[i+1:i+1+n]
@@ -269,7 +270,7 @@ def gnss_quality_stats(df_gnss, t0, t1):
     # np.diff computes the distance between consecutive entries, here in decimal years
     gaps_years = np.diff(t_win)
     # Turning the decimal years into days
-    gaps_days = gaps_years * 365.25 
+    gaps_days = gaps_years * 365.25
     # Find the maximum gap
     max_gap_days = gaps_days.max()
 
@@ -342,7 +343,7 @@ def compute_station_velocities(row, t0, t1):
         for short_name, col_name in zip(["ve", "vn", "vu"], ["__east(m)", "_north(m)", "____up(m)"]):
             # from metres to mm
             ts = gnss_df[col_name] * 1000
-            # cleaning up the time series 
+            # cleaning up the time series
             ts = remove_outlier(ts, n=10, alpha=0.05, k=5)
             # filtering the time series and the date array to ensure dimension match
             valid = ~np.isnan(ts)
@@ -352,7 +353,7 @@ def compute_station_velocities(row, t0, t1):
             trend = np.polyfit(t_valid, ts, 1)[0]
 
             result[short_name] = trend
-                    
+
         velocities.append(result)
 
     return velocities
@@ -400,6 +401,56 @@ def merge_wc_tiles(row):
         ds.close()
 
     return wc_merged_path
+
+
+##################################################
+#======= Section 5: Markdown Log Helper =========#
+##################################################
+# Used at the end of a run, for the step's part of the markdown log (see s01.write_md_log).
+
+def preprocessing_summary_md(study_areas_gdf, stats_path=EGMS_NORM_STATS_PATH):
+    """
+    Builds the s02 part of the markdown log: the EGMS quality thresholds and the preprocessed bursts, the
+    normalization stats of the train regions, the GNSS stations of the val regions and the merged WorldCover files.
+
+    Arguments:
+        study_areas_gdf -- geopandas.GeoDataFrame, the region table after main
+        stats_path -- Path, the normalization stats json written by compute_norm_stats
+
+    Returns:
+        body -- str, markdown
+    """
+    set_names = {0: "train", 1: "dev", 2: "cal", 3: "val"}
+    parts = []
+
+    # EGMS: thresholds and normalization stats, as written by compute_norm_stats
+    if Path(stats_path).exists():
+        stats = json.load(open(stats_path))
+        parts += ["## EGMS",
+                  f"Quality filter: temporal_coherence >= {stats['filter']['egms_coherence']}, "
+                  f"amplitude_dispersion <= {stats['filter']['egms_ampdisp_max']}.",
+                  s01.table_to_md([{"set": name, "regions": int((study_areas_gdf["set"] == s).sum()),
+                                    "preprocessed bursts": sum(preprocessed_path(c).exists() for p in
+                                                               study_areas_gdf.loc[study_areas_gdf["set"] == s, "region_path"]
+                                                               for c in burst_csvs_for_region(p))}
+                                   for s, name in set_names.items()]),
+                  f"Normalization stats ({stats['source']}, {stats['n_csvs']} bursts, {stats['n_points']:,} points):",
+                  s01.table_to_md([{"column": c, "mean": round(stats[c]["mean"], 3), "std": round(stats[c]["std"], 3)}
+                                   for c in EGMS_NORM_COLS])]
+
+    # GNSS: stations in the core vs stations passing the quality filter, per val region
+    if "gnss_station_codes_filtered" in study_areas_gdf.columns:
+        val = study_areas_gdf.loc[study_areas_gdf["set"] == 3]
+        parts += ["## GNSS stations (val regions)",
+                  s01.table_to_md([{"val region": r.location, "in the core": len(r.gnss_station_codes),
+                                    "passing the quality filter": len(r.gnss_station_codes_filtered)} for r in val.itertuples()])]
+
+    # WorldCover: one merged file per region
+    if "wc_merged_path" in study_areas_gdf.columns:
+        parts += ["## WorldCover", f"Merged WorldCover files: {int(study_areas_gdf['wc_merged_path'].notna().sum())} "
+                                   f"of {len(study_areas_gdf)} regions."]
+
+    return "\n\n".join(parts)
 
 ##############################################################################
 #============================================================================#
@@ -526,7 +577,7 @@ def main(run_egms=True, run_gnss=True, run_worldcover=True, egms_coherence=None,
             sample_every, file_every -- passed to preprocess_egms
 
     Returns:
-        None
+        study_areas_gdf -- geopandas.GeoDataFrame, the updated region table (also saved to disk)
     """
     # Import the gdf again to have access to all the file paths
     study_areas_gdf = s01.study_areas_io("read", base_path = Path(__file__).parent / "../../assets/study_areas_gdf")
@@ -544,6 +595,8 @@ def main(run_egms=True, run_gnss=True, run_worldcover=True, egms_coherence=None,
         study_areas_gdf = preprocess_esa10mwc(study_areas_gdf)
 
     s01.study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
+
+    return study_areas_gdf
 
 
 
@@ -583,11 +636,12 @@ if __name__ == '__main__':
         if not args.compute_thresholds and (args.egms_coherence is None or args.egms_ampdisp_max is None):
             parser.error("--egms-coherence and --egms-ampdisp-max are required unless --egms-compute-thresholds is set")
 
-    # Saving the important parameters in a log file
-    s01.write_param_log("s02_preprocessing", s01.PARAM_LOG_DIR, vars(args))
+    start = datetime.now()
+    study_areas_gdf = main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover,
+                           egms_coherence=args.egms_coherence, egms_ampdisp_max=args.egms_ampdisp_max,
+                           compute_thresholds=args.compute_thresholds, coherence_q=args.coherence_q, ampdisp_q=args.ampdisp_q,
+                           sample_every=args.sample_every, file_every=args.file_every)
 
-    main(run_egms=args.run_egms, run_gnss=args.run_gnss, run_worldcover=args.run_worldcover,
-         egms_coherence=args.egms_coherence, egms_ampdisp_max=args.egms_ampdisp_max,
-         compute_thresholds=args.compute_thresholds, coherence_q=args.coherence_q, ampdisp_q=args.ampdisp_q,
-         sample_every=args.sample_every, file_every=args.file_every)
+    # the markdown log of the run, written only if the run got this far
+    s01.write_md_log("s02_preprocessing", start, vars(args), body=preprocessing_summary_md(study_areas_gdf))
 

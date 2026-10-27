@@ -204,7 +204,7 @@ Within each selected burst csv, build the pool of mini-graph anchors as follows 
 2. Exclude a buffer margin along the burst's own (post-step-0) boundary (`buffer_m`, 1000 m) so every seed has points available in every direction. Margin points can still be pool neighbours; only seeds are restricted to the centre.
 3. **Seed selection (separate step, §4.9):** grid share + land-cover stratified share with a global minimum distance. Land cover is used here only to pick a diverse set of seeds. It is **not stored with the pools** and never a model feature; GSE embeddings remain the only covariate (§4.1). Land cover is sampled again later at the query points of the val regions, to evaluate in which land-cover types the model performs best (§8.4). The seed step returns the burst table with a `seed` flag column (1 = seed).
 4. **Pool construction (separate step, after seed selection, decided 2026-10-21):** go through the seeds (random order as the neutral default; earlier seeds get the better neighbours). For each seed, select its neighbours by **angular-balanced selection** (split the neighbourhood into angular sectors, probably 8, take the nearest point(s) per sector) from points that are **not seeds** and **not already assigned to an earlier seed** (no point reuse between pools). Every selected point gets the seed's `pid` in a new column `seed_pid`; the seed carries its own pid. One pool = all rows with the same `seed_pid`. The pool is built burst by burst, so pids only have to be unique within a burst, which they are.
-5. **Prototype rule (decided 2026-10-21, kept simple until the whole pipeline runs end to end):** angular-balanced selection of the **25 nearest** free points within a **maximum distance of 2 km** from the seed; a pool with **fewer than 7 points** is rejected. The more elaborate pool construction and the sparsification augmentation stay open (§10.11). `k_nearest` (25) is the working pool size the capacity formula assumes. Graphs don't need a fixed size (PyG batches variable-size graphs natively). **The minimum pool size must leave room for the training-time dropout (noted 2026-10-21):** the number of points a pool keeps after the per-epoch sparsification (random subset, exclusion radius around the query, dropped sectors; §7.1, §10.11) must never fall below the minimum graph size (at least the query plus k = 3 neighbours, better a few more). So the pool minimum has to be higher than the graph minimum, roughly `min_pool ≥ min_graph / smallest kept fraction` plus a margin for the exclusion radius. Example: a minimum graph of 5 and subsets down to 60% already need pools of ≥ 9 points; with an exclusion radius removing further points near the query, more. In addition, the sampler itself should never drop below `min_graph` (clamp the drop count per draw), so a single unlucky draw cannot produce a degenerate graph.
+5. **Prototype rule (decided 2026-10-21, kept simple until the whole pipeline runs end to end):** angular-balanced selection of the **25 nearest** free points within a **maximum distance of 2 km** from the seed. **Implemented (2026-10-24, `s03.select_candidate_pool` / `find_pool_points`):** 8 equal sectors around the seed, taken round by round (nearest free point of every sector first, then the second nearest, ...) until 25 are picked; empty sectors are skipped. Seeds are processed in random order and never become pool points of other seeds. The **minimum pool size (7 points) is not applied in s03** but at training time, when the graphs are redrawn from the pools every epoch. Side effect: where one side has no data (gaps inside the overlap), the round-robin pulls in points up to `max_dist` away. The more elaborate pool construction and the sparsification augmentation stay open (§10.11). `k_nearest` (25) is the working pool size the capacity formula assumes. Graphs don't need a fixed size (PyG batches variable-size graphs natively). **The minimum pool size must leave room for the training-time dropout (noted 2026-10-21):** the number of points a pool keeps after the per-epoch sparsification (random subset, exclusion radius around the query, dropped sectors; §7.1, §10.11) must never fall below the minimum graph size (at least the query plus k = 3 neighbours, better a few more). So the pool minimum has to be higher than the graph minimum, roughly `min_pool ≥ min_graph / smallest kept fraction` plus a margin for the exclusion radius. Example: a minimum graph of 5 and subsets down to 60% already need pools of ≥ 9 points; with an exclusion radius removing further points near the query, more. In addition, the sampler itself should never drop below `min_graph` (clamp the drop count per draw), so a single unlucky draw cannot produce a degenerate graph.
 6. On acceptance the seed's pool is fixed; its points are unavailable for all later seeds.
 
 This replaces reserving a conservative worst-case min-distance around every anchor (which wastes points in dense areas) with directly tracking which points are already claimed — denser sampling, more training examples per burst for the same budget, same no-shared-points-between-graphs guarantee.
@@ -293,10 +293,10 @@ Then project to EPSG:3035 and fit the temporal basis.
 
 A **seed** is the starting point of one candidate pool, so one seed = one training graph (§7.1). Seed selection per accepted burst, as implemented in `s03` (`select_area_and_buffer_burst_edges`, `find_n_seed_points`, `select_center_nodes`):
 
-1. **Overlap and rejection.** Burst hull ∩ AOI (EPSG:3035). A burst is rejected if the overlap is < 4 km² (`MIN_AREA`) or holds < 10,000 points (`MIN_PTS`).
+1. **Overlap and rejection.** Burst hull ∩ AOI (EPSG:3035). A burst is rejected if the overlap is < 4 km² (`MIN_AREA`) or holds < 1,000 points (`MIN_PTS`; lowered from 10,000 on 2026-10-24: at the median density of 288 points/km² in the core overlaps, 4 km² hold only ~1,150 points, so 10,000 required ~35 km²; the new limit adds 85 of 750 bursts, but at most ~5,600 seeds, because small overlaps lose almost everything to the 2 km edge margin).
 2. **Edge margin.** Points within `buffer_m` (default 1000 m) of the overlap's edge are flagged `in_center = 0`; they can be pool neighbours but never seeds. `n_center` = points outside the margin.
 3. **Capacity.** `n_seeds = (n_center // (POOL_FACTOR * k_nearest)) * density`. `POOL_FACTOR` (so far hardcoded as 4, to become a parameter) reserves room so that every seed can find its neighbours without point reuse. Working values: `k_nearest` = 25, `density` = 0.66 (must be in (0, 1]).
-4. **Placement** (`select_center_nodes`): 2/3 of the seeds spread over a 2 × 2 km grid with the same quota per occupied cell (random within the cell), 1/3 stratified over six WorldCover classes (Built-up, Grassland, Tree cover, Shrubland, Bare/sparse, Cropland) with weight = class size ^ `strat_exponent` (0.5; 0 = equal per class, 1 = proportional). In both phases every seed must keep `min_dist_m` (one global value, default 100 m) to all seeds chosen so far (spatial hash). Shortfalls are not redistributed; intended vs real counts are appended to the s03 log.
+4. **Placement** (`select_seed_nodes`): 2/3 of the seeds spread over a 2 × 2 km grid with the same quota per occupied cell (random within the cell), 1/3 stratified over six WorldCover classes (Built-up, Grassland, Tree cover, Shrubland, Bare/sparse, Cropland) with weight = class size ^ `strat_exponent` (0.5; 0 = equal per class, 1 = proportional). In both phases every seed must keep `min_dist_m` (one global value, default 100 m) to all seeds chosen so far (spatial hash). Shortfalls are not redistributed; intended vs real counts are appended to the s03 log.
 
 **Test results** (`test/seed_selection_test.py`, 15 accepted train bursts, k 25, density 0.66 unless stated; share of intended seeds that survive the minimum distance):
 
@@ -349,7 +349,7 @@ Existing train regions: tightened Napoli (to Campi Flegrei, uplift), Larisa, Tag
 
 **Scan v2 (2026-10-22), after the Crete check:** v1 only kept cells ≥ 5 mm/yr with local support plus 1 km, which missed the weaker parts of deformation fields (e.g. the uplift lobe of the Arkalochori earthquake dipole, visible in the EGMS viewer). v2 (`test/l3_subsidence_scan_v2.py`, developed on known sites in `test/aoi_refine_dev.py`): regional background removed (40 km median on 2 km blocks), normalised Gaussian smoothing (300 m), hysteresis per sign (strong ≥ 5 mm/yr growing over connected cells ≥ 2 mm/yr), weak regions of either sign within 3 km of a core attached (dipoles, halos), closing 1 km, holes filled, ≥ 3 km². Result: Crete now covers both lobes; Thessaly the whole earthquake field. Build with v2: 121 train regions (8 existing incl. Sisak, Austria dropped; 108 scan regions; 5 GIA windows from v1), polygons total ~48,500 km² (median 130 km²). Estimate (same parameters, 50/50): real-sub 151,865 seeds (33.2% abs(v) > 5, 18.1% > 10; 11.1% below −5, 22.0% above +5), total ~304 k graphs, 20.8% abs(v) > 5 overall. Seed shares of the real-sub half: existing regions 34%, other scan regions 27%, **Iceland 24%**, GIA windows 15%. Problems: the Iceland regions are mostly relative patches inside the strong regional glacial uplift (long convex hulls over the highlands), not local deformation; convex hulls of far-apart parts inflate some polygons; v2's background removal did not remove the Fennoscandian uplift (excluded by the country rule anyway); broad weak fields (UK, Ireland, ~−4 mm/yr) are now included; Sisak still gives 0 seeds. Only the vertical component is scanned; horizontal (E-W) motion is not seen.
 
-**s01 input format (decided 2026-10-22).** The regions are now picked by hand in QGIS (on the 250 m L3 vertical / east-west mosaics and the GNSS station gpkg) and stored in `assets/real_subsidence_polygonbased.gpkg` (tracked in git): any CRS (converted to EPSG:3035 when read), one single-part polygon per region = the core area for seeds, columns `location` and `set`. s01 adds `clip_buffer_m` = `CLIP_BUFFER_M` (5000 m, module constant) and queries EGMS with core + buffer; right after unzipping, every burst csv is clipped in place to core + 5 km (rows only, bursts never deleted, so reruns don't download them again). The raw bursts are therefore gone, but the pool buffer of s03 (`--buffer-m`, default 2000 m) can still vary up to 5 km; s03 refuses larger values. **The EGMS search only uses the min/max lon/lat of the query polygon** (tested 2026-10-22: an L-shape and a thin diagonal strip give the same hits as their lon/lat envelope, and only 22 of 30 resp. 24 of 44 hits actually intersect the shape; vertex count up to 18k makes no difference). Therefore `pull_egms` checks every returned burst against the actual query area (core + buffer, EPSG:3035) and picks the relative orbit with the largest overlap; densifying the query ring is not needed. The minimum-overlap check (≥ 4 km² and ≥ 10,000 points) is done in s03 (`select_area_and_buffer_burst_edges`), so s01 always downloads something and every region folder exists. Random regions are handled the same way (square core of half side `egms_rand_extension`). The exclusion buffer for the random sampling is `real_sub_buffer_value + egms_rand_extension·√2 + 2·CLIP_BUFFER_M` around the real-sub cores, so `real_sub_buffer_value` is the minimum gap between real-sub and random query areas; overlapping query areas would put the same points into train and dev/cal (leakage). For the same reason, handpicked regions of different sets must be ≥ 10 km apart and `mindist_rnd` ≥ 2·(e·√2 + 5 km). Git only holds what is needed to start the process (this gpkg, the coverage geojson); `study_areas_io` writes and reads the region table only as gitignored `study_areas_gdf_local*` files.
+**s01 input format (decided 2026-10-22).** The regions are now picked by hand in QGIS (on the 250 m L3 vertical / east-west mosaics and the GNSS station gpkg) and stored in `assets/real_subsidence_polygonbased.gpkg` (tracked in git): any CRS (converted to EPSG:3035 when read), one single-part polygon per region = the core area for seeds, columns `location` and `set`. s01 adds `clip_buffer_m` = `CLIP_BUFFER_M` (5000 m, module constant) and queries EGMS with core + buffer; right after unzipping, every burst csv is clipped in place to core + 5 km (rows only, bursts never deleted, so reruns don't download them again). The raw bursts are therefore gone. s03 (decided 2026-10-23) only uses the overlap of each burst with the **core**: all points of the overlap are kept (pool candidates), seeds only come from the overlap shrunk by the edge margin `--buffer-m` (default 2000 m, column `in_center`). The 5 km ring is kept as a reserve but not used for now. The seed budget per region is the same for all regions of a set (train, dev, cal separately), computed from the `in_center` points. **The EGMS search only uses the min/max lon/lat of the query polygon** (tested 2026-10-22: an L-shape and a thin diagonal strip give the same hits as their lon/lat envelope, and only 22 of 30 resp. 24 of 44 hits actually intersect the shape; vertex count up to 18k makes no difference). Therefore `pull_egms` checks every returned burst against the actual query area (core + buffer, EPSG:3035) and picks the relative orbit with the largest overlap; densifying the query ring is not needed. The minimum-overlap check (≥ 4 km² and ≥ 1,000 points) is done in s03 (`select_area_and_buffer_burst_edges`), so s01 always downloads something and every region folder exists. Random regions are handled the same way (square core of half side `egms_rand_extension`). The exclusion buffer for the random sampling is `real_sub_buffer_value + egms_rand_extension·√2 + 2·CLIP_BUFFER_M` around the real-sub cores, so `real_sub_buffer_value` is the minimum gap between real-sub and random query areas; overlapping query areas would put the same points into train and dev/cal (leakage). For the same reason, handpicked regions of different sets must be ≥ 10 km apart and `mindist_rnd` ≥ 2·(e·√2 + 5 km). Git only holds what is needed to start the process (this gpkg, the coverage geojson); `study_areas_io` writes and reads the region table only as gitignored `study_areas_gdf_local*` files.
 
 ---
 
@@ -716,10 +716,14 @@ This adapts coverage: points far from data get wider intervals.
 |---|---|---|
 | `pid` | str | EGMS point id |
 | `seed_pid` | str | pid of the pool's seed; one pool = all rows with the same value |
-| `lat`, `lon` | float64 | WGS84, only used for pairwise distances/bearings |
-| `mean_velocity` | float32 | raw mm/yr, 2019–2023 (§3.6a) |
-| `incidence_angle` | float32 | raw degrees |
-| `gse_0` ... `gse_63` | int8 | raw quantised embedding, de-quantised on read; year handling open (§10.16) |
+| `seed` | int8 | 1 = the pool's seed |
+| `latitude`, `longitude` | float64 | WGS84, only used for pairwise distances/bearings |
+| `easting`, `northing` | float64 | EPSG:3035 (used for the GSE sampling) |
+| `mean_velocity` | float64 | raw mm/yr, 2019–2023 (§3.6a) |
+| `incidence_angle` | float64 | raw degrees |
+| `gse_0` ... `gse_63` | int8 | raw quantised embedding of `GSE_YEAR` (2025, §10.16), de-quantised on read; −128 = no data |
+
+**Implemented (2026-10-27):** `s03_build_training_dataset.py` writes these tables as `<burst>_GRAPH.parquet` next to every burst csv that got seeds; the GSE columns are added on region level afterwards (every tile touching the core opened once, every needed block read once for all bursts of the region).
 
 **Static information is attached in the same per-burst step:** GSE is sampled only at the points that are a seed or a pool member (not at the other points of the burst), from a transient windowed read. **Edge features are not stored**; they are computed at training time from the drawn subset (below).
 
@@ -1026,10 +1030,11 @@ Original note: §4.3 Step 3's angular-balanced candidate pool construction delib
 
 ### 10.13 OPEN — GSE normalization and compression, pending supervisor discussion
 
-**Status: idea sketched, not finalized — needs supervisor input before implementing.**
+**Status: not done for now (decided 2026-10-24) — the prototype feeds the 64-dim embedding without compression. Kept as an important point of potential improvement later; needs supervisor input before implementing.**
 
 Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5.4):
 - **Compression:** project a 64-dim embedding down via a small MLP before concatenating with other node features (rationale: dimensional balance, task-specific projection — see §5.4), vs. feeding it raw. Leaning toward compressing, not committed.
+- **Idea (noted 2026-10-24): the same compression MLP could also combine several years** (e.g. the five embeddings of 2019–2023, 320 values) into one smaller feature vector, so the model can use the whole target window without the node features growing. For now only the latest year is used (§10.16).
 - **Normalization:** the embedding is already roughly unit-scale post de-quantization and may encode meaningful relative geometry across its 64 dims; standardizing each dimension independently (the default treatment for every other feature group, §4.6) could distort that. Leaning toward skipping per-channel normalization for GSE specifically (or applying one shared scalar at most), unlike velocity/incidence/distance which get ordinary independent normalization. Not committed either way.
 
 ### 10.14 OPEN — per-burst anchor budget for candidate pool construction
@@ -1044,6 +1049,8 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 ### 10.16 OPEN — GSE year(s) and sampling strategy
 
+**Decision for the prototype (2026-10-24):** only the **latest year** of the embedding (2025, the newest in the index, which covers 2017–2025) is used, read from the **open bucket** (`gs://alphaearth_foundations/satellite_embedding/v1/annual/<year>/<utm_zone>/…`, served anonymously via `https://storage.googleapis.com/…`; tile index `…/annual/aef_index.csv`, 0.8 GB, one row per tile with year, UTM CRS, path and footprint), not through Google Earth Engine (account, authentication and request quotas for ~6 M points, same data). Note that 2025 lies two years after the 2019–2023 target window. **Tile layout:** 8192 × 8192 px of 10 m (~6,700 km²), 64 bands int8, zstd, band-interleaved, internal blocks of 1024 × 1024 px (10 km), overviews; files ~2.7 GB (compressed to ~0.62 of the raw size). **Volume for one year (measured 2026-10-24):** the 71 cores (123,600 km²) touch 174 tiles = 465 GB as full tiles; the core pixels alone are 79 GB raw, ~69 GB as windowed reads over the cores' bounding boxes (train 34, dev 8, cal 4, val 23 GB). Because a block covers 10 × 10 km in all 64 bands, sampling only the pool points still reads almost every block of a core, so ~50–70 GB transferred per year is realistic; nothing has to be stored except the vectors at the points. The val regions only need the embedding at their query points, which would cut their share to almost nothing.
+
 **Status: working plan, not verified.** (1) *Which year(s):* the target is the 2019–2023 mean velocity (§3.6a), so a single year's embedding doesn't match it by construction. Options: one representative year (64 B/point), or a pooled embedding over 2019–2023 (average then renormalise, or all five years kept and pooled in the model: 320 B/point). Interacts with §10.13. (2) *Sampling:* GSE is not stored as rasters (full tiles ~4.3 GB, regional windows ~200 MB per year). `s03` samples it once per region from a transient windowed COG read at the pool points and keeps only the int8 vectors. Sampling per `__getitem__` during training is **not** viable: remote range requests per draw would stall the data loader, and compute nodes may not have outbound HTTPS. As of 2026-10-20 the GSE download is not implemented in `s01` (only the tile index exists), so this is a prerequisite for `s03`'s feature step.
 
 ---
@@ -1053,6 +1060,10 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 ### 10.17 CONCERN — extrapolation queries at the pool edge
 
 **Status: accepted for now, possible reason for poor performance later (noted 2026-10-21).** Pools are built angular-balanced around their seed (§4.3 Step 3), but at training time any point of the drawn subset can be the query (§7.1). Points on the rim of a pool have all their neighbours on one side, so a large share of the training queries is extrapolation rather than interpolation. Consequences to watch: (1) the model may learn a blurred mix of both tasks and interpolate worse than it could; (2) validation errors may be dominated by such cases without it being visible. If performance is poor, check this first: record the query's largest angular gap to its neighbours per draw, break errors down by it, and then restrict queries to inner points or reweight the query choice.
+
+### 10.18 IDEA — informative points instead of nearest points for the candidate pool
+
+**Status: idea, not planned (noted 2026-10-24).** Instead of the angular-weighted nearest points (§4.3 Step 3), the pool could gather the *most informative* points around the seed (e.g. the points that best explain the seed's displacement). Concern: in dense areas this would probably lead to very narrow clusters of near-identical neighbours, so the model would learn from configurations that do not exist in genuinely sparse areas, which could hurt performance there later. Revisit only after the prototype pipeline runs end to end.
 
 ## 11. Thesis Positioning & Novelty
 
@@ -1122,8 +1133,8 @@ Inline comments explain the *why* of each step. They are short, lowercase senten
 ### 12.4 Command-line arguments and parameter logs
 
 - Every argument is written as `parser.add_argument("--kebab-case", dest="snake_case", type=..., required=True | default=..., help="meaning (unit)")`.
-- Validity checks (value ranges, `--buffer-m` ≤ `s01.CLIP_BUFFER_M`, mutually exclusive options) use `parser.error(...)` right after `parse_args()`.
-- Every step records its arguments with `s01.write_param_log("<script name>", s01.PARAM_LOG_DIR, vars(args))` (inside s01 without the prefix). The logs go to `assets/param_logs/` (gitignored); the folder is created if missing.
+- Validity checks (value ranges, mutually exclusive options) use `parser.error(...)` right after `parse_args()`.
+- Every step writes a **Markdown log** once at the end of a successful run: `s01.write_md_log("<script name>", body, figures=None)` → `assets/param_logs/<script name>_<timestamp>.md` (gitignored). The step only builds the body (`s01.params_to_md(vars(args))` for the arguments, `s01.table_to_md(rows)` for any list of dicts); everything is collected in memory during the run, nothing is written if the run fails. Figures (matplotlib, passed as `{name: fig}`) are saved into the subfolder `<script name>_<timestamp>/` and linked at the end of the md file; the plotting functions themselves live in an extra section of `xx_plotting.py`.
 - In the slurm scripts the arguments are a bash array `ARGS=( ... )`, one argument per line with a comment, followed by `uv run <script>.py "${ARGS[@]}"`.
 
 ### 12.5 CRS, units and geometry
@@ -1141,13 +1152,14 @@ Inline comments explain the *why* of each step. They are short, lowercase senten
 - **File names:**
   - `PART_<file>` for an unfinished download;
   - `<burst>_PREPROCESSED.csv` for the s02 output next to the (clipped) raw csv;
+  - `<burst>_GRAPH.parquet` for the s03 output (pool points with GSE) next to it — parquet, so no `*.csv` glob of s01/s02 picks it up;
   - `worldcover_merged.tif`;
   - `<Sta>_gnss_time_series.tenv3`.
 - **The region table** is read and written only through `s01.study_areas_io`. It writes and reads only the gitignored `assets/study_areas_gdf_local.gpkg` + `_local_complex.json`; the region table is a run result and never goes into git.
 - **Other `assets/` files:**
   - Inputs, tracked in git: `real_subsidence_polygonbased.gpkg` (handpicked regions) and `egms_coverage_countries.geojson`.
   - Secret: `token.jwt` (gitignored).
-  - Generated or downloaded on the fly: `egms_norm_stats.json`, `failed_egms_downloads.csv`, `gnss_station_list.txt`, `esa_world_cover_index.geojson`.
+  - Generated or downloaded on the fly: `egms_norm_stats.json`, `failed_egms_downloads.csv`, `gnss_station_list.txt`, `esa_world_cover_index.geojson`, `gse_index.parquet`, and the Markdown logs in `param_logs/` (all gitignored).
 
 ### 12.7 Column names
 
@@ -1165,7 +1177,7 @@ Inline comments explain the *why* of each step. They are short, lowercase senten
 | `egms_union_bbox`, `wc_tile_urls` | s01 | `[lon, lat]` extent of all clipped bursts, WorldCover tiles |
 | `wc_merged_path` | s02 | merged WorldCover raster |
 | `gnss_station_codes_filtered`, `gnss_station_paths_filtered`, `gnss_velocities`, `gnss_filter_params` | s02 (val only) | stations passing the quality filter and their velocities |
-| `n_points_region`, `n_seed_points_per_region`, `train_file` | s03 (train only) | point count, seed budget, output file |
+| `n_center_region`, `n_seed_points_per_region`, `graph_file_list` | s03 (train, dev, cal) | seed-eligible points (`in_center`), seed budget, graph files per burst |
 
 List or dict columns go into the `_complex.json`. A new list column must be added to `complex_cols` in `study_areas_io`. `uid` is internal to `study_areas_io` and only used to match the two files.
 
@@ -1187,10 +1199,10 @@ List or dict columns go into the `_complex.json`. A new list column must be adde
 - [x] Train / dev / cal / val split assigned at region level
 
 **Next up (§3.6a prototype scope):**
-- [ ] Per-burst candidate pool: land-cover-stratified anchors, angular-balanced k-NN, sequential no-reuse sampling, edge buffer (§4.3 Step 3 / §4.4)
+- [x] Per-burst candidate pool: land-cover-stratified anchors, angular-balanced k-NN, sequential no-reuse sampling, edge buffer (§4.3 Step 3 / §4.4) — implemented in s03, first full run pending
 - [x] Target is EGMS's own `mean_velocity` (2019–2023), a column in the preprocessed csvs, no fitting step (§3.6a)
-- [ ] GSE sampled once at candidate points only from a transient windowed read, vectors kept, no rasters stored; year choice decided (§10.16)
-- [ ] Candidate pools (lat/lon, velocity, incidence, GSE vectors, land cover, pool offsets) written to a few shard files, one per region (§7.1)
+- [x] GSE sampled once at candidate points only from a transient windowed read, vectors kept, no rasters stored; year choice decided: latest year 2025 (§10.16) — implemented in s03, first full run pending
+- [x] Candidate pools (lat/lon, velocity, incidence, GSE vectors) written as one GRAPH parquet per burst (§7.1) — implemented in s03, first full run pending
 - [ ] `PoolDataset` + `ConcatDataset` + `DataLoader(shuffle=True)` wired up, subset/graph/query drawn fresh in `__getitem__` (§7.1)
 - [ ] Normalization applied at read time: velocity/incidence stats from s02 (done), edge-distance and `dist_to_coherent` stats estimated from sampled draws (§4.6, §7.1)
 - [ ] Model architecture implemented (scalar head: `(mu_v, logvar_v)`, no basis coefficients yet) (§5, §3.6a)
@@ -1207,7 +1219,7 @@ List or dict columns go into the `_complex.json`. A new list column must be adde
 - [ ] Full multi-year temporal basis fit (§3.5), reconstruction propagation (§6.3)
 - [ ] Reprojection loss (§7.2, parked)
 - [ ] Sparsity augmentation (§10.11), distance-binned calibration (§6.5), multi-node masking (§10.10)
-- [ ] GSE normalization/compression finalization — pending supervisor input (§10.13)
+- [ ] GSE normalization/compression — not for the prototype, important potential improvement later, pending supervisor input (§10.13)
 
 ---
 

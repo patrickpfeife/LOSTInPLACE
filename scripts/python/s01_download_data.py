@@ -33,7 +33,7 @@ from shapely.ops import transform
 ################################################
 
 # Buffer (metres) around each region's core that is downloaded and kept when the bursts are clipped.
-# The pool buffer of the later steps may vary, but must not be larger than this.
+# s03 only uses the core for now, the ring is a reserve so later steps can use more without a new download.
 CLIP_BUFFER_M = 5000
 # Parameter logs of all steps, kept with the repo (gitignored) instead of the data tree
 PARAM_LOG_DIR = Path(__file__).parent / "../../assets/param_logs"
@@ -49,33 +49,6 @@ PARAM_LOG_DIR = Path(__file__).parent / "../../assets/param_logs"
 #===== Section 1: Shared Helper Functions =====#
 ################################################
 # Used across more than one processing step below, in the order they're first called.
-
-def write_param_log(step_name, param_log_dir, params):
-    """
-    Writes the runtime parameters of a processing step to a timestamped log file.
-
-    Arguments:
-        step_name -- str, name of the step, used in the file name (e.g. "s02_preprocessing")
-        param_log_dir -- Path, folder the log is written to (created if missing)
-        params -- dict, parameters to record (e.g. vars(args))
-
-    Returns:
-        log_path -- Path, the written log file
-    """
-    # the folder may not exist yet, e.g. on the very first s01 run
-    param_log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = param_log_dir / f"{step_name}_log_{timestamp}.log"
-
-    with open(log_path, "w") as f:
-        f.write(f"step: {step_name}\n")
-        f.write(f"time: {datetime.now().isoformat()}\n")
-        f.write("parameters:\n")
-        for key, value in params.items():
-            f.write(f"  {key}: {value}\n")
-
-    return log_path
-
 
 def create_file_system():
     """
@@ -167,7 +140,7 @@ def study_areas_io(mode, gdf=None, base_path=None):
     # the columns holding lists or dicts. gpkg can't store those, so they go into the json
     complex_cols = ["egms_query_bbox", "egms_union_bbox", "gnss_station_codes", "gnss_station_paths",
                      "wc_tile_urls", "gnss_station_codes_filtered", "gnss_station_paths_filtered",
-                     "gnss_velocities", "gnss_filter_params"]
+                     "gnss_velocities", "gnss_filter_params", "graph_file_list"]
 
     if mode == "write":
         # work on a copy so the uid column doesn't end up in the gdf of the caller
@@ -222,6 +195,83 @@ def pull_data_by_url(url, out_dir, file):
         pass
 
     return str(file_path)
+
+
+def table_to_md(rows):
+    """
+    Turns a list of dicts (one per row, the same keys in every dict) into a markdown table.
+
+    Arguments:
+        rows -- list of dicts, the keys of the first dict are the column names
+
+    Returns:
+        table -- str, the markdown table ("_none_" if rows is empty)
+    """
+    if not rows:
+        return "_none_"
+    cols = list(rows[0])
+    lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    lines += ["| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows]
+    return "\n".join(lines)
+
+
+def params_to_md(params):
+    """
+    Turns the parameters of a run into a two-column markdown table.
+
+    Arguments:
+        params -- dict, e.g. vars(args)
+
+    Returns:
+        table -- str, the markdown table (parameter | value)
+    """
+    return table_to_md([{"parameter": k, "value": v} for k, v in params.items()])
+
+
+def write_md_log(step_name, start, params, body="", figures=None, end=None):
+    """
+    Writes the markdown log of one run of a step to PARAM_LOG_DIR/<step_name>_<timestamp>.md. Called once at the
+    end of a successful run with everything collected during it. Every log starts with the same header: the step,
+    start, end and duration of the run and the arguments passed to the script; the step's own body follows.
+    Optional matplotlib figures are saved as png into the subfolder <step_name>_<timestamp>/ and appended to the
+    body as images, with paths relative to the md file.
+
+    Arguments:
+        step_name -- str, name of the step, used as title and in the file name (e.g. "s02_preprocessing")
+        start -- datetime, when the run started (also the timestamp of the file name)
+        params -- dict, the arguments of the run (e.g. vars(args))
+        body -- str, the step's own markdown content, appended after the header
+        figures -- dict or None, {name: matplotlib.figure.Figure}, each saved as <name>.png
+        end -- datetime or None, when the run finished; None = now
+
+    Returns:
+        md_path -- Path, the written markdown file
+    """
+    end = end or datetime.now()
+    # the same header for every step
+    header = "\n\n".join([f"# {step_name}",
+                           table_to_md([{"run": "started", "time": f"{start:%Y-%m-%d %H:%M:%S}"},
+                                        {"run": "finished", "time": f"{end:%Y-%m-%d %H:%M:%S}"},
+                                        {"run": "duration", "time": str(end - start).split(".")[0]}]),
+                           "## Arguments", params_to_md(params)])
+    body = header + ("\n\n" + body if body else "")
+
+    # the folder may not exist yet, e.g. on the very first run
+    PARAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = start.strftime("%Y%m%d_%H%M%S")
+    md_path = PARAM_LOG_DIR / f"{step_name}_{stamp}.md"
+
+    # figures go into a subfolder with the same name as the md file, and are linked at the end of the body
+    if figures:
+        fig_dir = PARAM_LOG_DIR / f"{step_name}_{stamp}"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        body += "\n\n## Figures\n"
+        for name, fig in figures.items():
+            fig.savefig(fig_dir / f"{name}.png", dpi=120, bbox_inches="tight")
+            body += f"\n![{name}]({fig_dir.name}/{name}.png)\n"
+
+    md_path.write_text(body + "\n")
+    return md_path
 
 
 ################################################
@@ -718,6 +768,48 @@ def pull_worldcover(row, index_gdf):
     return tile_urls
 
 
+##################################################
+#======= Section 5: Markdown Log Helper =========#
+##################################################
+# Used at the end of a run, for the step's part of the markdown log (see write_md_log).
+
+def download_summary_md(study_areas_gdf):
+    """
+    Builds the s01 part of the markdown log: the regions per set, the downloaded EGMS bursts, failed downloads,
+    the GNSS stations of the val regions and the WorldCover tiles.
+
+    Arguments:
+        study_areas_gdf -- geopandas.GeoDataFrame, the region table after download_esa_worldcover
+
+    Returns:
+        body -- str, markdown
+    """
+    set_names = {0: "train", 1: "dev", 2: "cal", 3: "val"}
+    # random regions are named after their set with a running number, all others are handpicked
+    random = study_areas_gdf["location"].str.match(r"^(train|dev|cal)_\d+$")
+    # the raw (clipped) burst csvs of every region, the s02 outputs next to them are not counted
+    n_bursts = [len([c for c in Path(p).glob("*/*.csv") if "_PREPROCESSED" not in c.name]) for p in study_areas_gdf["region_path"]]
+
+    per_set = []
+    for s, name in set_names.items():
+        m = (study_areas_gdf["set"] == s).to_numpy()
+        per_set.append({"set": name, "regions": int(m.sum()), "handpicked": int((m & ~random.to_numpy()).sum()),
+                        "random": int((m & random.to_numpy()).sum()), "burst csvs": int(np.array(n_bursts)[m].sum()),
+                        "WorldCover tiles": int(sum(len(u) for u in study_areas_gdf.loc[m, "wc_tile_urls"]))})
+
+    failed_path = Path(__file__).parent / "../../assets/failed_egms_downloads.csv"
+    n_failed = len(pd.read_csv(failed_path)) if failed_path.exists() else 0
+
+    val = study_areas_gdf.loc[study_areas_gdf["set"] == 3]
+    gnss = [{"val region": r.location, "GNSS stations in the core": len(r.gnss_station_codes)} for r in val.itertuples()]
+
+    return "\n\n".join(["## Summary", table_to_md(per_set),
+                         f"EGMS files that could not be downloaded: {n_failed}"
+                         + ("" if n_failed == 0 else " (see assets/failed_egms_downloads.csv)") + ".",
+                         f"Clip buffer around every core: {CLIP_BUFFER_M} m.",
+                         "## GNSS stations (val regions)", table_to_md(gnss)])
+
+
 ##############################################################################
 #============================================================================#
 # 3) Processing
@@ -934,7 +1026,8 @@ def main(real_sub_buffer_value, n_rnd, mindist_rnd, maxit_rnd, egms_rand_extensi
             download_egms, see there
 
     Returns:
-        None -- raises FileNotFoundError if the real subsidence file is missing
+        study_areas_gdf -- geopandas.GeoDataFrame, the final region table (also saved to disk);
+            raises FileNotFoundError if the real subsidence file is missing
     """
 
     ##############################
@@ -961,6 +1054,8 @@ def main(real_sub_buffer_value, n_rnd, mindist_rnd, maxit_rnd, egms_rand_extensi
 
     # Download the ESA world cover for later land use stratification
     download_esa_worldcover(study_areas_gdf, index_url="https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/esa_worldcover_grid.geojson")
+
+    return study_areas_gdf
 
 
 if __name__ == '__main__':
@@ -992,9 +1087,10 @@ if __name__ == '__main__':
     CAL_DIR = DATA_DIR / "cal"
     VAL_DIR = DATA_DIR / "val"
 
-    # Saving the important parameters in a log file
-    write_param_log("s01_download_data", PARAM_LOG_DIR, vars(args))
-
     # running the whole download
-    main(real_sub_buffer_value=args.real_sub_buffer_value, n_rnd=args.n_rnd, mindist_rnd=args.mindist_rnd,
-         maxit_rnd=args.maxit_rnd, egms_rand_extension=args.egms_rand_extension)
+    start = datetime.now()
+    study_areas_gdf = main(real_sub_buffer_value=args.real_sub_buffer_value, n_rnd=args.n_rnd, mindist_rnd=args.mindist_rnd,
+                           maxit_rnd=args.maxit_rnd, egms_rand_extension=args.egms_rand_extension)
+
+    # the markdown log of the run, written only if the run got this far
+    write_md_log("s01_download_data", start, vars(args), body=download_summary_md(study_areas_gdf))

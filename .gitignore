@@ -18,7 +18,8 @@ assets/*_local.gpkg
 assets/*_local_complex.json
 assets/param_logs/
 esa_world_cover_index.geojson
-
+assets/gse_index.parquet
+assets/aef_index.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
