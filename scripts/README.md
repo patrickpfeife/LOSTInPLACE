@@ -14,7 +14,7 @@ uv run s01_download_data.py --project-dir PROJECTDIR --real-sub-buffer-value=150
 
 | Argument | Example | Description |
 |---|---|---|
-| `--project-dir` | `/dss/.../LOSTInPLACE` | Root of the project's data tree (needs tens of GB free); `data/{train,dev,cal,val}/` is created under it |
+| `--project-dir` | `/dss/.../LOSTInPLACE` | Root of the project's data tree (needs a few hundred GB free); `data/{train,dev,cal,val}/` and `checkpoints/` (model weights of the later steps) are created under it |
 | `--real-sub-buffer-value` | `150000` | Minimum gap in metres between the query areas of the real-subsidence regions and those of the random regions |
 | `--n-rnd` | `35` | Number of random regions to sample across the EGMS coverage area |
 | `--mindist-rnd` | `150000` | Minimum distance in metres between the random region centres; keep it ≥ 2 · (`egms-rand-extension` · √2 + `CLIP_BUFFER_M`) so their query areas can't overlap |

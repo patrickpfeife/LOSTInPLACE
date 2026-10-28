@@ -52,10 +52,11 @@ PARAM_LOG_DIR = Path(__file__).parent / "../../assets/param_logs"
 
 def create_file_system():
     """
-    Creates the project's directory tree (data, train, dev, cal, val) under PROJECT_DIR if it doesn't exist yet.
+    Creates the project's directory tree (data with train, dev, cal, val, and checkpoints for the model weights
+    of s04/s05) under PROJECT_DIR if it doesn't exist yet.
 
     Arguments:
-        None -- uses the global PROJECT_DIR / DATA_DIR / TRAIN_DIR / DEV_DIR / CAL_DIR / VAL_DIR paths
+        None -- uses the global PROJECT_DIR / DATA_DIR / TRAIN_DIR / DEV_DIR / CAL_DIR / VAL_DIR / CHECKPOINT_DIR paths
 
     Returns:
         None -- creates the folders on disk as a side effect
@@ -67,6 +68,7 @@ def create_file_system():
     DEV_DIR.mkdir(parents=True, exist_ok=True)
     CAL_DIR.mkdir(parents=True, exist_ok=True)
     VAL_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def requests_get(url, part_file_path, file_path, headers=None):
@@ -1086,6 +1088,8 @@ if __name__ == '__main__':
     DEV_DIR = DATA_DIR / "dev"
     CAL_DIR = DATA_DIR / "cal"
     VAL_DIR = DATA_DIR / "val"
+    # the model weights of the training steps (s04, s05), next to the data tree
+    CHECKPOINT_DIR = PROJECT_DIR / "checkpoints"
 
     # running the whole download
     start = datetime.now()

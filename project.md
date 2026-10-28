@@ -600,6 +600,8 @@ Train **M** independent copies of the model (M ≈ 5), each with different:
 - Random seed
 - Bootstrap sample of the training points
 
+All members use the **same hyperparameters** (the best setting of the s04 search) but are trained **from scratch** (s05): their weights differ, and that disagreement is the epistemic signal. Initialising all members from one trained model and only fine-tuning would keep them too similar and underestimate the epistemic uncertainty; the best s04 model can at most serve as one of the members. **The predictor used at inference is the whole ensemble** (M checkpoints + the conformal factor q from s06), never a single member: per query all M members run on the same graph, their outputs are combined as below, scaled with q (§6.5) and then decomposed into east-west and vertical (§6.4). Calibration (s06) and validation therefore have to use exactly this combination.
+
 At inference, run all M members and compute:
 ```python
 means = [mu_m for each member m]          # (M, p_los)
@@ -840,8 +842,8 @@ for member_id, (model, opt) in enumerate(zip(ensemble_models, optimizers)):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
         
-        # Validation on cal blocks
-        val_loss = evaluate(model, cal_loader)
+        # Validation on the dev regions (cal stays untouched for the conformal step, §7.5)
+        val_loss = evaluate(model, dev_loader)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), f"model_m{member_id}.pt")
@@ -853,6 +855,23 @@ for member_id, (model, opt) in enumerate(zip(ensemble_models, optimizers)):
 ### 7.4 Warmup strategy
 
 **Status: under consideration, not yet adopted — pending literature justification (§10.12).** The idea: train with MSE on the mean only for a few epochs before switching to Gaussian NLL, since an uncalibrated variance head early on can destabilize both heads at once. Keep in mind, don't implement yet without evidence this is worth the added complexity.
+
+### 7.5 s04_train_model.py: scope and decisions (2026-10-28)
+
+**Scope:** loading the GRAPH files (§7.1, masked-target draws per epoch), defining and training **one** model per hyperparameter setting, and evaluating it on the dev regions for hyperparameter tuning. Nothing about ensembles or calibration.
+
+**Pipeline after s04 (decided 2026-10-28):**
+- **s05_ensemble_prediction:** trains the M members with the chosen hyperparameters (one SLURM array job per member, `--member` = array index → seed and bootstrap resample) by importing the training code from s04 (no duplicated code), and saves one checkpoint per member.
+- **s06_calibration:** loads all M checkpoints, predicts on the cal graphs (ensemble mean, epistemic spread, aleatoric `logvar`) and computes the conformal quantile (§6.5). Trains nothing.
+- Kept as two scripts because s05 is many long (GPU) jobs in parallel, while s06 is one short job that can only start once all members exist.
+
+- **GSE as a switch (`--use-gse`):** the first runs train **without** GSE, to see how far velocity, incidence and geometry alone get. Then with the raw 64-dim embedding, later with the compressed one (§10.13). With GSE off, the 64 columns are not loaded at all.
+- **Dataset size as an argument:** the number of graphs (pools) used can be limited (e.g. 30,000 of the ~188k train graphs) for fast first runs. Implementation: list all pools (GRAPH file + `seed_pid`) of all train regions and draw the wanted number at random with a fixed seed, so every region contributes on average in proportion to its pools. How the result scales with the dataset size is a test in itself.
+- **Loss:** heteroscedastic NLL only. The MSE warmup (§7.4) is **kept as an idea** but not implemented in s04 for now (no argument, no code); it may come back once the literature is checked (§10.12).
+- **Checkpoints:** the weights of a run go to `<project-dir>/checkpoints/<run-name>/best_model.pt` on scratch, next to the data tree (`checkpoints/` is created by s01's `create_file_system`); s04 therefore takes `--project-dir`.
+- **Early stopping and model selection on dev.** dev is therefore used twice, so its scores are slightly optimistic; cal and val are never touched during training or tuning.
+- **Hyperparameter search:** one SLURM array job per combination (each run = one training job with its own log), selection on the dev metric; the grid is kept small.
+- **Ensemble:** hyperparameters are tuned on single models in s04; the M members are trained in s05 with the final setting (see above).
 
 ---
 
@@ -1148,6 +1167,7 @@ Inline comments explain the *why* of each step. They are short, lowercase senten
 
 - **Project tree:**
   - `<project-dir>/data/{train,dev,cal,val}/<location>/{ascending,descending}/<burst>.csv`
+  - `<project-dir>/checkpoints/<run-name>/` for the model weights of s04/s05
   - GNSS series and WorldCover tiles sit directly in `<location>/`.
 - **File names:**
   - `PART_<file>` for an unfinished download;
