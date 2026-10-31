@@ -3,6 +3,7 @@
 Exercise-driven notebooks for this thesis's codebase. Same convention throughout: most code cells are `# TODO` stubs with hints and doc links, not finished solutions — each notebook's intro cell explains exactly how it's meant to be used.
 
 - **`pyg_tutorial.ipynb`** — from-scratch introduction to PyTorch Geometric (PyG), building up toward the model described in `../project.md` (Sections 3 and 5). Assumes general ML/DL knowledge but no prior GNN or PyG experience.
+- **`s04_dataflow_tutorial.ipynb`** — not an exercise notebook: a walk-through of `scripts/python/s04_train_model.py` on tiny toy GRAPH files (built in a temp folder inside the notebook). Every s04 function is copied in and run once, and its output is printed: types, dtypes, shapes and values from the pool index over one hand-built graph, the batching and the model's shapes to the training loop with early stopping and the checkpoint. Runs in under a minute on the login node (CPU).
 - **`oop_tutorial.ipynb`** — object-oriented Python past the basics (inheritance/`super()`, dunder methods, `@property`/`@classmethod`/`@staticmethod`, `abc.ABC`, `@dataclass`, `__call__`), using the same EGMS sample data and building toward `project.md` Section 8.2's baseline-comparison design. Assumes you already know classes/`self`/`__init__` — it picks up from there, and assumes the Python level `pyg_tutorial.ipynb` requires.
 
 ## Setup
