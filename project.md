@@ -1084,6 +1084,17 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 **Status: idea, not planned (noted 2026-10-24).** Instead of the angular-weighted nearest points (§4.3 Step 3), the pool could gather the *most informative* points around the seed (e.g. the points that best explain the seed's displacement). Concern: in dense areas this would probably lead to very narrow clusters of near-identical neighbours, so the model would learn from configurations that do not exist in genuinely sparse areas, which could hurt performance there later. Revisit only after the prototype pipeline runs end to end.
 
+### 10.19 TODO — theory to research and understand before it goes into the thesis
+
+**Status: running list, entries are added as they come up (started 2026-10-31).** Each topic has to be understood well enough to explain and defend it in the thesis, not just to use it in the code. Tick an entry once it is understood and written up.
+
+- [ ] **The model head with `mu` and `logvar`:** how the heteroscedastic head works, why the log-variance is predicted, how it connects to the Gaussian NLL loss and what the predicted variance does and does not mean (§5, §6.1).
+- [ ] **The model architecture:** what really happens in the encoder, the GATv2 layers with edge features, the residual connections and the readout at the query node, and why it is built like this and not differently (§5).
+- [ ] **The Gaussian NLL loss:** why this loss function and not another (e.g. MSE), where the formula comes from (negative log-likelihood of a Gaussian with predicted mean and variance), how the two terms balance error against predicted variance, and what assumptions it makes about the errors (§6.1).
+- [ ] **The theory behind the conformal calibration:** why split-conformal prediction gives coverage, what the guarantee assumes and where it breaks (§6.5).
+
+---
+
 ## 11. Thesis Positioning & Novelty
 
 ### 11.1 Related work
