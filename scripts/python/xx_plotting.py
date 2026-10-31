@@ -250,6 +250,32 @@ def plot_real_vs_random(study_areas_path, real_sub_path):
     save_figure(fig, "real_vs_random_points")
 
 
+def plot_loss_curves(history):
+    """
+    Plots the train and dev loss per epoch of a training run and marks the epoch with the lowest dev loss.
+
+    Arguments:
+        history -- list of dicts, one per epoch, with the keys "epoch", "train_loss" and "dev_loss" (see train_model in s04)
+
+    Returns:
+        fig -- matplotlib.figure.Figure, not saved here since s01.write_md_log saves the figures it gets
+    """
+    epochs = [h["epoch"] for h in history]
+    # the epoch of the lowest dev loss is the one saved as the best checkpoint
+    best = min(history, key=lambda h: h["dev_loss"])
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(epochs, [h["train_loss"] for h in history], color=COLOR_TRAIN, label="train")
+    ax.plot(epochs, [h["dev_loss"] for h in history], color=COLOR_DEV, label="dev")
+    ax.axvline(best["epoch"], color="gray", linestyle="--", linewidth=1, label=f"best epoch ({best['epoch']})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("NLL (normalized units)")
+    ax.set_title("Loss per epoch")
+    ax.legend(frameon=False)
+
+    return fig
+
+
 #============================================================#
 # Main
 #============================================================#
