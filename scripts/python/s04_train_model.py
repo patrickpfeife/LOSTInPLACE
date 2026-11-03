@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 
 import s01_download_data as s01
 import s02_preprocessing as s02
-import s03_build_training_dataset as s03
 import xx_plotting as xx
 
 from pathlib import Path
@@ -37,7 +36,6 @@ from torch_geometric.utils import to_undirected
 
 # geodesic distances and bearings on the WGS84 ellipsoid (project.md §4.2)
 GEOD = Geod(ellps="WGS84")
-
 
 ##############################################################################
 #============================================================================#
@@ -233,8 +231,6 @@ class PoolDataset(torch.utils.data.Dataset):
         self.fixed_draws = fixed_draws
 
     def set_epoch(self, epoch):
-        # train_model calls this before every epoch; the DataLoader starts its workers anew every epoch (no
-        # persistent_workers), so every worker copies the dataset with the current epoch
         """
         Sets the epoch the next train draws belong to, so every epoch draws new subsets and queries.
 
@@ -244,10 +240,11 @@ class PoolDataset(torch.utils.data.Dataset):
         Returns:
             None -- updates self.epoch
         """
+        # train_model calls this before every epoch; the DataLoader starts its workers anew every epoch (no
+        # persistent_workers), so every worker copies the dataset with the current epoch
         self.epoch = epoch
 
     def __len__(self):
-        # the number of pools: one item per pool and epoch
         """
         Number of items of the dataset, used by the DataLoader to know how many graphs one epoch has.
 
@@ -257,7 +254,36 @@ class PoolDataset(torch.utils.data.Dataset):
         Returns:
             n -- int, the number of pools (one graph per pool and epoch)
         """
+        # the number of pools: one item per pool and epoch
         return len(self.pools)
+
+    def draw_subset_method(self, i):
+        """
+        Draws the subset of pool i and the query among it. Used by __getitem__ (GNN) and by evaluate_baselines, so
+        the GNN and the baselines see exactly the same visible points and query.
+
+        Arguments:
+            i -- int, the pool number
+
+        Returns:
+            pool -- dict, the pool (see load_pools)
+            idx -- numpy int array (m,), positions of the subset's points in the pool
+            q -- int, position of the query within idx
+        """
+
+        # pulls one candidate pool from all pools to build a graph from it
+        pool = self.pools[i]
+        n = len(pool["vel"])
+
+        # train: the generator is seeded with (run seed, epoch, pool), so every epoch draws a different subset and query,
+        #        reproducibly and independent of which DataLoader worker draws the pool (and of --num-workers)
+        # dev: the generator is seeded with i, so pool i always gives the same graph and the dev metrics stay comparable
+        # the generator is created anew in every call, so repeated calls with the same i (and epoch) give the same draw
+        rng = np.random.default_rng(i) if self.fixed_draws else np.random.default_rng([self.seed, self.epoch, i])
+        # draws the subset of the candidate pool and the query among it
+        idx, q = draw_subset(n, self.subset_min, self.subset_max, self.min_graph_size, rng)
+
+        return pool, idx, q
 
     def __getitem__(self, i):
         """
@@ -271,17 +297,10 @@ class PoolDataset(torch.utils.data.Dataset):
                 y (1,) the query's normalized velocity, query_mask (m,) True at the query, region and orbit (str)
         """
 
-        # pulls one candidate pool from all pools to build a graph from it
-        pool = self.pools[i]
-        n = len(pool["vel"])
-        lat, lon = pool["lat"], pool["lon"]
+        # the pool, the subset and the query (the same draw the baselines use for dev)
+        pool, idx, q = self.draw_subset_method(i)
 
-        # train: the generator is seeded with (run seed, epoch, pool), so every epoch draws a different subset and query,
-        #        reproducibly and independent of which DataLoader worker draws the pool (and of --num-workers)
-        # dev: the generator is seeded with i, so pool i always gives the same graph and the dev metrics stay comparable
-        rng = np.random.default_rng(i) if self.fixed_draws else np.random.default_rng([self.seed, self.epoch, i])
-        # draws the subset of the candidate pool for per epoch variation
-        idx, q = draw_subset(n, self.subset_min, self.subset_max, self.min_graph_size, rng)
+        lat, lon = pool["lat"], pool["lon"]
 
         # compute the distance and the orientation of the points
         dist, az = pairwise_geodesic(lat[idx], lon[idx])
@@ -309,7 +328,7 @@ def draw_subset(n, subset_min, subset_max, min_graph_size, rng):
         n -- int, number of points of the pool
         subset_min, subset_max -- float, range of the share of points drawn
         min_graph_size -- int, minimum size of the subset
-        rng -- numpy.random.Generator, the generator of the item (see PoolDataset.__getitem__)
+        rng -- numpy.random.Generator, the generator of the item (see PoolDataset.draw_subset_method)
 
     Returns:
         idx -- numpy int array (m,), positions of the subset's points in the pool
@@ -530,7 +549,6 @@ class InSARGNN(nn.Module):
         self.head_logvar = nn.Linear(hidden_dim, 1)
 
     def forward(self, data):
-        # encode the node features
         """
         Runs a batch of graphs through the model and reads the prediction out at the query nodes.
 
@@ -541,6 +559,7 @@ class InSARGNN(nn.Module):
             mu -- torch tensor (n_graphs,), predicted normalized velocity of every query
             logvar -- torch tensor (n_graphs,), predicted log variance, clamped to [-8, 8]
         """
+        # encode the node features
         h = self.encoder(data.x)
 
         # Message passing with residual connections: the layer's output is added to its input (h + ...), so a layer only
@@ -726,17 +745,162 @@ def save_checkpoint(model, params, epoch, path):
     # state.dict() holds learned weights; params is the dict from main; epoch is at which epoch the best state was reached
     torch.save({"state_dict": model.state_dict(), "params": params, "epoch": epoch}, path)
 
-
-
 ################################################
-#======= Section 4: Markdown Log Helper =======#
+#======== Section 4: Evaluation Helpers =======#
+################################################
+# Used by evaluate_on_dev: the baselines on the dev graphs (§7.5) and the metrics per method and group.
+
+def idw(pool, idx, q, power):
+    """
+    Predicts the query's velocity by inverse distance weighting of all visible points of the same dev graph
+    (baseline). Distances below 1 m are clipped, so very close points don't get an unbounded weight.
+
+    Arguments:
+        pool -- dict, the pool (see load_pools)
+        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
+        q -- int, position of the query within idx
+        power -- int or float, power of the inverse distance (1 or 2)
+
+    Returns:
+        prediction -- float, the predicted velocity in mm/yr
+    """
+
+    # coordinates and raw velocities (mm/yr) of the subset, in subset order (positions 0 ... m-1)
+    lat, lon, vel = pool["lat"][idx], pool["lon"][idx], pool["vel"][idx]
+    # pairwise distances between all points of the subset; the bearings are not needed
+    dist, _ = pairwise_geodesic(lat, lon)
+    # we only need the distances from the query to the other points, which are in row q of the matrix
+    query_dist_row = dist[q]
+    # the query itself is deleted (its distance to itself is 0)
+    query_dist_row = np.delete(query_dist_row, q)
+    # its velocity is deleted as well, so distances and velocities stay in the same order
+    vel = np.delete(vel, q)
+    # very close points (and distance 0) would get an unbounded weight: distances below 1 m are set to 1 m
+    query_dist_row = np.maximum(query_dist_row, 1.0)
+    # inverse distance weights
+    weights = 1 / query_dist_row ** power
+    # weighted mean by vector operation
+    result = np.sum(vel * weights) / np.sum(weights)
+
+    return float(result)
+
+
+def neighbour_mean(pool, idx, q, k_graph):
+    """
+    Predicts the query's velocity as the mean of its k_graph nearest visible points of the same dev graph (baseline).
+
+    Arguments:
+        pool -- dict, the pool (see load_pools)
+        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
+        q -- int, position of the query within idx
+        k_graph -- int, number of nearest visible points that are averaged
+
+    Returns:
+        mean -- float, the predicted velocity in mm/yr
+    """
+
+    # coordinates and raw velocities (mm/yr) of the subset, in subset order (positions 0 ... m-1)
+    lat, lon, vel = pool["lat"][idx], pool["lon"][idx], pool["vel"][idx]
+
+    # pairwise distances of the subset; the bearings are not needed
+    dist, _ = pairwise_geodesic(lat, lon)
+
+    # distances from the query to all subset points; the query itself gets inf so it is never its own neighbour
+    d_q = dist[q].copy()
+    d_q[q] = np.inf
+
+    # positions (within the subset) of the k nearest visible points
+    nearest = np.argsort(d_q)[:k_graph]
+
+    # mean of their velocities, as a plain python float
+    return float(vel[nearest].mean())
+
+
+
+def o_kriging():
+    pass
+
+def reg_kriging():
+    pass
+
+
+def evaluate_baselines(dev_ds, k_graph):
+    """
+    Predicts every dev query with the baselines, each from exactly the visible points of the GNN's dev graph (same
+    subset and query, see PoolDataset.draw_subset_method). Runs once per run, the baselines don't depend on the model.
+
+    Arguments:
+        dev_ds -- PoolDataset, the dev dataset (fixed_draws=True)
+        k_graph -- int, number of nearest visible points of the neighbour mean
+
+    Returns:
+        baselines -- polars.DataFrame, one row per dev graph in pool order (= the order of the unshuffled dev loader):
+            region, orbit, y_mm and one column per baseline (mm/yr)
+    """
+
+    # list to capture the comparisons
+    results = []
+
+    # len applied to dev_ds calls the method __len__ of that object; we iterate over every graph of the dev set in pool
+    # order 0 ... n-1, the order in which the dev loader (shuffle=False) gives them to the GNN. The raw values of the
+    # draw are used here, not the Data object (that only holds normalized features and no coordinates)
+    for i in range(len(dev_ds)):
+        pool, idx, q = dev_ds.draw_subset_method(i)
+        # one row per graph: the true value of the query and the prediction of every baseline
+        results_per_graph = {"region": pool["region"], "orbit": pool["orbit"],
+                             "y_mm": pool["vel"][idx][q], "neighbour_mean": neighbour_mean(pool, idx, q, k_graph),
+                             "o_kriging": o_kriging(), "reg_kriging": reg_kriging(),
+                             "idw_1": idw(pool, idx, q, 1), "idw_2": idw(pool, idx, q, 2)}
+
+        results.append(results_per_graph)
+    # a dataframe built from the list of dicts, one row per graph
+    return pl.DataFrame(results)
+
+
+def per_group_metrics(dev_predictions, pred_col, group_col=None, sigma_col=None):
+    """
+    Computes n, RMSE and MAE of one prediction column against y_mm, overall or per group, and the share inside
+    pred ± 1.645 sigma if a sigma column is given.
+
+    Arguments:
+        dev_predictions -- polars.DataFrame, one row per dev query with y_mm and the prediction columns
+            (see evaluate_on_dev)
+        pred_col -- str, the prediction column (mu_mm, idw_1, ...)
+        group_col -- str or None, column to group by (region, orbit); None = one row over all queries
+        sigma_col -- str or None, the predicted standard deviation (so far only the GNN has one)
+
+    Returns:
+        metrics -- list of dicts: one per group (sorted by the group), or a list with one dict without grouping
+    """
+
+    # the error as a polars expression, computed per row once it is used in select or agg
+    err = pl.col(pred_col) - pl.col("y_mm")
+    # a list of expressions for accuracy metrics
+    metrics_recipes = [pl.len().alias("n"), (err ** 2).mean().sqrt().alias("rmse"), err.abs().mean().alias("mae")]
+
+    if sigma_col is not None:
+        # <= comparison yields True or False. The mean of that yields the share of True, so how many are in interval
+        metrics_recipes.append((err.abs() <= (1.645 * pl.col(sigma_col))).mean().alias("inside_90"))
+
+    # agg applies the expressions per group (sorted, group_by has no fixed order); select applies them to the whole
+    # table and gives one row
+    if group_col is not None:
+        metrics = dev_predictions.group_by(group_col).agg(metrics_recipes).sort(group_col)
+    else:
+        metrics = dev_predictions.select(metrics_recipes)
+
+    return metrics.to_dicts()
+
+    
+################################################
+#======= Section 5: Markdown Log Helper =======#
 ################################################
 # Used at the end of a run, for the step's part of the markdown log (see s01.write_md_log).
 
 def training_summary_md(results):
     """
-    Builds the s04 part of the markdown log: data, training (epochs, best epoch, checkpoint), train vs dev metrics
-    and the dev metrics per region and orbit, plus the loss curves as figure.
+    Builds the s04 part of the markdown log: data, training (epochs, best epoch, checkpoint), train vs dev metrics,
+    the dev metrics per region and orbit and the comparison with the baselines on dev, plus the loss curves as figure.
 
     Arguments:
         results -- dict, returned by main
@@ -767,9 +931,19 @@ def training_summary_md(results):
         s01.table_to_md([rounded(r) for r in metrics["dev_per_region"]]),
         "## Dev per orbit",
         s01.table_to_md([rounded(r) for r in metrics["dev_per_orbit"]]),
+        # the GNN against the baselines on exactly the same dev graphs
+        "## Baselines on dev",
+        "All methods on the same dev graphs (same visible points and query). IDW1/IDW2 = inverse distance weighting "
+        "with power 1/2 over all visible points (distances below 1 m clipped), Neighbour Mean = mean of the k_graph "
+        "nearest visible points. RMSE and MAE in mm/yr; inside_90 only for methods with an uncertainty.",
+        s01.table_to_md([rounded(r) for r in metrics["baselines_overall"]]),
+        "### RMSE per region",
+        s01.table_to_md([rounded(r) for r in metrics["baselines_rmse_per_region"]]),
+        "### MAE per region",
+        s01.table_to_md([rounded(r) for r in metrics["baselines_mae_per_region"]]),
     ])
 
-    # train and dev loss per epoch, best epoch marked (xx.plot_loss_curves is still to be written in xx_plotting.py)
+    # train and dev loss per epoch, best epoch marked
     figures = {"loss_curves": xx.plot_loss_curves(history)}
 
     return body, figures
@@ -870,22 +1044,27 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
     return history, best_epoch
 
 
-def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device):
+def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_graph):
     """
-    Reloads the best checkpoint and evaluates it on train and dev, and on dev per region and per orbit.
+    Reloads the best checkpoint and evaluates it on train and dev, on dev per region and per orbit, and compares it
+    with the baselines on exactly the same dev graphs.
 
     Arguments:
         model -- InSARGNN, its weights are replaced by the checkpoint's
         checkpoint_path -- Path, the best checkpoint (see train_model)
         train_loader, dev_loader -- DataLoader
         device -- str, "cuda" or "cpu"
+        k_graph -- int, number of nearest visible points of the neighbour mean baseline
 
     Returns:
-        metrics -- dict with train and dev (see evaluate) and dev_per_region, dev_per_orbit (lists of dicts with
-            n, rmse, mae, inside_90 per group)
+        metrics -- dict with
+            train, dev -- dicts, see evaluate
+            dev_per_region, dev_per_orbit -- lists of dicts, the GNN's n, rmse, mae, inside_90 per group
+            baselines_overall -- list of dicts, one per method: method, n, rmse, mae (inside_90 with a sigma)
+            baselines_rmse_per_region, baselines_mae_per_region -- lists of dicts, one per region, one column per method
     """
 
-    # loads the best checkpoint not the last one 
+    # loads the best checkpoint not the last one
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["state_dict"])
 
@@ -893,19 +1072,46 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device):
     train_metrics, _ = evaluate(model, train_loader, device)
     dev_metrics, dev_predictions = evaluate(model, dev_loader, device)
 
-    # helper to aggregate the dev predictions by region or orbit: number of queries, RMSE, MAE and the share inside
-    # mu ± 1.645 sigma per group, sorted by name, as list of dicts for the markdown tables
-    def per_group(col):
-        err = pl.col("mu_mm") - pl.col("y_mm")
-        return (dev_predictions.group_by(col)
-                .agg(pl.len().alias("n"),
-                    (err ** 2).mean().sqrt().alias("rmse"),
-                    err.abs().mean().alias("mae"),
-                    (err.abs() <= 1.645 * pl.col("sigma_mm")).mean().alias("inside_90"))
-                .sort(col).to_dicts())
+    # the baselines on all dev graphs, from the raw values of the same draws (once per run, not per epoch)
+    baseline_df = evaluate_baselines(dev_loader.dataset, k_graph)
+
+    # same true values row by row = same graphs in the same order; otherwise the comparison is meaningless.
+    # The tolerance covers the float32 round trip (normalize -> de-normalize) of the GNN's y_mm
+    if not np.allclose(dev_predictions["y_mm"], baseline_df["y_mm"], atol=1e-2):
+        raise ValueError("The y_mm columns of the GNN and the baselines differ: different dev graphs or order.")
+
+    # GNN and baseline predictions side by side, one row per dev query (strict: both tables must have the same height)
+    dev_predictions = pl.concat([dev_predictions, baseline_df.select(["idw_1", "idw_2", "o_kriging", "reg_kriging", "neighbour_mean"])],
+                                how="horizontal", strict=True)
+
+    # the compared methods: display name -> (prediction column, sigma column or None). The GNN comes first, so the
+    # report tables take their columns (incl. inside_90) from its row (s01.table_to_md uses the keys of the first row)
+    result_recipe = {"GNN": ("mu_mm", "sigma_mm"),
+                     "IDW1": ("idw_1", None),
+                     "IDW2": ("idw_2", None),
+                     "Neighbour Mean": ("neighbour_mean", None),
+                     "Ordinary Kriging": ("o_kriging", None),
+                     "Regression Kriging": ("reg_kriging", None)}
+
+    # overall: one row per method
+    baselines_overall = [{"method": name, **per_group_metrics(dev_predictions, pred_col, None, sigma_col)[0]}
+                         for name, (pred_col, sigma_col) in result_recipe.items()]
+
+    # per region: first one row per method and region (long), then one row per region with one column per method (wide)
+    per_region_long = pl.DataFrame([{"method": name, **row}
+                                    for name, (pred_col, sigma_col) in result_recipe.items()
+                                    for row in per_group_metrics(dev_predictions, pred_col, "region", sigma_col)])
+    
+    rmse_per_region = per_region_long.pivot(on="method", index="region", values="rmse").to_dicts()
+    mae_per_region = per_region_long.pivot(on="method", index="region", values="mae").to_dicts()
 
     return {"train": train_metrics, "dev": dev_metrics,
-        "dev_per_region": per_group("region"), "dev_per_orbit": per_group("orbit")}
+            "dev_per_region": per_group_metrics(dev_predictions, "mu_mm", "region", "sigma_mm"),
+            "dev_per_orbit": per_group_metrics(dev_predictions, "mu_mm", "orbit", "sigma_mm"),
+            "baselines_overall": baselines_overall,
+            "baselines_rmse_per_region": rmse_per_region,
+            "baselines_mae_per_region": mae_per_region}
+
 
 
 ##############################################################################
@@ -975,8 +1181,9 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
     history, best_epoch = train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, patience, grad_clip,
                                       device, checkpoint_path, params)
 
-    # Reload the best checkpoint and evaluate it on train and dev (overall, per dev region and orbit)
-    metrics = evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device)
+    # Reload the best checkpoint and evaluate it on train and dev (overall, per dev region and orbit), and compare it
+    # with the baselines on the same dev graphs
+    metrics = evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_graph)
 
     return {"n_train_pools": len(train_ds), "n_dev_pools": len(dev_ds), "history": history,
             "best_epoch": best_epoch, "checkpoint_path": checkpoint_path, "metrics": metrics,

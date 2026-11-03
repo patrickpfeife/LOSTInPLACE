@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=01:00:00
 #SBATCH --account=hpda-c
 #SBATCH --qos=normal
 
@@ -44,7 +44,7 @@ ARGS=(
     --grad-clip=5.0       # maximum gradient norm
     --seed=42             # seed of the pool sample, the draws and the weight initialisation
     --num-workers=14      # DataLoader worker processes (keep below --cpus-per-task, keep it fixed within a grid)
-    # --use-gse           # uncomment to use the 64 GSE columns as node features
+    --use-gse             # uncomment to use the 64 GSE columns as node features
 )
 
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
