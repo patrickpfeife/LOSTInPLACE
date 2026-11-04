@@ -17,6 +17,7 @@ import torch.nn as nn
 import matplotlib
 matplotlib.use("Agg")      # no display on the compute nodes, figures are only saved
 import matplotlib.pyplot as plt
+import gstools as gs
 
 import s01_download_data as s01
 import s02_preprocessing as s02
@@ -29,6 +30,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import to_undirected
+from collections import defaultdict
 
 ################################################
 # 1.1) Constants
@@ -36,6 +38,11 @@ from torch_geometric.utils import to_undirected
 
 # geodesic distances and bearings on the WGS84 ellipsoid (project.md §4.2)
 GEOD = Geod(ellps="WGS84")
+# For the automatic variogram estimation
+VARIO_PERCENTILE = 95
+VARIO_LAG_FACTOR = 1.5
+VARIO_FIRST_EDGE_M = 5
+VARIO_N_BINS = 20
 
 ##############################################################################
 #============================================================================#
@@ -124,7 +131,7 @@ def load_pools(sampled_index, use_gse, min_graph_size):
     pools = []
 
     # grouped by graph_file so every file is opened once
-    for (graph_file,), rows in sampled_index.group_by("graph_file"):
+    for (graph_file,), rows in sampled_index.group_by("graph_file", maintain_order=True):
         # read the cols of a file
         df = pl.read_parquet(graph_file, columns=cols)
         # keep only the rows of the pools of this file that were sampled
@@ -816,11 +823,77 @@ def neighbour_mean(pool, idx, q, k_graph):
     return float(vel[nearest].mean())
 
 
+def compute_variograms(dev_ds):
+    # computes the variograms for every region and orbit and returns them in a dictionary 
 
-def o_kriging():
-    pass
+    collected = defaultdict(lambda: {"lat":[], "lon": [], "vel": [], "dist": []})
 
-def reg_kriging():
+    for i in range(len(dev_ds)):
+        # extract necessary information from the graph
+        pool, idx, q = dev_ds.draw_subset_method(i)
+        dist, _ = pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
+
+        # the aggregation per region
+        query_pos = idx[q] 
+        keep_mask = np.ones(len(pool["vel"]),dtype=bool)
+        keep_mask[query_pos] = False
+        key = (pool["region"], pool["orbit"])
+
+        # the variogram max distance
+        dist_to_q = np.delete(dist[q], q)      # dist[q] is the row for the distances from the query to all others and the distance to itself is deleted
+
+        # the key (region and orbit) does not yet exists in the dict yet.
+        # It is created when it is called and does not exist yet.
+        # If it already exists, the lat, lon and vel arrays are appended to the lists in the dict. 
+        for x in ["lat", "lon", "vel"]:
+            collected[key][x].append(pool[x][keep_mask])
+        collected[key][x].append(dist_to_q)
+    
+    # iterate over .items() yields a key,value pair per group. The key is the region, orbit pair
+    # the value for every key is another dict containing lat,lon and vel as keys and the actual values in lists with one array per pool
+    for (region, orbit), data in collected.items():
+        for x in ["lat", "lon", "vel", "dist"]:
+            data[x] = np.concatenate(data[x])
+
+        # Now per region and orbit a variogram can be fit 
+        # get total number of points available
+        n = len(data["vel"])
+
+        # compute the variogram bins for the region/orbit
+        max_dist_to_q = np.percentile(data["dist"], VARIO_PERCENTILE) * VARIO_LAG_FACTOR
+        bins = np.concatenate([[0.0], np.geomspace(VARIO_FIRST_EDGE_M, max_dist_to_q, VARIO_N_BINS)])
+
+        # estimate the variogram
+        bin_center, gamma, counts = gs.vario_estimate(pos=(data["lat"], data["lon"]), field=data["vel"], bin_edges=bins, latlon=True
+                                  geo_scale=gs.KM_SCALE * 1000, estimator="cressie", return_counts=True, sampling_size=min(n, 5000),
+                                  sampling_seed=0)
+        
+        # gstools squares the gammas internally, hence the root
+        weights = np.sqrt(counts) / gamma
+
+        fits = []
+        for model in [gs.Exponential, gs.Spherical, gs.Gaussian]:
+            x = model(dim=2, latlon=True, geo_scale=gs.KM_SCALE * 1000)
+            _, _, r2 = x.fit_variogram(bin_center, gamma, nugget=True, weights=weights, max_eval=100000, return_r2=True)
+            fits.append((r2, x))
+
+        best_model_and_r2 = max(fits, key=lambda t: t[0])
+
+
+
+
+
+    return collected
+
+def o_kriging(pool, idx, q, k_graph, variograms):
+
+    # finds which region and orbit the pool is from from the pool dictionary.
+    # takes the right variogram from the variograms dict.
+    # applies it to the points and returns the value and the variance. 
+    
+
+
+
     pass
 
 
@@ -841,6 +914,9 @@ def evaluate_baselines(dev_ds, k_graph):
     # list to capture the comparisons
     results = []
 
+    # Compute the variogram models for all regions and orbits
+    variograms = compute_variograms(dev_ds)
+
     # len applied to dev_ds calls the method __len__ of that object; we iterate over every graph of the dev set in pool
     # order 0 ... n-1, the order in which the dev loader (shuffle=False) gives them to the GNN. The raw values of the
     # draw are used here, not the Data object (that only holds normalized features and no coordinates)
@@ -849,7 +925,7 @@ def evaluate_baselines(dev_ds, k_graph):
         # one row per graph: the true value of the query and the prediction of every baseline
         results_per_graph = {"region": pool["region"], "orbit": pool["orbit"],
                              "y_mm": pool["vel"][idx][q], "neighbour_mean": neighbour_mean(pool, idx, q, k_graph),
-                             "o_kriging": o_kriging(), "reg_kriging": reg_kriging(),
+                             "o_kriging": o_kriging(pool, idx, q, k_graph, variograms),
                              "idw_1": idw(pool, idx, q, 1), "idw_2": idw(pool, idx, q, 2)}
 
         results.append(results_per_graph)
@@ -1081,7 +1157,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
         raise ValueError("The y_mm columns of the GNN and the baselines differ: different dev graphs or order.")
 
     # GNN and baseline predictions side by side, one row per dev query (strict: both tables must have the same height)
-    dev_predictions = pl.concat([dev_predictions, baseline_df.select(["idw_1", "idw_2", "o_kriging", "reg_kriging", "neighbour_mean"])],
+    dev_predictions = pl.concat([dev_predictions, baseline_df.select(["idw_1", "idw_2", "o_kriging", "neighbour_mean"])],
                                 how="horizontal", strict=True)
 
     # the compared methods: display name -> (prediction column, sigma column or None). The GNN comes first, so the
@@ -1090,8 +1166,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
                      "IDW1": ("idw_1", None),
                      "IDW2": ("idw_2", None),
                      "Neighbour Mean": ("neighbour_mean", None),
-                     "Ordinary Kriging": ("o_kriging", None),
-                     "Regression Kriging": ("reg_kriging", None)}
+                     "Ordinary Kriging": ("o_kriging", None)}
 
     # overall: one row per method
     baselines_overall = [{"method": name, **per_group_metrics(dev_predictions, pred_col, None, sigma_col)[0]}
@@ -1111,8 +1186,6 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
             "baselines_overall": baselines_overall,
             "baselines_rmse_per_region": rmse_per_region,
             "baselines_mae_per_region": mae_per_region}
-
-
 
 ##############################################################################
 #============================================================================#
