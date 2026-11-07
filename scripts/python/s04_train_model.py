@@ -38,11 +38,18 @@ from collections import defaultdict
 
 # geodesic distances and bearings on the WGS84 ellipsoid (project.md §4.2)
 GEOD = Geod(ellps="WGS84")
-# For the automatic variogram estimation
+# automatic variogram fit of the ordinary kriging baseline (compute_variograms, project.md §7.5): the largest lag is
+# the VARIO_PERCENTILE of the query -> visible point distances of a dev region x orbit times VARIO_LAG_FACTOR, the bin
+# edges are 0 plus VARIO_N_BINS geometrically spaced edges from VARIO_FIRST_EDGE_M (fine bins at short lags), and bins
+# with fewer than VARIO_MIN_PAIRS point pairs are dropped. The fit uses at most VARIO_SAMPLING_SIZE random points of
+# the group (the number of pairs grows with n^2), the fitted range is bounded by VARIO_LEN_FACTOR x the largest lag
 VARIO_PERCENTILE = 95
 VARIO_LAG_FACTOR = 1.5
-VARIO_FIRST_EDGE_M = 5
-VARIO_N_BINS = 20
+VARIO_FIRST_EDGE_M = 10
+VARIO_N_BINS = 50
+VARIO_MIN_PAIRS = 30
+VARIO_SAMPLING_SIZE = 5000
+VARIO_LEN_FACTOR = 1.5
 
 ##############################################################################
 #============================================================================#
@@ -824,7 +831,20 @@ def neighbour_mean(pool, idx, q, k_graph):
 
 
 def compute_variograms(dev_ds):
-    # computes the variograms for every region and orbit and returns them in a dictionary 
+    """
+    Fits one variogram per dev region x orbit for the ordinary kriging baseline (project.md §7.5). The points are all
+    points of the group's dev pools minus the dev queries (fixed draws), so the query values never enter the fit.
+    Empirical semivariance per bin with the robust Cressie-Hawkins estimator (Cressie & Hawkins 1980), weighted least
+    squares fit with the Cressie (1985) weights N(h)/gamma(h)^2 of an Exponential, Spherical and Gaussian model with
+    nugget, the best by r2 is kept. Distances (bins, len_scale) are in metres.
+
+    Arguments:
+        dev_ds -- PoolDataset, the dev dataset (fixed_draws=True)
+
+    Returns:
+        variograms -- dict, (region, orbit) -> fitted gstools model (see o_kriging)
+        vario_log -- list of dicts, one per group: points, kept bins, largest lag and the fitted parameters (report)
+    """
 
     collected = defaultdict(lambda: {"lat":[], "lon": [], "vel": [], "dist": []})
 
@@ -833,68 +853,107 @@ def compute_variograms(dev_ds):
         pool, idx, q = dev_ds.draw_subset_method(i)
         dist, _ = pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
 
-        # the aggregation per region
+        # mask over the whole pool (not only the subset): everything except the query enters the variogram.
+        # q is the position within idx, so the query's position in the pool is idx[q]
         query_pos = idx[q] 
         keep_mask = np.ones(len(pool["vel"]),dtype=bool)
         keep_mask[query_pos] = False
         key = (pool["region"], pool["orbit"])
 
-        # the variogram max distance
-        dist_to_q = np.delete(dist[q], q)      # dist[q] is the row for the distances from the query to all others and the distance to itself is deleted
+        # distances from the query to the visible points (row q, without the 0 to itself): the distances the kriging
+        # actually has to bridge, they set the largest lag of the group's variogram
+        dist_to_q = np.delete(dist[q], q)
 
-        # the key (region and orbit) does not yet exists in the dict yet.
-        # It is created when it is called and does not exist yet.
-        # If it already exists, the lat, lon and vel arrays are appended to the lists in the dict. 
+        # the defaultdict creates the empty lists the first time a key is accessed; every pool adds one array per list
         for x in ["lat", "lon", "vel"]:
             collected[key][x].append(pool[x][keep_mask])
-        collected[key][x].append(dist_to_q)
-    
-    # iterate over .items() yields a key,value pair per group. The key is the region, orbit pair
-    # the value for every key is another dict containing lat,lon and vel as keys and the actual values in lists with one array per pool
+        collected[key]["dist"].append(dist_to_q)
+
+    variograms = {}
+    vario_log = []
+
+    # one fit per group: key = (region, orbit), value = dict of lat, lon, vel, dist (lists with one array per pool)
     for (region, orbit), data in collected.items():
+        # one flat array per variable
         for x in ["lat", "lon", "vel", "dist"]:
             data[x] = np.concatenate(data[x])
 
-        # Now per region and orbit a variogram can be fit 
-        # get total number of points available
         n = len(data["vel"])
 
-        # compute the variogram bins for the region/orbit
+        # bins up to the largest lag the kriging needs in this group, fine near 0 and coarse further out
         max_dist_to_q = np.percentile(data["dist"], VARIO_PERCENTILE) * VARIO_LAG_FACTOR
         bins = np.concatenate([[0.0], np.geomspace(VARIO_FIRST_EDGE_M, max_dist_to_q, VARIO_N_BINS)])
 
-        # estimate the variogram
-        bin_center, gamma, counts = gs.vario_estimate(pos=(data["lat"], data["lon"]), field=data["vel"], bin_edges=bins, latlon=True
-                                  geo_scale=gs.KM_SCALE * 1000, estimator="cressie", return_counts=True, sampling_size=min(n, 5000),
+        # empirical semivariance per bin (Cressie-Hawkins estimator), from at most VARIO_SAMPLING_SIZE random points
+        # (pairs grow with n^2); geo_scale in metres, so the bins are in metres
+        bin_center, gamma, counts = gs.vario_estimate(pos=(data["lat"], data["lon"]), field=data["vel"], bin_edges=bins, latlon=True,
+                                  geo_scale=gs.KM_SCALE * 1000, estimator="cressie", return_counts=True, sampling_size=min(n, VARIO_SAMPLING_SIZE),
                                   sampling_seed=0)
-        
-        # gstools squares the gammas internally, hence the root
+
+        # drop bins with too few pairs (noisy) and empty bins (gamma = 0 would divide by zero in the weights)
+        valid = (counts >= VARIO_MIN_PAIRS) & (gamma > 0)
+        bin_center, gamma, counts = bin_center[valid], gamma[valid], counts[valid]
+
+        # Cressie (1985) weights N(h)/gamma(h)^2, with the empirical gamma. gstools squares the weights internally
+        # (sigma = 1/weights in scipy's curve_fit), hence the root
         weights = np.sqrt(counts) / gamma
 
+        # fit every candidate model with nugget and keep (r2, model); r2 is computed on the bins
         fits = []
         for model in [gs.Exponential, gs.Spherical, gs.Gaussian]:
             x = model(dim=2, latlon=True, geo_scale=gs.KM_SCALE * 1000)
+            # upper bound of the range, otherwise variograms that keep rising (trend) end at absurd ranges
+            x.len_scale_bounds = [0, VARIO_LEN_FACTOR * max_dist_to_q]
             _, _, r2 = x.fit_variogram(bin_center, gamma, nugget=True, weights=weights, max_eval=100000, return_r2=True)
             fits.append((r2, x))
 
-        best_model_and_r2 = max(fits, key=lambda t: t[0])
+        # the best model by r2 is used for the kriging, its parameters go to the report
+        best_r2, best_model = max(fits, key=lambda t: t[0])
+
+        variograms[(region, orbit)] = best_model
+        vario_log.append({"region": region, "orbit": orbit, "n": n, "n_bins_kept": len(gamma),
+                          "max_dist_to_q": max_dist_to_q, "model name": type(best_model).__name__,
+                          "best model nugget": best_model.nugget, "best model var": best_model.var,
+                          "best model len_scale": best_model.len_scale, "best R2": best_r2})
+
+    return variograms, vario_log
 
 
+def o_kriging(pool, idx, q, variograms):
+    """
+    Predicts the query's velocity by ordinary kriging from all visible points of the same dev graph (baseline), with
+    the fitted variogram of the pool's region x orbit. exact=False treats the nugget as measurement noise, so the
+    kriging variance includes it and sigma is comparable to the GNN's.
 
+    Arguments:
+        pool -- dict, the pool (see load_pools)
+        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
+        q -- int, position of the query within idx
+        variograms -- dict, (region, orbit) -> fitted gstools model (see compute_variograms)
 
+    Returns:
+        mu -- float, the predicted velocity (mm/yr)
+        sigma -- float, the kriging standard deviation (mm/yr)
+    """
 
-    return collected
+    # the variogram of the pool's region and orbit
+    model = variograms[(pool["region"], pool["orbit"])]
 
-def o_kriging(pool, idx, q, k_graph, variograms):
+    # the visible points: the subset without the query
+    lat = np.delete(pool["lat"][idx], q)
+    lon = np.delete(pool["lon"][idx], q)
+    vel = np.delete(pool["vel"][idx], q)
 
-    # finds which region and orbit the pool is from from the pool dictionary.
-    # takes the right variogram from the variograms dict.
-    # applies it to the points and returns the value and the variance. 
-    
+    # the query's position
+    lat_q, lon_q = pool["lat"][idx][q], pool["lon"][idx][q]
 
+    # kriging system of the visible points; positions as (lat, lon) because the model has latlon=True
+    krig = gs.krige.Ordinary(model, cond_pos=(lat, lon), cond_val=vel, exact=False)
+    # mean and variance at the query (positions as arrays, also for a single point; store=False keeps no field)
+    mu, var = krig((np.array([lat_q]), np.array([lon_q])), return_var=True, store=False)
 
-
-    pass
+    # the variance can be slightly negative from rounding, hence the max
+    return float(mu[0]), float(np.sqrt(max(var[0], 0.0)))
 
 
 def evaluate_baselines(dev_ds, k_graph):
@@ -908,29 +967,33 @@ def evaluate_baselines(dev_ds, k_graph):
 
     Returns:
         baselines -- polars.DataFrame, one row per dev graph in pool order (= the order of the unshuffled dev loader):
-            region, orbit, y_mm and one column per baseline (mm/yr)
+            region, orbit, y_mm and one column per baseline (mm/yr): neighbour_mean, idw_1, idw_2, ok_mu and the
+            kriging standard deviation ok_sigma
+        vario_log -- list of dicts, the fitted variograms per region x orbit (see compute_variograms)
     """
 
     # list to capture the comparisons
     results = []
 
-    # Compute the variogram models for all regions and orbits
-    variograms = compute_variograms(dev_ds)
+    # one variogram per dev region x orbit, fitted once before the loop (never per query)
+    variograms, vario_log = compute_variograms(dev_ds)
 
     # len applied to dev_ds calls the method __len__ of that object; we iterate over every graph of the dev set in pool
     # order 0 ... n-1, the order in which the dev loader (shuffle=False) gives them to the GNN. The raw values of the
     # draw are used here, not the Data object (that only holds normalized features and no coordinates)
     for i in range(len(dev_ds)):
         pool, idx, q = dev_ds.draw_subset_method(i)
+        # kriging gives a mean and a standard deviation
+        ok_mu, ok_sigma = o_kriging(pool, idx, q, variograms)
         # one row per graph: the true value of the query and the prediction of every baseline
         results_per_graph = {"region": pool["region"], "orbit": pool["orbit"],
                              "y_mm": pool["vel"][idx][q], "neighbour_mean": neighbour_mean(pool, idx, q, k_graph),
-                             "o_kriging": o_kriging(pool, idx, q, k_graph, variograms),
+                             "ok_mu": ok_mu, "ok_sigma": ok_sigma,
                              "idw_1": idw(pool, idx, q, 1), "idw_2": idw(pool, idx, q, 2)}
 
         results.append(results_per_graph)
     # a dataframe built from the list of dicts, one row per graph
-    return pl.DataFrame(results)
+    return pl.DataFrame(results), vario_log
 
 
 def per_group_metrics(dev_predictions, pred_col, group_col=None, sigma_col=None):
@@ -976,7 +1039,8 @@ def per_group_metrics(dev_predictions, pred_col, group_col=None, sigma_col=None)
 def training_summary_md(results):
     """
     Builds the s04 part of the markdown log: data, training (epochs, best epoch, checkpoint), train vs dev metrics,
-    the dev metrics per region and orbit and the comparison with the baselines on dev, plus the loss curves as figure.
+    the dev metrics per region and orbit, the comparison with the baselines on dev and the fitted kriging variograms,
+    plus the loss curves as figure.
 
     Arguments:
         results -- dict, returned by main
@@ -1011,12 +1075,23 @@ def training_summary_md(results):
         "## Baselines on dev",
         "All methods on the same dev graphs (same visible points and query). IDW1/IDW2 = inverse distance weighting "
         "with power 1/2 over all visible points (distances below 1 m clipped), Neighbour Mean = mean of the k_graph "
-        "nearest visible points. RMSE and MAE in mm/yr; inside_90 only for methods with an uncertainty.",
+        "nearest visible points, Ordinary Kriging = ordinary kriging of all visible points with the variogram of the "
+        "query's region x orbit (see below). RMSE and MAE in mm/yr; inside_90 only for the methods with an uncertainty "
+        "(GNN and Ordinary Kriging, mu ± 1.645 sigma).",
         s01.table_to_md([rounded(r) for r in metrics["baselines_overall"]]),
         "### RMSE per region",
         s01.table_to_md([rounded(r) for r in metrics["baselines_rmse_per_region"]]),
         "### MAE per region",
         s01.table_to_md([rounded(r) for r in metrics["baselines_mae_per_region"]]),
+        # the fitted variograms, so every kriging result can be traced back to its model
+        "### Variograms of the ordinary kriging, per dev region × orbit",
+        f"Fitted once per region × orbit on all dev pool points minus the dev queries (at most {VARIO_SAMPLING_SIZE} sampled points). "
+        f"Empirical semivariance with the Cressie-Hawkins estimator in {VARIO_N_BINS} bins from 0 to the largest lag "
+        f"max_dist_to_q (the {VARIO_PERCENTILE}th percentile of the query distances × {VARIO_LAG_FACTOR}, geometric "
+        f"spacing from {VARIO_FIRST_EDGE_M} m), bins with fewer than {VARIO_MIN_PAIRS} pairs dropped; weighted least "
+        f"squares fit with the Cressie (1985) weights, best of Exponential, Spherical and Gaussian (with nugget, range at most {VARIO_LEN_FACTOR} × max_dist_to_q) by r². "
+        f"Nugget and var (partial sill) in mm²/yr², len_scale and max_dist_to_q in m.",
+        s01.table_to_md([rounded(r) for r in metrics["Kriging log"]]),
     ])
 
     # train and dev loss per epoch, best epoch marked
@@ -1138,6 +1213,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
             dev_per_region, dev_per_orbit -- lists of dicts, the GNN's n, rmse, mae, inside_90 per group
             baselines_overall -- list of dicts, one per method: method, n, rmse, mae (inside_90 with a sigma)
             baselines_rmse_per_region, baselines_mae_per_region -- lists of dicts, one per region, one column per method
+            Kriging log -- list of dicts, the fitted variograms per dev region x orbit (see compute_variograms)
     """
 
     # loads the best checkpoint not the last one
@@ -1149,7 +1225,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
     dev_metrics, dev_predictions = evaluate(model, dev_loader, device)
 
     # the baselines on all dev graphs, from the raw values of the same draws (once per run, not per epoch)
-    baseline_df = evaluate_baselines(dev_loader.dataset, k_graph)
+    baseline_df, vario_log = evaluate_baselines(dev_loader.dataset, k_graph)
 
     # same true values row by row = same graphs in the same order; otherwise the comparison is meaningless.
     # The tolerance covers the float32 round trip (normalize -> de-normalize) of the GNN's y_mm
@@ -1157,7 +1233,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
         raise ValueError("The y_mm columns of the GNN and the baselines differ: different dev graphs or order.")
 
     # GNN and baseline predictions side by side, one row per dev query (strict: both tables must have the same height)
-    dev_predictions = pl.concat([dev_predictions, baseline_df.select(["idw_1", "idw_2", "o_kriging", "neighbour_mean"])],
+    dev_predictions = pl.concat([dev_predictions, baseline_df.select(["idw_1", "idw_2", "ok_mu", "ok_sigma", "neighbour_mean"])],
                                 how="horizontal", strict=True)
 
     # the compared methods: display name -> (prediction column, sigma column or None). The GNN comes first, so the
@@ -1166,7 +1242,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
                      "IDW1": ("idw_1", None),
                      "IDW2": ("idw_2", None),
                      "Neighbour Mean": ("neighbour_mean", None),
-                     "Ordinary Kriging": ("o_kriging", None)}
+                     "Ordinary Kriging": ("ok_mu", "ok_sigma")}
 
     # overall: one row per method
     baselines_overall = [{"method": name, **per_group_metrics(dev_predictions, pred_col, None, sigma_col)[0]}
@@ -1185,7 +1261,8 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
             "dev_per_orbit": per_group_metrics(dev_predictions, "mu_mm", "orbit", "sigma_mm"),
             "baselines_overall": baselines_overall,
             "baselines_rmse_per_region": rmse_per_region,
-            "baselines_mae_per_region": mae_per_region}
+            "baselines_mae_per_region": mae_per_region,
+            "Kriging log": vario_log}
 
 ##############################################################################
 #============================================================================#
