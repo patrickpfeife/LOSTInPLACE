@@ -18,6 +18,8 @@
 10. [Known Issues & Caveats](#10-known-issues--caveats)
 11. [Thesis Positioning & Novelty](#11-thesis-positioning--novelty)
 12. [Coding Conventions](#12-coding-conventions)
+13. [Run Log Template](#13-run-log-template)
+14. [Next Steps](#14-next-steps)
 
 ---
 
@@ -1124,6 +1126,27 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 **Status: observation, to analyse in depth later (noted 2026-11-07).** In the variogram check (`test/variogram_check.py`, dev, 32,532 queries; outputs in `test/figs/variogram_check/`) ordinary kriging with the automatically fitted variograms reached RMSE 5.84 / MAE 2.54 mm/yr, but its ±1.645σ interval covered only 79 % of the queries (0.68–0.88 per region × orbit, below 0.90 in every group). The standardised errors z = (μ − y)/σ have median |z| = 0.67, almost exactly the Gaussian value 0.674, but the 90 % and 99 % quantiles of |z| are 2.88 and 9.99 (Gaussian: 1.645 and 2.58). So the kriging σ fits typical queries, and the errors are **heavy-tailed**: a Gaussian ±1.645σ interval cannot cover them, whatever the variogram. The worst coverage is in the hotspot groups with point-level heterogeneity (dev_5, dev_8: 0.68–0.75). Why it matters: (1) it is a thesis finding in its own right about the error distribution of InSAR interpolation; (2) it argues for the conformal calibration step (s06), which does not assume Gaussian errors; (3) it makes the GNN's inside_90 of 0.905 (GSE run) more notable, since the GNN's learned σ seems to adapt to these tails. To check later: the z-distribution of the GNN on the same queries (median |z| and tails, not only inside_90); whether a Student-t / Laplace likelihood instead of the Gaussian NLL would fit better (§6.1); whether the tails come from a few regions or from all; and how the coverage looks after conformal calibration.
 
+### 10.22 PLANNED — distance-distribution sampling of the candidate pools (s03)
+
+**Status: method decided, implementation next (noted 2026-11-07).** Motivation: the current pools (25 nearest free points within 2 km, balanced over 8 sectors, `find_pool_points`) put the query's nearest neighbour only ~14 m away (median), so the task is too easy and does not match the much sparser configurations expected in real InSAR scenarios. Related: §10.11 (sparsity augmentation), §10.18 (informative points).
+
+**Method.** The user sets four parameters at runtime: μ1, σ1, μ2, σ2. They define two normal distributions, dist1 = N(μ1, σ1) and dist2 = N(μ2, σ2). While looping over the sectors around the seed, per iteration: draw μ3 from dist1 and σ3 from dist2, draw a target distance d from N(μ3, σ3) (e.g. 150 m), and pick a free point of that sector at about d from the seed. As in the current version the loop continues over the sectors until k_nearest points are picked or no free points are left (not one draw per sector). The hyperparameters of the drawn distributions are drawn anew per sector on purpose: heterogeneous, anisotropic graphs challenge the model more.
+
+**Decisions (2026-11-07):**
+- **Negative draws** (σ3 or d below 0) are simply clipped. With e.g. μ = 150 m, σ = 60 m they are rare; no lognormal or truncated distribution needed.
+- **Picking the point (option, recorded):** instead of searching a ring d ± x in the sector (often empty in sparse areas), take the free point of the sector whose distance to the seed is closest to d; x then only acts as a tolerance, beyond which the sector counts as empty in that round.
+- **Distance cap:** the 2 km `max_dist` (and the 2 km edge margin `in_center`) is about the upper bound anyway, fine for now.
+- **Competition between seeds:** not expected to matter. The graphs' areas will overlap, but plenty of points stay unused, so seeds do not really compete for points.
+- **All sets** (train, dev, cal) are built with this method. EGMS is not representative of real InSAR scenarios and its dense clouds are not treated as absolute ground truth; real cases are expected to be much sparser, which this sampling fits better. The real test is InSAR data from outside Europe, if it can be obtained.
+
+**Open:**
+- **Query = seed? (to decide).** s03 builds the distance distribution around the seed, but s04 currently draws the query at random from the subset. A random pool point as query sees a different geometry than the one the distributions describe. For the method to work as intended, s04 has to use the seed as the query on these pools (the seed's position would need to be kept, e.g. the `seed` column in `load_pools`). Also decide whether s04's subset draw (0.6–0.9) stays on top, which would thin the pools a second time.
+- **Limitations of the scheme:** it cannot model every real configuration, e.g. a street between fields: many close points along the road in two sectors, the next points in the other directions only beyond the fields. More realistic spatial patterns to be discussed later.
+- **Knock-on effects to keep in mind:** with larger distances the log-distance edge feature (§10.20) becomes relevant; the edge normalization stats are re-estimated from the train draws anyway (`estimate_edge_stats`), the variogram bins of the kriging baseline adapt automatically (`compute_variograms`, max lag from the query distances).
+
+**Idea for later:** analyse the natural sparsity patterns of real (non-EGMS or sparse EGMS) point clouds and either sparsify real configurations accordingly or use the analysis to set or replace the distance distributions, so the augmented graphs resemble real gaps.
+
+
 ---
 
 ## 11. Thesis Positioning & Novelty
@@ -1251,6 +1274,88 @@ List or dict columns go into the `_complex.json`. A new list column must be adde
 - Flags are int8 0/1.
 
 **GNSS:** the velocity keys are `ve`, `vn`, `vu` (mm/yr, east/north/up).
+
+---
+
+## 13. Run Log Template
+
+**Added 2026-11-08.** The user keeps one Obsidian note with the results of every training and test run, the conclusions, and what to try next and why. Every run gets one entry in this format: as short as possible, numbers instead of prose. When a run finishes, fill in an entry and hand it over ready to copy. Fields marked † are left out when they do not apply. The table always lists the GNN and all baselines on dev (`–` = not available for that method or run).
+
+```markdown
+## DD.MM.YYYY · <short name of the run>
+**Question:** what should this run show? (1 sentence)
+**Changed vs. reference:** only what differs from the reference run (method, data, parameters)
+**Setup:** pools <method> · <n> train pools · GSE on/off · k=<k> · subset <min–max> · <hparams if not default>
+**Job / report:** <SLURM id> · `<report file name>.md`
+
+| dev | RMSE | MAE | inside_90 | NLL |
+|---|---|---|---|---|
+| GNN | | | | |
+| IDW1 | | | – | – |
+| IDW2 | | | – | – |
+| Neighbour Mean | | | – | – |
+| Ordinary Kriging | | | | – |
+| GNN reference run † | | | | |
+
+**Observations:** (max. 3 bullets, numbers, not interpretations)
+- 
+**Conclusion:** what does this mean for the question? (1–2 sentences)
+**Problems / bugs:** † 
+**Next:** what to try next and why (1–2 bullets)
+```
+
+---
+
+## 14. Next Steps
+
+**Decided 2026-11-09**, after the distance-pools prototype (§10.22), the GNN error diagnosis and the MSE warmup test. Background of the decisions: the GNN underfits (worse than IDW1 even on its own train data: RMSE 5.31 vs 4.82, `test/gnn_error_diagnosis.py`); the Gaussian NLL down-weights the hard (deforming) queries by 1/σ²; the k = 3 kNN graphs are often disconnected; the random query often sits at the graph edge; most queries are stable and easy, the hard ones are equally bad for all methods (dev: graphs with range > 20 mm/yr = 27 % of the queries but 82 % of the squared error); artefact-like outliers (Iceland_North, Norway, dev_5/dev_8 in arctic Scandinavia) dominate RMSE, the loss spikes and the dev NLL. The MSE warmup test (5 MSE epochs, then NLL; report `test/figs/mse_warmup/s04_mse_warmup_20261109_151650.md`) changes nothing for now: final dev RMSE 6.17 vs 6.21 without warmup; during the MSE phase dev RMSE reached 6.03–6.11 and rose again after the switch to the NLL. The warmup and the other loss variants are tried again later on the new dataset (step 7).
+
+### 14.1 Steps (in order)
+
+**1. Regions (s01).** Collect more handpicked deformation regions for train, dev, cal and val, including small deformation areas, so the data contains more real displacement. Reduce the random (background) regions substantially, so the meaningless background does not dominate. Review Iceland_North and Norway (artefact-prone) and swap them out if needed. Update the region file and rerun s01.
+
+**2. Preprocessing (s02).** Rerun s02: the normalization stats come from the train regions, new regions mean new stats.
+
+**3. New training dataset (s03).** Move the distance-distribution pools of the prototype (`test/distance_pools_prototype.py`, §10.22) into the real s03, with μ1, σ1, μ2, σ2 and the tolerance as arguments. Generate the dataset with GSE. Generate several variants with different distance distributions, to test whether the added value of the GNN over IDW/OK grows with distance.
+
+**4. Check the dataset before training.** Compare the distributions of train, dev, cal and val (velocity, share of stable queries, pool range, distances, region types), so the model is never evaluated on out-of-distribution data. Check the share of stable queries; reduce it if it is still too high (region selection, or a weighted sampler), so the model has something to learn.
+
+**5. Graph and query (s04).** Delaunay triangulation instead of the symmetric kNN with k = 3 (connected, sparse, adapts to the geometry), optionally plus direct edges from all points to the query. Restrict the query choice per epoch to central nodes via a centrality indicator, so nodes at the edge of the graph are never the query. GSE on by default from now on (one of the defining features of the project).
+
+**6. Evaluation (s04).** Report the errors separately for easy and hard queries (|v| ≤ 5 vs > 5 mm/yr and/or by the graph's velocity range). Fix the kriging bug: back to ~20 bins and drop the Gaussian model (or a lower bound on the nugget); the Gaussian model with nugget 0 makes the kriging system nearly singular (dev_5: RMSE 83), fewer bins alone are not a guaranteed fix.
+
+**6b. Baselines once per dataset, on CPU (decided 2026-11-10).** Today `evaluate_on_dev` computes the baselines (variogram fits, ordinary kriging per dev query, IDW, neighbour mean) inside every GPU training job: ~20 of ~26 minutes per run (runs of 2026-11-07 and 2026-11-09) on CPU while the reserved GPU sits idle, and in a grid search again in every array task. The baselines do not depend on the model, only on the dev pools and the draw settings (subset, query rule, k), so they are computed once per dataset in a separate CPU job and saved (e.g. a parquet next to the dev data, with the draw settings recorded); s04 only loads and joins them. This also makes the baselines identical across all runs on the same dataset. Prerequisite: join on a stable key per query, e.g. `(graph_file, seed_pid)`, instead of the row order, because the dev pool order is not reproducible across runs (`load_pools` groups without `maintain_order=True`); the y_mm check stays as a safeguard. Best done together with step 5, since the dev draws change there anyway (Delaunay graph, central query).
+
+**7. Model and loss experiments on the new dataset (all with GSE).**
+1. Reference run with the new graph and query design.
+2. **β-NLL** (β = 0.5, possibly 1): the main loss experiment.
+3. **More layers** (e.g. 2 vs 3 vs 4); with Delaunay the receptive field really grows with depth.
+4. Batch size as a hyperparameter. Note: a smaller batch does not reduce the dominance of stable queries (the batch loss is a mean, the expected share of stable queries per batch is independent of the batch size); it only gives noisier gradients and more updates per epoch. The weighting changes only through the data (share of stable queries), a weighted sampler or the loss (β-NLL).
+5. The distance-distribution variants of step 3.
+6. Secondary: pre-norm instead of post-norm LayerNorm (`h = h + conv(LN(h))` instead of `h = LN(h + conv(h))`, keeps the velocity amplitudes in the residual path); heavy-tailed likelihood (Student-t / Laplace); detach (μ with MSE, σ separately with NLL on a fixed μ); MSE warmup again.
+
+**Loss options at a glance**
+
+| Option | What it does | Priority |
+|---|---|---|
+| β-NLL | NLL × σ^(2β) (σ held constant in backprop); hard queries count more for μ (Seitzer et al. 2022, to verify) | high |
+| MSE warmup | first epochs MSE on μ, then NLL | later (tested once, no gain on the old data) |
+| Heavy-tailed likelihood (Student-t / Laplace) | outliers give moderate instead of explosive losses | secondary |
+| Detach | μ with MSE, σ separately with NLL; the heads don't compete | secondary |
+| σ floor (e.g. 0.5 mm/yr) | caps (y − μ)²/σ², fewer spikes (today's floor: logvar clamp −8 = 0.15 mm/yr) | later |
+| Weighted sampler | draws hard pools more often | later |
+| CRPS as loss | proper score, linear in the error | later |
+
+### 14.2 For later (keep in mind)
+- **Check the artefact hypothesis:** a sample of the 30–60 mm/yr single-point outliers on the map and in their time series (unwrapping errors: Sentinel-1 λ = 5.55 cm, one cycle = λ/2 ≈ 2.77 cm LOS; snow/vegetation/moisture; real local processes), then decide: filter, down-weight or robust likelihood. Relevant even after swapping Iceland and Norway, artefacts also occur elsewhere.
+- **Robust selection metric** for the early stopping (CRPS or trimmed/median NLL) instead of the mean dev NLL: the mean dev NLL is dominated by the worst 1 % of the queries (66 % of the positive NLL) and in the warmup test picked epoch 11 (RMSE 6.17) over epoch 4 (RMSE 6.03).
+- **Residual formulation** μ = IDW + Δ, so the model starts at baseline level.
+- **σ floor and weighted sampler** (see the table).
+- **R² and errors per distance bin** (query → nearest visible point) in the report, next to the easy/hard split.
+- **Several seeds per comparison** before conclusions from small differences; until measured, RMSE differences of ~0.1–0.2 mm/yr count as inconclusive.
+- **Log distance as edge feature** (§10.20), relevant with the larger distances.
+- **Heavy-tailed errors and conformal calibration** (§10.21, s06).
+- **Small leftovers:** `load_pools` groups without `maintain_order=True` (dev pool order not reproducible across runs; handled by the stable key in step 6b); `uv remove pykrige`; regional inside_90 in the report.
 
 ---
 
