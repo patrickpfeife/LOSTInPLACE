@@ -37,6 +37,11 @@ from shapely.ops import transform
 CLIP_BUFFER_M = 5000
 # Parameter logs of all steps, kept with the repo (gitignored) instead of the data tree
 PARAM_LOG_DIR = Path(__file__).parent / "../../assets/param_logs"
+# EGMS release that is downloaded (valid values: the API's /releases endpoint; 2019-2023 is no longer offered
+# since 2026-11). EGMS_PERIOD is the same period as decimal years [start, end), e.g. 2020-2024 -> (2020.0, 2025.0);
+# s02 fits the GNSS station velocities over exactly this window, so GNSS and EGMS describe the same years
+EGMS_RELEASE = "2020-2024"
+EGMS_PERIOD = (float(EGMS_RELEASE.split("-")[0]), float(EGMS_RELEASE.split("-")[1]) + 1.0)
 
 ##############################################################################
 #============================================================================#
@@ -504,11 +509,11 @@ def query_egms(row, headers, api_endpoint = "https://egms.land.copernicus.eu/ins
         links -- list of strings, one download link per hit in result["hits"]
     """
 
-    # the search query: all L2B products of the 2019-2023 release within the query's lon/lat bounds
+    # the search query: all L2B products of the EGMS_RELEASE within the query's lon/lat bounds
     query = {"id": None,
          "bbox": row["egms_query_bbox"],
          "levels" : ["L2B"],
-         "releases" : ["2019-2023"]
+         "releases" : [EGMS_RELEASE]
          }
 
     # send the query to the archive

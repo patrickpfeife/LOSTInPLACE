@@ -509,7 +509,8 @@ def preprocess_gnss(study_areas_gdf):
     # Filter the dataframe for the validation set because only there, gnss data is even available on disk
     val_mask = study_areas_gdf["set"] == 3
     coverage_frac_lim, max_gap_days_lim = 0.8, 120
-    t0, t1 = 2019.0, 2024.0
+    # same period as the downloaded EGMS release (s01.EGMS_RELEASE), so GNSS and EGMS velocities cover the same years
+    t0, t1 = s01.EGMS_PERIOD
 
     # Filter out the stations with insufficient temporal coverage or too large gaps
     result = study_areas_gdf.loc[val_mask].apply(find_quality_filtered_stations, axis=1, t0=t0, t1=t1,
