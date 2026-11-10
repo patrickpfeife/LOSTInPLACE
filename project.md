@@ -124,8 +124,8 @@ Stage 2: CLASSICAL GEOMETRIC DECOMPOSITION (closed-form)
 
 **Status: active working scope, not a permanent architecture change.** To get a first end-to-end pipeline running, several of the above mechanisms are deliberately narrowed. The fuller versions they defer are kept everywhere else in this document, not deleted — the prototype choices below are a strict subset of them, chosen so the later, fuller version reuses the same code rather than requiring a rewrite.
 
-- **Target: EGMS's own `mean_velocity` (mean LOS velocity over the full 2019–2023 window), not the full time series or §3.5's basis coefficients.** Decided 2026-10-20; this replaces the earlier single-year self-fit. It is already a column in the preprocessed csvs, so no velocity-fitting step exists anywhere in the pipeline, and it spans the same window as the GNSS validation trends (2019.0–2024.0), so the comparison is like for like.
-- **Covariate: AlphaEarth embedding; which year(s) is open (§10.16).** With a 5-year target, a single year's embedding no longer matches the target window by construction. Options: one representative year, or an embedding pooled over 2019–2023 (§5.3's `AnnualEncoder` idea becomes relevant again).
+- **Target: EGMS's own `mean_velocity` (mean LOS velocity over the full 2020–2024 window; release switched from 2019–2023 on 2026-11-10 because the EGMS API no longer offers it, set once as `s01.EGMS_RELEASE`), not the full time series or §3.5's basis coefficients.** Decided 2026-10-20; this replaces the earlier single-year self-fit. It is already a column in the preprocessed csvs, so no velocity-fitting step exists anywhere in the pipeline, and it spans the same window as the GNSS validation trends (2020.0–2025.0, `s01.EGMS_PERIOD`, used by s02), so the comparison is like for like.
+- **Covariate: AlphaEarth embedding; which year(s) is open (§10.16).** With a 5-year target, a single year's embedding no longer matches the target window by construction. Options: one representative year, or an embedding pooled over 2020–2024 (§5.3's `AnnualEncoder` idea becomes relevant again).
 - **Node features, simplified accordingly:** `[velocity (1), is_query (1), incidence_angle (1), encoded GSE static vector]` — no `p`-dimensional basis coefficients. Output head is scalar `(mu, logvar)` instead of `ℝ^p`. **No `dist_to_coherent` node feature (decided 2026-10-31).** How far the nearest evidence is enters only through the edge features (geodesic distance per edge) and the attention over them, so the model learns the importance of distance from the edges instead of from a single per-node summary. Without GSE this gives 3 node features, with the 64 GSE columns 67.
 - **Uncertainty propagation (§6.3/6.4), scalar version:** no basis-reconstruction step (`Φ @ coeffs`) needed, since there's no coefficient vector. The asc/desc decomposition (§6.4) applies the same `G⁻¹` once to `(mu_v, var_v)` per orbit, instead of looping over `T` epochs.
 - **Deferred, revisit once this works end-to-end:** full multi-year time series target; reprojection loss (§7.2 — parked, not on the near-term roadmap); MSE-warmup before switching to NLL (§7.4 — pending literature justification, see §10.12); GSE per-channel normalization and the compression-MLP choice (§5.4 — both flagged for supervisor discussion, not finalized, see §10.13).
@@ -260,6 +260,8 @@ rmse, temporal_coherence, amplitude_dispersion, incidence_angle, track_angle,
 los_east, los_north, los_up, mean_velocity, mean_velocity_std, acceleration, acceleration_std,
 seasonality, seasonality_std, 20190101, 20190107, 20190113, ..., 20231224
 ```
+Verified on the 2019–2023 release; the 2020–2024 release (used since 2026-11-10) is expected to have the same columns with date columns from 2020 to 2024. **Re-verify after the s01 rerun**, also because the 2020–2024 release comes with a stricter quality control (EGMS patch note).
+
 Date columns are plain 8-digit `YYYYMMDD` strings, **not** prefixed with `t_`. `rmse`/`temporal_coherence`/`amplitude_dispersion`/`mp_type` are the per-point quality fields to filter/flag on before basis-fitting (§3.5); `incidence_angle`/`track_angle`/`los_*` are the §3.7 viewing-geometry columns, already present, no separate raster needed.
 
 **Loading:**
@@ -406,7 +408,7 @@ class TemporalEncoder(nn.Module):
 
 ### 5.3 Annual predictor encoding
 
-**Prototype note (§3.6a):** the target is the 2019–2023 mean velocity, so whether one year's embedding or a pooled one is used is open (§10.16). Either way a single (64,) vector per point goes directly into §5.4's `StaticEncoder`; this `AnnualEncoder` is only needed if several years are fed in separately.
+**Prototype note (§3.6a):** the target is the 2020–2024 mean velocity, so whether one year's embedding or a pooled one is used is open (§10.16). Either way a single (64,) vector per point goes directly into §5.4's `StaticEncoder`; this `AnnualEncoder` is only needed if several years are fed in separately.
 
 ```python
 class AnnualEncoder(nn.Module):
@@ -704,7 +706,7 @@ This adapts coverage: points far from data get wider intervals.
 
 **Two levels: a fixed pool on disk, a fresh graph every draw.**
 
-- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: `pid`, `seed_pid` (the pool it belongs to), lat/lon, `mean_velocity` (EGMS's own 2019–2023 field, no fitting needed, §3.6a), incidence angle and GSE embedding. Land cover is not stored (§4.3 Step 3.3). This is the expensive part (angular selection, GSE sampling) and is never recomputed during training. **GSE is sampled once, here, per burst and only at seed and pool points, from a transient windowed COG read; only the per-point 64-dim int8 vectors are kept and no raster tiles are stored (§10.16).**
+- **Persisted once (s03), offline:** the §4.3 Step 3 candidate pools. Each pool is a seed point plus the points gathered around it by angular selection (the seed is just where the pool starts, not a graph centre). Per pool point: `pid`, `seed_pid` (the pool it belongs to), lat/lon, `mean_velocity` (EGMS's own 2020–2024 field, no fitting needed, §3.6a), incidence angle and GSE embedding. Land cover is not stored (§4.3 Step 3.3). This is the expensive part (angular selection, GSE sampling) and is never recomputed during training. **GSE is sampled once, here, per burst and only at seed and pool points, from a transient windowed COG read; only the per-point 64-dim int8 vectors are kept and no raster tiles are stored (§10.16).**
 - **Rebuilt fresh on every `__getitem__` call:**
   1. draw a random subset of the pool's points,
   2. pick one point of the subset as the query and hide its velocity,
@@ -722,7 +724,7 @@ This adapts coverage: points far from data get wider intervals.
 | `seed` | int8 | 1 = the pool's seed |
 | `latitude`, `longitude` | float64 | WGS84, only used for pairwise distances/bearings |
 | `easting`, `northing` | float64 | EPSG:3035 (used for the GSE sampling) |
-| `mean_velocity` | float64 | raw mm/yr, 2019–2023 (§3.6a) |
+| `mean_velocity` | float64 | raw mm/yr, 2020–2024 (§3.6a) |
 | `incidence_angle` | float64 | raw degrees |
 | `gse_0` ... `gse_63` | int8 | raw quantised embedding of `GSE_YEAR` (2025, §10.16), de-quantised on read; −128 = no data |
 
@@ -1058,7 +1060,7 @@ Original note: §4.3 Step 3's angular-balanced candidate pool construction delib
 
 Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5.4):
 - **Compression:** project a 64-dim embedding down via a small MLP before concatenating with other node features (rationale: dimensional balance, task-specific projection — see §5.4), vs. feeding it raw. Leaning toward compressing, not committed.
-- **Idea (noted 2026-10-24): the same compression MLP could also combine several years** (e.g. the five embeddings of 2019–2023, 320 values) into one smaller feature vector, so the model can use the whole target window without the node features growing. For now only the latest year is used (§10.16).
+- **Idea (noted 2026-10-24): the same compression MLP could also combine several years** (e.g. the five embeddings of 2020–2024, 320 values) into one smaller feature vector, so the model can use the whole target window without the node features growing. For now only the latest year is used (§10.16).
 - **Normalization:** the embedding is already roughly unit-scale post de-quantization and may encode meaningful relative geometry across its 64 dims; standardizing each dimension independently (the default treatment for every other feature group, §4.6) could distort that. Leaning toward skipping per-channel normalization for GSE specifically (or applying one shared scalar at most), unlike velocity/incidence/distance which get ordinary independent normalization. Not committed either way.
 
 ### 10.14 OPEN — per-burst anchor budget for candidate pool construction
@@ -1073,9 +1075,9 @@ Two linked questions on how the AlphaEarth embedding enters the model (§5.3/§5
 
 ### 10.16 OPEN — GSE year(s) and sampling strategy
 
-**Decision for the prototype (2026-10-24):** only the **latest year** of the embedding (2025, the newest in the index, which covers 2017–2025) is used, read from the **open bucket** (`gs://alphaearth_foundations/satellite_embedding/v1/annual/<year>/<utm_zone>/…`, served anonymously via `https://storage.googleapis.com/…`; tile index `…/annual/aef_index.csv`, 0.8 GB, one row per tile with year, UTM CRS, path and footprint), not through Google Earth Engine (account, authentication and request quotas for ~6 M points, same data). Note that 2025 lies two years after the 2019–2023 target window. **Tile layout:** 8192 × 8192 px of 10 m (~6,700 km²), 64 bands int8, zstd, band-interleaved, internal blocks of 1024 × 1024 px (10 km), overviews; files ~2.7 GB (compressed to ~0.62 of the raw size). **Volume for one year (measured 2026-10-24):** the 71 cores (123,600 km²) touch 174 tiles = 465 GB as full tiles; the core pixels alone are 79 GB raw, ~69 GB as windowed reads over the cores' bounding boxes (train 34, dev 8, cal 4, val 23 GB). Because a block covers 10 × 10 km in all 64 bands, sampling only the pool points still reads almost every block of a core, so ~50–70 GB transferred per year is realistic; nothing has to be stored except the vectors at the points. The val regions only need the embedding at their query points, which would cut their share to almost nothing.
+**Decision for the prototype (2026-10-24):** only the **latest year** of the embedding (2025, the newest in the index, which covers 2017–2025) is used, read from the **open bucket** (`gs://alphaearth_foundations/satellite_embedding/v1/annual/<year>/<utm_zone>/…`, served anonymously via `https://storage.googleapis.com/…`; tile index `…/annual/aef_index.csv`, 0.8 GB, one row per tile with year, UTM CRS, path and footprint), not through Google Earth Engine (account, authentication and request quotas for ~6 M points, same data). Since the switch to the 2020–2024 release (2026-11-10) the 2025 embedding lies directly after the target window (before: two years after the 2019–2023 window), so the mismatch between embedding year and target is smaller; it is still outside the window. **Tile layout:** 8192 × 8192 px of 10 m (~6,700 km²), 64 bands int8, zstd, band-interleaved, internal blocks of 1024 × 1024 px (10 km), overviews; files ~2.7 GB (compressed to ~0.62 of the raw size). **Volume for one year (measured 2026-10-24):** the 71 cores (123,600 km²) touch 174 tiles = 465 GB as full tiles; the core pixels alone are 79 GB raw, ~69 GB as windowed reads over the cores' bounding boxes (train 34, dev 8, cal 4, val 23 GB). Because a block covers 10 × 10 km in all 64 bands, sampling only the pool points still reads almost every block of a core, so ~50–70 GB transferred per year is realistic; nothing has to be stored except the vectors at the points. The val regions only need the embedding at their query points, which would cut their share to almost nothing.
 
-**Status: working plan, not verified.** (1) *Which year(s):* the target is the 2019–2023 mean velocity (§3.6a), so a single year's embedding doesn't match it by construction. Options: one representative year (64 B/point), or a pooled embedding over 2019–2023 (average then renormalise, or all five years kept and pooled in the model: 320 B/point). Interacts with §10.13. (2) *Sampling:* GSE is not stored as rasters (full tiles ~4.3 GB, regional windows ~200 MB per year). `s03` samples it once per region from a transient windowed COG read at the pool points and keeps only the int8 vectors. Sampling per `__getitem__` during training is **not** viable: remote range requests per draw would stall the data loader, and compute nodes may not have outbound HTTPS. As of 2026-10-20 the GSE download is not implemented in `s01` (only the tile index exists), so this is a prerequisite for `s03`'s feature step.
+**Status: working plan, not verified.** (1) *Which year(s):* the target is the 2020–2024 mean velocity (§3.6a), so a single year's embedding doesn't match it by construction. Options: one representative year (64 B/point; 2025 is the year right after the window, 2022 its middle), or a pooled embedding over 2020–2024 (average then renormalise, or all five years kept and pooled in the model: 320 B/point). Interacts with §10.13. (2) *Sampling:* GSE is not stored as rasters (full tiles ~4.3 GB, regional windows ~200 MB per year). `s03` samples it once per region from a transient windowed COG read at the pool points and keeps only the int8 vectors. Sampling per `__getitem__` during training is **not** viable: remote range requests per draw would stall the data loader, and compute nodes may not have outbound HTTPS. As of 2026-10-20 the GSE download is not implemented in `s01` (only the tile index exists), so this is a prerequisite for `s03`'s feature step.
 
 ---
 
@@ -1312,7 +1314,7 @@ List or dict columns go into the `_complex.json`. A new list column must be adde
 
 ### 14.1 Steps (in order)
 
-**1. Regions (s01).** Collect more handpicked deformation regions for train, dev, cal and val, including small deformation areas, so the data contains more real displacement. Reduce the random (background) regions substantially, so the meaningless background does not dominate. Review Iceland_North and Norway (artefact-prone) and swap them out if needed. Update the region file and rerun s01.
+**1. Regions (s01). DONE 2026-11-10 (region file), s01 rerun pending.** `assets/real_subsidence_polygonbased.gpkg` reworked: 46 handpicked regions (train 23, dev 9, cal 7, val 7; dev from 4 to 9, cal from 4 to 7, train + SW_England), picked visually and by the cell values of the L3 derivative (deformation of ~10 mm/yr also in small areas the L3 scan missed, its thresholds were ≥ 2 km² and ≥ 4 mm/yr contrast). Random regions reduced in `01_download_data.slurm` to `--n-rnd=12` (was 35; ~7/2–3/2–3 train/dev/cal squares of 30 × 30 km). Artefact-prone regions (Iceland_North, Norway, Estonia in train; Sweden, Rejkjavik in val) are **kept on purpose** (supervisor, 2026-11-10: leave them in for now and see what happens). Columns reduced to `location`, `set`, `geometry`. Old data tree and region table removed before the rerun.
 
 **2. Preprocessing (s02).** Rerun s02: the normalization stats come from the train regions, new regions mean new stats.
 
@@ -1367,7 +1369,7 @@ List or dict columns go into the `_complex.json`. A new list column must be adde
 
 **Next up (§3.6a prototype scope):**
 - [x] Per-burst candidate pool: land-cover-stratified anchors, angular-balanced k-NN, sequential no-reuse sampling, edge buffer (§4.3 Step 3 / §4.4) — implemented in s03, first full run pending
-- [x] Target is EGMS's own `mean_velocity` (2019–2023), a column in the preprocessed csvs, no fitting step (§3.6a)
+- [x] Target is EGMS's own `mean_velocity` (2020–2024, release switched 2026-11-10), a column in the preprocessed csvs, no fitting step (§3.6a)
 - [x] GSE sampled once at candidate points only from a transient windowed read, vectors kept, no rasters stored; year choice decided: latest year 2025 (§10.16) — implemented in s03, first full run pending
 - [x] Candidate pools (lat/lon, velocity, incidence, GSE vectors) written as one GRAPH parquet per burst (§7.1) — implemented in s03, first full run pending
 - [ ] `PoolDataset` + `ConcatDataset` + `DataLoader(shuffle=True)` wired up, subset/graph/query drawn fresh in `__getitem__` (§7.1)
