@@ -620,7 +620,7 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
 
 
-def train_one_epoch(model, loader, optimizer, grad_clip, device):
+def train_one_epoch(model, loader, optimizer, grad_clip, device, beta):
     """
     Trains the model for one pass over the train loader: NLL loss, backward pass, gradient clipping, optimizer step.
 
@@ -649,7 +649,7 @@ def train_one_epoch(model, loader, optimizer, grad_clip, device):
 
         # forward pass through the model and comparison with ground truth to compute loss
         mu, logvar = model(batch)
-        loss = loss_fn(mu, logvar, batch.y)
+        loss = loss_fn(mu, logvar, batch.y, beta=beta)
         # backward pass
         loss.backward()
         # gradient clipping stops them from exploding
@@ -665,13 +665,18 @@ def train_one_epoch(model, loader, optimizer, grad_clip, device):
     return total_loss / n_graphs
 
 
-def loss_fn(mu, logvar, y):
+def loss_fn(mu, logvar, y, beta=0.0):
     """
-    Heteroscedastic Gaussian negative log likelihood (§6.1), without the constant term.
+    Heteroscedastic Gaussian negative log likelihood (§6.1), without the constant term, optionally as β-NLL
+    (Seitzer et al. 2022): the NLL of every query is weighted with sigma^(2 beta) = exp(beta * logvar), held constant
+    in the backward pass (detach). The weight gives the queries with a large predicted variance (the hard ones) more
+    weight for the mean than in the plain NLL; it does not change the optimal sigma of a query.
 
     Arguments:
         mu, logvar -- torch tensors (n,), predicted mean and log variance (normalized units)
         y -- torch tensor (n,), true normalized velocity
+        beta -- float in [0, 1], 0 = plain NLL (also used for the dev NLL in evaluate), 0.5 = recommended by the
+            paper, 1 = the gradient for the mean is the same as with MSE
 
     Returns:
         loss -- torch scalar tensor, mean over the n queries
@@ -681,8 +686,10 @@ def loss_fn(mu, logvar, y):
     # so the model learns an honest uncertainty (the constant 0.5 * log(2 pi) is left out, it doesn't change the gradients)
     loss = 0.5 * (logvar + (y - mu) ** 2 / torch.exp(logvar))
 
-    # mean over the queries of the batch
-    return loss.mean()
+    if beta > 0:
+        loss=loss * torch.exp(logvar).detach() ** beta
+
+    return loss.mean(axis=-1)
 
 
 def evaluate(model, loader, device):
@@ -1150,7 +1157,7 @@ def build_datasets(use_gse, n_graphs, k_graph, subset_min, subset_max, min_graph
 
 
 def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, patience, grad_clip,
-                device, checkpoint_path, params):
+                device, checkpoint_path, params, beta):
     """
     Trains with AdamW and early stopping on the dev NLL: every epoch new train draws, one training pass, one
     evaluation on dev; every new best epoch is saved as checkpoint, training stops after patience epochs without one.
@@ -1178,7 +1185,7 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
     for epoch in range(max_epochs):
         # new draws for this epoch (the train draws depend on the run seed, the epoch and the pool, see PoolDataset)
         train_loader.dataset.set_epoch(epoch)
-        train_loss = train_one_epoch(model, train_loader, optimizer, grad_clip, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, grad_clip, device, beta)
         dev_metrics, _ = evaluate(model, dev_loader, device)
         history.append({"epoch": epoch, "train_loss": train_loss,
                 "dev_loss": dev_metrics["nll"], "dev_rmse": dev_metrics["rmse"]})
@@ -1272,7 +1279,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
 
 def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_graph_size,
          hidden_dim, n_layers, heads, dropout,
-         lr, weight_decay, batch_size, max_epochs, patience, grad_clip,
+         lr, weight_decay, batch_size, max_epochs, patience, grad_clip, beta,
          seed, num_workers, run_name):
     """
     Trains one model with one hyperparameter setting and evaluates it on dev; one run of the hyperparameter search
@@ -1325,11 +1332,11 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
                   subset_max=subset_max, min_graph_size=min_graph_size, hidden_dim=hidden_dim,
                   n_layers=n_layers, heads=heads, dropout=dropout, lr=lr, weight_decay=weight_decay,
                   batch_size=batch_size, max_epochs=max_epochs, patience=patience, grad_clip=grad_clip,
-                  seed=seed, n_node_features=n_node_features, edge_dim=edge_dim, stats=stats)
+                  beta=beta, seed=seed, n_node_features=n_node_features, edge_dim=edge_dim, stats=stats)
 
     # params = the arguments of the run + n_node_features, edge_dim and stats (saved with every checkpoint)
     history, best_epoch = train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, patience, grad_clip,
-                                      device, checkpoint_path, params)
+                                      device, checkpoint_path, params, beta)
 
     # Reload the best checkpoint and evaluate it on train and dev (overall, per dev region and orbit), and compare it
     # with the baselines on the same dev graphs
@@ -1383,6 +1390,8 @@ if __name__ == '__main__':
                         help="early stopping: epochs without a new best dev loss before training stops")
     parser.add_argument("--grad-clip", dest="grad_clip", type=float, default=5.0,
                         help="maximum gradient norm")
+    parser.add_argument("--beta", dest="beta", type=float, default=0.0,
+                            help="interpolation parameter for NLL loss")
 
     # run
     parser.add_argument("--seed", dest="seed", type=int, default=42,

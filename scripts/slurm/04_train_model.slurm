@@ -44,6 +44,7 @@ ARGS=(
     --grad-clip=5.0       # maximum gradient norm
     --seed=42             # seed of the pool sample, the draws and the weight initialisation
     --num-workers=14      # DataLoader worker processes (keep below --cpus-per-task, keep it fixed within a grid)
+    --beta=0.5            # Interpolation parameter for beta NLL loss
     --use-gse             # uncomment to use the 64 GSE columns as node features
 )
 
