@@ -29,8 +29,9 @@ from pyproj import Geod
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv
-from torch_geometric.utils import to_undirected
+from scipy.spatial import Delaunay
 from collections import defaultdict
+torch_geometric.utils import to_undirected
 
 ################################################
 # 1.1) Constants
@@ -124,12 +125,13 @@ def load_pools(sampled_index, use_gse, min_graph_size):
         min_graph_size -- int, minimum number of points of a pool
 
     Returns:
-        pools -- list of dicts, one per pool: lat, lon (float64 arrays), vel, inc (float32 arrays), gse (int8 array of
+        pools -- list of dicts, one per pool: lat, lon, x, y (float64 arrays; x, y = easting, northing in EPSG:3035 for
+            the Delaunay edges), vel, inc (float32 arrays), gse (int8 array of
             shape (m, 64), only with use_gse), region and orbit (str, from the folder names of the file)
     """
 
     # List of necessary columns to read for the process
-    cols = ["latitude", "longitude", "mean_velocity", "incidence_angle", "seed_pid"]
+    cols = ["latitude", "longitude", "easting", "northing", "mean_velocity", "incidence_angle", "seed_pid"]
     gse_cols = [f"gse_{i}" for i in range(64)]
     # if gse is used, the 64 dimensions are appended
     if use_gse:
@@ -153,6 +155,8 @@ def load_pools(sampled_index, use_gse, min_graph_size):
             pool = {
                     "lat": pool_df["latitude"].to_numpy(),                           # float64, needed for geodesics
                     "lon": pool_df["longitude"].to_numpy(),
+                    "x": pool_df["easting"].to_numpy(),
+                    "y": pool_df["northing"].to_numpy(),
                     "vel": pool_df["mean_velocity"].to_numpy().astype(np.float32),
                     "inc": pool_df["incidence_angle"].to_numpy().astype(np.float32),
                     "region": Path(graph_file).parent.parent.name,
@@ -213,13 +217,14 @@ def estimate_edge_stats(dataset, n_draws=20000):
 class PoolDataset(torch.utils.data.Dataset):
     """
     The dataset of one set (train or dev): one item = one pool. Every __getitem__ builds a graph from its pool:
-    a random subset of the points, one of them as query with its velocity hidden, k-nearest-neighbour edges and the
-    node and edge features (masked target, §7.1). Train draws change every epoch, dev draws are fixed.
+    a random subset of the points, one of them as query with its velocity hidden, Delaunay edges (delaunay_edges) and
+    the node and edge features (masked target, §7.1). Train draws change every epoch, dev draws are fixed.
 
     Arguments (of __init__):
         pools -- list of dicts, the loaded pools (see load_pools)
         stats -- dict, normalization stats (see load_norm_stats, estimate_edge_stats)
-        k_graph -- int, every node is connected to its k_graph nearest nodes
+        k_graph -- int, number of nearest visible points of the neighbour mean baseline (the graph itself uses
+            Delaunay edges since 2026-11-11, k_graph no longer affects it)
         subset_min, subset_max -- float, range of the share of a pool's points drawn per item
         min_graph_size -- int, minimum number of points of a drawn subset
         use_gse -- bool, add the 64 GSE values to the node features
@@ -301,7 +306,7 @@ class PoolDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         """
-        Builds one graph from pool i: random subset, query, k-NN edges, node and edge features, target.
+        Builds one graph from pool i: random subset, query, Delaunay edges, node and edge features, target.
 
         Arguments:
             i -- int, the pool number
@@ -316,9 +321,10 @@ class PoolDataset(torch.utils.data.Dataset):
 
         lat, lon = pool["lat"], pool["lon"]
 
-        # compute the distance and the orientation of the points
+        # compute the distance and the orientation of the points (geodesic, for the edge features)
         dist, az = pairwise_geodesic(lat[idx], lon[idx])
-        edge_index = knn_edges(dist, self.k_graph)
+        # the edges: Delaunay triangulation of the subset in EPSG:3035 metres (replaced knn_edges(dist, self.k_graph))
+        edge_index = delaunay_edges(pool["x"][idx], pool["y"][idx])
 
         # the edge and node features are put together using the normalization stats. 
         x = build_node_features(pool, idx, q, self.stats, self.use_gse)
@@ -387,10 +393,64 @@ def pairwise_geodesic(lat, lon):
     # back to (m, m): row i, column j = from point i to point j; the diagonal (a point with itself) has distance 0
     return d.reshape(m, m), az12.reshape(m, m)
 
+def delaunay_edges(x,y):
+    """
+    Connects the nodes of a drawn subset by a Delaunay triangulation: two nodes are connected if they share a triangle
+    side, i.e. they are natural neighbours. Unlike k nearest neighbours the graph is always connected and every node has
+    neighbours in all directions (on average about 5). Only the choice of the edges uses the planar coordinates, the
+    edge features are still geodesic (build_edge_features).
+
+    Arguments:
+        x, y -- numpy float arrays (m,), easting and northing of the subset's points (EPSG:3035, metres), in the order
+            of idx, so the node numbers 0..m-1 match the node features and the pairwise_geodesic matrices
+
+    Returns:
+        edge_index -- torch long tensor (2, n_edges), row 0 = source, row 1 = target node of every edge; every edge is
+            in both directions (undirected graph)
+    """
+    # gives the shape (m,2)
+    points = np.column_stack([x,y])
+
+    # creating a delaunay mesh between the points
+    # qh moves points on a straight line by a tiny bit so triangles can be formed
+    tri = Delaunay(points, qhull_options="QJ")
+
+    # indices is a list that contains for every point its neighbours: indices = [1,2,3, 0,2, 0,1,3, 0,2]
+    # indptr contains the indices that tell how to separate that list for the individual points: indptr = [0, 3, 5, 8, 10]
+    indptr, indices = tri.vertex_neighbor_vertices
+
+    # for point i=1 example:
+    # indptr[i] = 3    indptr[i+1]=5
+    # indices[indptr[i] : indptr[i+1]] = indices[3:5] = [0,2]
+    # This means point 1 has edges to points 0 and 2. 
+
+    # We can count the number of neighbours per point:
+    # np.diff(indptr) = [3, 2, 3, 2]   as shown above point 1 has 2 neighbours
+    # n_per_point = np.diff(indptr)
+
+    # number of neighbours per point
+    n_neighbours = np.diff(indptr)
+
+    # Turn the neighbour lists into edges in the PyG convention: edge_index[0] = source (sends), edge_index[1] =
+    # target (receives). Position k in both lists together is one edge: "source[k] sends to target[k]"
+    # target: every point repeated as often as it has neighbours, e.g. np.repeat([0,1,2,3], [3,2,3,2])
+    # = [0,0,0, 1,1, 2,2,2, 3,3]
+    target = np.repeat(np.arange(len(n_neighbours)), n_neighbours)
+    # source: the neighbours of point 0, then those of point 1, ... which is exactly indices, so source and target
+    # line up: [1,2,3, 0,2, 0,1,3, 0,2] (sending neighbour) above [0,0,0, 1,1, 2,2,2, 3,3] (receiving point)
+    source = indices
+
+    # two rows on top of each other, shape (2, n_edges): column k is edge k
+    # no to_undirected needed: every neighbourship is listed from both sides, so every edge is already in both directions
+    edge_index = torch.tensor(np.stack([source, target]), dtype=torch.long)
+
+    return edge_index
+
 
 def knn_edges(dist, k):
     """
-    Connects every node to its k nearest nodes and symmetrises the edges (§7.1).
+    Connects every node to its k nearest nodes and symmetrises the edges (§7.1). No longer used for training (replaced
+    by delaunay_edges on 2026-11-11, kNN graphs were often disconnected); kept for the test scripts and the tutorial.
 
     Arguments:
         dist -- numpy array (m, m), pairwise distances (see pairwise_geodesic)
@@ -1359,7 +1419,7 @@ if __name__ == '__main__':
     parser.add_argument("--n-graphs", dest="n_graphs", type=int, default=None,
                         help="number of train pools drawn at random over all train regions (default: all)")
     parser.add_argument("--k-graph", dest="k_graph", type=int, default=3,
-                        help="every node of a drawn subset is connected to its k nearest nodes")
+                        help="number of nearest visible points averaged by the neighbour mean baseline (the graph uses Delaunay edges)")
     parser.add_argument("--subset-min", dest="subset_min", type=float, default=0.6,
                         help="smallest share of a pool's points drawn as subset per epoch")
     parser.add_argument("--subset-max", dest="subset_max", type=float, default=0.9,
