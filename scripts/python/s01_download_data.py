@@ -309,8 +309,10 @@ def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
     the actual query area (core + clip_buffer_m, EPSG:3035), since the API only searches its lon/lat bounding box.
     Of the intersecting bursts, only the relative orbit with the largest combined overlap is kept, and all
     of its bursts are downloaded, however small their overlap (the minimum-overlap check is done in s02).
-    Files already on disk are skipped. Files the server refuses are recorded in failed_downloads and
-    skipped as well, so a single bad file doesn't stop the whole run.
+    Files already on disk are skipped. Every file gets up to five attempts with a growing pause: after an error
+    status of the server (a 401 also fetches a new token and search id) and after a connection that cannot be
+    opened or breaks during the download. Files that fail all attempts are recorded in failed_downloads and
+    skipped, so a single bad file or connection doesn't stop the whole run.
 
     Arguments:
         row -- pandas.Series, a GeoDataFrame row with geometry (core, EPSG:3035), clip_buffer_m,
@@ -320,7 +322,8 @@ def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
             1 hour, and a single row's files can take longer than that to all download)
         orbit -- string, orbit direction to keep, e.g. "ascending" or "descending"
         failed_downloads -- list, every file that could not be downloaded is appended to it as a
-            dict (location, orbit, filename, status_code, server_response)
+            dict (location, orbit, filename, status_code, server_response); for connection errors status_code
+            is None and server_response holds the error message
         t2proj -- pyproj.Transformer from EPSG:4326 to EPSG:3035 (always_xy), for the burst footprints
 
     Returns:
@@ -449,6 +452,20 @@ def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
                     link = f"{link.split('?id=')[0]}?id={result['id']}"
 
                 # give the server some time before the next attempt, a bit longer every time
+                time.sleep(10 * attempt)
+            except (requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ConnectionError) as e:
+
+                print(f"Connection error on attempt {attempt}/{max_attempts} for {hit["filename"]}: {e}", flush=True)
+
+                if attempt == max_attempts:
+                    failed_downloads.append({"location": row["location"],
+                                            "orbit": orbit,
+                                            "filename": hit["filename"],
+                                            "status_code": None,
+                                            "server_response": str(e)[:500]})
+                    break
+
                 time.sleep(10 * attempt)
 
     return str(return_path)
