@@ -4,7 +4,7 @@
 #SBATCH --error=../logs/analysis_%j.err
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --time=06:00:00
 #SBATCH --partition=hpda2_compute
 #SBATCH --account=hpda-c
 #SBATCH --qos=normal
