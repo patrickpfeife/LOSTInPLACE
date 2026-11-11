@@ -196,12 +196,12 @@ def select_area_and_buffer_burst_edges(burst, aoi, buffer_m):
 
 
 def select_seed_nodes(n_seed_points, wc_merged_path, burst, area_intersected, burst_name, seed_log,
-                        min_dist_m=100.0, cell_size_m=2000.0, grid_share=2/3,
+                        min_dist_seeds=100.0, cell_size_m=2000.0, grid_share=2/3,
                         strat_exponent=0.5, rng_seed=42):
     """
     Flags seed points: 2/3 spread equally over a 2 x 2 km grid (random within each cell), 1/3
     stratified over land cover with extra weight on small classes. Only points with in_center == 1
-    (outside the edge margin) can become seeds. In both phases a seed must be at least min_dist_m
+    (outside the edge margin) can become seeds. In both phases a seed must be at least min_dist_seeds
     from every seed chosen so far. Shortfalls are not redistributed; intended vs real counts go to seed_log.
 
     Arguments:
@@ -211,7 +211,7 @@ def select_seed_nodes(n_seed_points, wc_merged_path, burst, area_intersected, bu
         area_intersected -- shapely geometry (EPSG:3035), defines the grid origin
         burst_name -- str, used in the log
         seed_log -- list, one dict with the intended vs real counts of this burst is appended (markdown log of the run)
-        min_dist_m -- float, minimum distance between any two seeds (0 = off)
+        min_dist_seeds -- float, minimum distance between any two seeds (0 = off)
         cell_size_m -- float, grid cell size
         grid_share -- float, share of seeds placed on the grid
         strat_exponent -- float, class weight = class size ** strat_exponent
@@ -236,12 +236,12 @@ def select_seed_nodes(n_seed_points, wc_merged_path, burst, area_intersected, bu
     n_strat = n_seed_points - n_grid
 
     # spatial hash of the accepted seeds for the minimum distance
-    # hash cell size = min_dist_m, so a seed that is too close must lie in the same or one of the 8 neighbouring cells
-    g = min_dist_m
+    # hash cell size = min_dist_seeds, so a seed that is too close must lie in the same or one of the 8 neighbouring cells
+    g = min_dist_seeds
     seed_hash = {}
 
     def far_enough(x, y):
-        # checks whether a point keeps min_dist_m to every seed accepted so far
+        # checks whether a point keeps min_dist_seeds to every seed accepted so far
         if g <= 0:
             return True
         kx, ky = int(x // g), int(y // g)
@@ -347,18 +347,21 @@ def sample_landcover(wc_path, lon, lat):
     return lc
 
 
-def select_candidate_pool(burst, k_nearest, max_dist, rng_seed=42):
+def select_candidate_pool(burst, k_nearest, max_dist, mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries, rng_seed=42):
     """
-    Assigns a candidate pool to every seed of a burst: up to k_nearest points within max_dist, chosen
-    angular-weighted by find_pool_points. A point belongs to at most one pool (no reuse), and seeds never end up
-    in another seed's pool. The minimum pool size is not applied here but at training time, when the graphs
-    are redrawn from the pools every epoch.
+    Assigns a candidate pool to every seed of a burst: up to k_nearest points within max_dist, chosen by
+    find_pool_points with randomly drawn target distances per sector (project.md §10.22). A point belongs to at most
+    one pool (no reuse), and seeds never end up in another seed's pool. The minimum pool size is not applied here but
+    at training time, when the graphs are redrawn from the pools every epoch.
 
     Arguments:
         burst -- polars.DataFrame with pid, easting, northing and seed (all points of the overlap, see select_seed_nodes)
         k_nearest -- int, maximum number of pool points per seed
         max_dist -- float, maximum distance (m) of a pool point from its seed
-        rng_seed -- int, seed for the random order in which the seeds pick their points
+        mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries -- see
+            find_pool_points
+        rng_seed -- int, seed of the random generator: the order in which the seeds pick their points and all distance
+            draws of find_pool_points, so the pools are reproducible
 
     Returns:
         burst -- the input with a String column "seed_pid": the pid of the seed whose pool the point belongs to
@@ -387,7 +390,8 @@ def select_candidate_pool(burst, k_nearest, max_dist, rng_seed=42):
         cand = np.asarray(tree.query_ball_point(xy[i], r=max_dist), dtype=np.int64)
         cand = cand[np.argsort(np.hypot(xy[cand, 0] - xy[i, 0], xy[cand, 1] - xy[i, 1]))]
         # pools can be smaller than k_nearest in sparse areas, the minimum size is applied at training time
-        pool = find_pool_points(cand, available, k_nearest, xy, xy[i])
+        pool = find_pool_points(cand, available, k_nearest, xy, xy[i], mu_mu_dist, sigma_mu_dist, 
+                                mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries, rng)
 
         # the seed and its pool points get the seed's pid
         seed_pid[i] = pids[i]
@@ -399,11 +403,18 @@ def select_candidate_pool(burst, k_nearest, max_dist, rng_seed=42):
     return burst.with_columns(pl.Series("seed_pid", seed_pid.tolist(), dtype=pl.String))
 
 
-def find_pool_points(cand_idx, available, k_nearest, xy, seed_xy, n_sectors=8):
+def find_pool_points(cand_idx, available, k_nearest, xy, seed_xy, mu_mu_dist, sigma_mu_dist, mu_sigma_dist,
+                    sigma_sigma_dist, min_dist_pool, tolerance, max_tries, rng, n_sectors=8):
     """
-    Angular-weighted k nearest: the circle around the seed is split into n_sectors equal sectors and the points are
-    taken round by round, the nearest free point of every sector first, then the second nearest of every sector, ...
-    until k_nearest are picked. So the pool surrounds the seed instead of lying on one side.
+    Picks the pool points of one seed by randomly drawn target distances, so the pools are sparser and more varied
+    than the nearest points (project.md §10.22). The circle around the seed is split into n_sectors equal sectors and
+    visited round by round; per visit a sector gets up to max_tries draws:
+      1) a mean mu ~ N(mu_mu_dist, sigma_mu_dist) and a spread sigma ~ N(mu_sigma_dist, sigma_sigma_dist),
+      2) a target distance ~ N(mu, sigma), all three clipped at 0,
+      3) one free point of the sector whose distance to the seed is within tolerance of the target, chosen at random.
+    A sector adds at most one point per round. The rounds stop when k_nearest points are picked or a whole round
+    picked nothing (no free point fits the drawn distances anymore). Points closer than min_dist_pool to the seed
+    are never picked.
 
     Arguments:
         cand_idx -- numpy int array, row indices of all points within max_dist of the seed, sorted by distance
@@ -411,30 +422,76 @@ def find_pool_points(cand_idx, available, k_nearest, xy, seed_xy, n_sectors=8):
         k_nearest -- int, number of points to pick
         xy -- numpy array (n, 2), coordinates of all points of the burst (EPSG:3035)
         seed_xy -- numpy array (2,), coordinates of the seed
+        mu_mu_dist, sigma_mu_dist -- float, mean and std (m) of the distribution the mean distance is drawn from
+        mu_sigma_dist, sigma_sigma_dist -- float, mean and std (m) of the distribution the spread is drawn from
+        min_dist_pool -- float, minimum distance (m) of a pool point from the seed
+        tolerance -- float, a point is only taken if its distance is within this many metres of the target distance
+        max_tries -- int, draws per sector and round before the next sector is visited
+        rng -- numpy.random.Generator, for all draws (the one of select_candidate_pool, so the run is reproducible)
         n_sectors -- int, number of angular sectors
 
     Returns:
-        pool -- numpy int array, row indices of the picked points (fewer than k_nearest if not enough are free)
+        pool -- numpy int64 array, row indices of the picked points (fewer than k_nearest if not enough fit)
     """
     # only the points that are still available
     free = cand_idx[available[cand_idx]]
-    if len(free) <= k_nearest:
+    # nothing left around this seed, the pool stays empty
+    if len(free) == 0:
         return free
+
+    # compute distance of every point to the seed
+    d = np.hypot(xy[free, 0] - seed_xy[0], xy[free, 1] - seed_xy[1])
+
+    # apply min_dist_pool
+    free = free[d >= min_dist_pool]
+    d = d[d >= min_dist_pool]
 
     # the sector of every free point, from its direction as seen from the seed
     angle = np.arctan2(xy[free, 1] - seed_xy[1], xy[free, 0] - seed_xy[0])
     sector = (np.floor((angle + np.pi) / (2 * np.pi) * n_sectors).astype(np.int64)) % n_sectors
+    
+    # bookkeeping which points are already chosen
+    taken = np.zeros(len(free), dtype=bool)
+    pool = []
 
-    # the rank of every point within its sector (0 = nearest), free is already sorted by distance
-    rank = np.zeros(len(free), dtype=np.int64)
-    for s in range(n_sectors):
-        in_s = sector == s
-        rank[in_s] = np.arange(in_s.sum())
+    # round by round over all sectors until the pool is full; every round each sector can add one point
+    while len(pool) < k_nearest:
+        # set to True as soon as any sector of this round picks a point
+        picked_this_round = False
+        for s in range(n_sectors):
+            # the pool can get full in the middle of a round
+            if len(pool) >= k_nearest: break
+            # every sector gets max_tries draws to hit a point, then the next sector is visited
+            for attempt in range(max_tries):
+                # drawing the mu and sigma anew per attempt
+                # clipping out potentially negative values with max
+                mu = max(rng.normal(mu_mu_dist, sigma_mu_dist), 0.0)
+                sigma = max(rng.normal(mu_sigma_dist, sigma_sigma_dist), 0.0)
+                # drawing the target distance
+                target = max(rng.normal(mu, sigma), 0.0)
 
-    # sort by rank first and by distance second (lexsort uses the last key first), then take the first k_nearest
-    # empty sectors are simply skipped, their share goes to the other sectors
-    order = np.lexsort((np.arange(len(free)), rank))
-    return free[order[:k_nearest]]
+                # creates boolean mask that returns T for a point in the right sector,
+                # that is not taken yet and within the distance tolerance 
+                mask = (sector == s) & ~taken & (np.abs(d - target) <= tolerance)
+
+                if mask.any():
+                    # returns the indices where the mask is true
+                    positions = np.flatnonzero(mask)
+                    # choose one of the points randomly
+                    p = rng.choice(positions)
+                    # register the taken point in the bookkeeping
+                    taken[p] = True
+                    # p is the position within free, free[p] is the row of the point in the burst
+                    pool.append(free[p])
+                    picked_this_round = True
+                    # one point per sector and round, on to the next sector
+                    break
+        # a whole round without a single pick: no more points fit the distance distribution, the pool stays smaller
+        if not picked_this_round:
+            break
+
+    # int64 so that an empty pool still works as index array in select_candidate_pool
+    return np.asarray(pool, dtype=np.int64)
 
 
 ######################################
@@ -659,8 +716,8 @@ def training_summary_md(study_areas_gdf, log, k_nearest, density):
 ##############################################################################
 
 def build_train_dataset_per_burst(csv_path, aoi, k_nearest, density, wc_merged_path,
-                                  log, min_dist_m, buffer_m, n_seed_points_per_region, n_center_region,
-                                  max_dist):
+                                  log, min_dist_seeds, buffer_m, n_seed_points_per_region, n_center_region,
+                                  max_dist, mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries):
     """
     Builds the GRAPH table of one burst: overlap with the core and edge margin, number of seeds, seed selection and
     candidate pools. Only the points of the pools (seeds included) are saved, as <burst>_GRAPH.parquet next to the
@@ -672,7 +729,9 @@ def build_train_dataset_per_burst(csv_path, aoi, k_nearest, density, wc_merged_p
         k_nearest, density -- see find_n_seed_points
         wc_merged_path -- str or Path, the region's merged WorldCover file
         log -- dict, the lists of the markdown log (see main); one entry is appended to log["bursts"]
-        min_dist_m, buffer_m, max_dist -- see main
+        min_dist_seeds, buffer_m, max_dist -- see main
+        mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries -- see
+            find_pool_points
         n_seed_points_per_region -- int, the region's seed budget
         n_center_region -- int, the region's in_center points, for the burst's share of the budget
 
@@ -725,13 +784,13 @@ def build_train_dataset_per_burst(csv_path, aoi, k_nearest, density, wc_merged_p
 
     burst = select_seed_nodes(n_seed_points, wc_merged_path, burst, area_intersected,
                             burst_name=f"{p.parent.parent.name}/{p.parent.name}/{p.stem}",
-                            seed_log=log["seeds"], min_dist_m=min_dist_m)
+                            seed_log=log["seeds"], min_dist_seeds=min_dist_seeds)
 
     #################################################
     # 4) Select the candidate pool around every point
     #################################################
 
-    burst = select_candidate_pool(burst, k_nearest, max_dist)
+    burst = select_candidate_pool(burst, k_nearest, max_dist, mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries)
 
     #################################################
     # 5) Save the points of the pools as the burst's GRAPH table
@@ -751,7 +810,8 @@ def build_train_dataset_per_burst(csv_path, aoi, k_nearest, density, wc_merged_p
     return str(graph_path)
 
 
-def build_train_dataset_per_region(row, k_nearest, density, log, min_dist_m, buffer_m, max_dist, gse_index):
+def build_train_dataset_per_region(row, k_nearest, density, log, min_dist_seeds, buffer_m, max_dist, gse_index,
+                                   mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries):
     """
     Builds the GRAPH tables of all bursts of one region and samples the GSE embedding at their points. Every burst
     keeps its own file, so the pids (unique only within a burst) never have to be made unique.
@@ -759,8 +819,10 @@ def build_train_dataset_per_region(row, k_nearest, density, log, min_dist_m, buf
     Arguments:
         row -- pandas.Series, a region row with region_path, geometry (core), wc_merged_path,
             n_seed_points_per_region and n_center_region
-        k_nearest, density, log, min_dist_m, buffer_m, max_dist -- see build_train_dataset_per_burst
+        k_nearest, density, log, min_dist_seeds, buffer_m, max_dist -- see build_train_dataset_per_burst
         gse_index -- polars.DataFrame, the GSE tile index (see load_gse_index)
+        mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries -- see
+            find_pool_points
 
     Returns:
         graph_file_list -- list of str, the region's GRAPH files
@@ -779,7 +841,8 @@ def build_train_dataset_per_region(row, k_nearest, density, log, min_dist_m, buf
 
     # Per csv, the training build is done and collected in a list
     train_sets_burst = [build_train_dataset_per_burst(csv, row.geometry, k_nearest, density, wc_merged_path,
-                        log, min_dist_m, buffer_m, n_seed_points_per_region, n_center_region, max_dist
+                        log, min_dist_seeds, buffer_m, n_seed_points_per_region, n_center_region, max_dist,
+                        mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries
                         ) for csv in csvs_for_region]
 
 
@@ -800,7 +863,8 @@ def build_train_dataset_per_region(row, k_nearest, density, log, min_dist_m, buf
 ##############################################################################
 
 
-def main(k_nearest, density, min_dist_m, buffer_m, max_dist):
+def main(k_nearest, density, min_dist_seeds, buffer_m, max_dist,
+         mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries):
     """
     Builds the training dataset for all train, dev and cal regions (val regions only need their GNSS stations):
     seeds, candidate pools and the GSE embedding per pool point, saved as one GRAPH parquet per burst.
@@ -826,16 +890,20 @@ def main(k_nearest, density, min_dist_m, buffer_m, max_dist):
               - 2/3 of the seeds on a 2 x 2 km grid: every occupied cell gets the same quota, random within the cell;
               - 1/3 stratified over the WorldCover classes, weight = class size ** 0.5, so small classes get more
                 than their size share;
-              - in both phases every seed keeps min_dist_m to all seeds chosen so far. Shortfalls are not
+              - in both phases every seed keeps min_dist_seeds to all seeds chosen so far. Shortfalls are not
                 redistributed; intended vs real counts per phase and class go to the log.
               Result: int8 column seed (1 = seed).
+           e) Candidate pools (select_candidate_pool, find_pool_points): around every seed up to k_nearest free points
+              within max_dist, picked sector by sector at randomly drawn target distances; no point in two pools.
 
     Arguments:
         k_nearest -- int, number of pool points per seed
         density -- float in (0, 1], share of the burst capacity used for seeds
-        min_dist_m -- float, minimum distance (m) between any two seeds
+        min_dist_seeds -- float, minimum distance (m) between any two seeds
         buffer_m -- float, edge margin (m) inside the overlap of burst and core without seeds
         max_dist -- float, maximum distance (m) of a pool point from its seed
+        mu_mu_dist, sigma_mu_dist, mu_sigma_dist, sigma_sigma_dist, min_dist_pool, tolerance, max_tries -- the
+            distance distribution and stop rule of the pool points, see find_pool_points
 
     Returns:
         study_areas_gdf -- geopandas.GeoDataFrame, the region table with the counts, budgets and graph_file_list
@@ -867,7 +935,9 @@ def main(k_nearest, density, min_dist_m, buffer_m, max_dist):
 
         # building the GRAPH files of every region of the set, their paths go into the region table
         study_areas_gdf.loc[train_mask, "graph_file_list"] = study_areas_gdf.loc[train_mask].apply(build_train_dataset_per_region, axis=1, k_nearest=k_nearest, density=density,
-                    log=log, min_dist_m=min_dist_m, buffer_m=buffer_m, max_dist=max_dist, gse_index=gse_index)
+                    log=log, min_dist_seeds=min_dist_seeds, buffer_m=buffer_m, max_dist=max_dist, gse_index=gse_index,
+                    mu_mu_dist=mu_mu_dist, sigma_mu_dist=sigma_mu_dist, mu_sigma_dist=mu_sigma_dist, sigma_sigma_dist=sigma_sigma_dist,
+                    min_dist_pool=min_dist_pool, tolerance=tolerance, max_tries=max_tries)
 
     s01.study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
 
@@ -882,12 +952,28 @@ if __name__ == '__main__':
                         help="number of pool points per seed")
     parser.add_argument("--density", dest="density", type=float, required=True,
                         help="share (0, 1] of the burst capacity that is used for seeds")
-    parser.add_argument("--min-dist", dest="min_dist", type=float, default=50.0,
+    parser.add_argument("--min-dist-seeds", dest="min_dist_seeds", type=float, default=50.0,
                         help="minimum distance (m) between any two seeds")
     parser.add_argument("--buffer-m", dest="buffer_m", type=float, default=2000.0,
                         help="edge margin (m) inside the overlap of burst and core: no seeds there, but its points can be pool points")
     parser.add_argument("--max-dist", dest="max_dist", type=float, default=2000.0,
-                            help="maximum distance (m) around a seed point from which pool candidates may come")
+                        help="maximum distance (m) around a seed point from which pool candidates may come")
+
+    # Variables governing the distance distribution in find_pool_points
+    parser.add_argument("--mu-mu-dist", dest="mu_mu_dist", type=float, required=True,
+                        help="mean of the distance distribution from which the means are drawn in find_pool_points")
+    parser.add_argument("--sigma-mu-dist", dest="sigma_mu_dist", type=float, required=True,
+                        help="sigma of the distance distribution from which the means are drawn in find_pool_points")
+    parser.add_argument("--mu-sigma-dist", dest="mu_sigma_dist", type=float, required=True,
+                        help="mu of the distance distribution from which the sigmas are drawn in find_pool_points")
+    parser.add_argument("--sigma-sigma-dist", dest="sigma_sigma_dist", type=float, required=True,
+                        help="sigma of the distance distribution from which the sigmas are drawn in find_pool_points")
+    parser.add_argument("--min-dist-pool", dest="min_dist_pool", type=float, required=True,
+                        help="minimum distance (m) between the seed (centre node) and any of its pool points")
+    parser.add_argument("--tolerance", dest="tolerance", type=float, required=True,
+                        help="a pool point is only taken if its distance to the seed is within this many metres of the drawn target distance")
+    parser.add_argument("--max-tries", dest="max_tries", type=int, required=True,
+                        help="rounds over all sectors in a row without a picked point after which the pool is closed")
 
     args = parser.parse_args()
 
@@ -896,7 +982,9 @@ if __name__ == '__main__':
         parser.error("--density must be in (0, 1]")
 
     start = datetime.now()
-    study_areas_gdf, log = main(args.k_nearest, args.density, args.min_dist, args.buffer_m, args.max_dist)
+    study_areas_gdf, log = main(args.k_nearest, args.density, args.min_dist_seeds, args.buffer_m, args.max_dist,
+                                args.mu_mu_dist, args.sigma_mu_dist, args.mu_sigma_dist, args.sigma_sigma_dist,
+                                args.min_dist_pool, args.tolerance, args.max_tries)
 
     # the markdown log of the run, written only if the run got this far
     s01.write_md_log("s03_build_training_dataset", start, vars(args),
