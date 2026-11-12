@@ -14,14 +14,9 @@ import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
-import matplotlib
-matplotlib.use("Agg")      # no display on the compute nodes, figures are only saved
-import matplotlib.pyplot as plt
-import gstools as gs
 
 import s01_download_data as s01
 import s02_preprocessing as s02
-import xx_plotting as xx
 
 from pathlib import Path
 from datetime import datetime
@@ -30,8 +25,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv
 from scipy.spatial import Delaunay
-from collections import defaultdict
-torch_geometric.utils import to_undirected
+from torch_geometric.utils import to_undirected
 
 ################################################
 # 1.1) Constants
@@ -39,18 +33,6 @@ torch_geometric.utils import to_undirected
 
 # geodesic distances and bearings on the WGS84 ellipsoid (project.md §4.2)
 GEOD = Geod(ellps="WGS84")
-# automatic variogram fit of the ordinary kriging baseline (compute_variograms, project.md §7.5): the largest lag is
-# the VARIO_PERCENTILE of the query -> visible point distances of a dev region x orbit times VARIO_LAG_FACTOR, the bin
-# edges are 0 plus VARIO_N_BINS geometrically spaced edges from VARIO_FIRST_EDGE_M (fine bins at short lags), and bins
-# with fewer than VARIO_MIN_PAIRS point pairs are dropped. The fit uses at most VARIO_SAMPLING_SIZE random points of
-# the group (the number of pairs grows with n^2), the fitted range is bounded by VARIO_LEN_FACTOR x the largest lag
-VARIO_PERCENTILE = 95
-VARIO_LAG_FACTOR = 1.5
-VARIO_FIRST_EDGE_M = 10
-VARIO_N_BINS = 50
-VARIO_MIN_PAIRS = 30
-VARIO_SAMPLING_SIZE = 5000
-VARIO_LEN_FACTOR = 1.5
 
 ##############################################################################
 #============================================================================#
@@ -161,6 +143,8 @@ def load_pools(sampled_index, use_gse, min_graph_size):
                     "inc": pool_df["incidence_angle"].to_numpy().astype(np.float32),
                     "region": Path(graph_file).parent.parent.name,
                     "orbit": Path(graph_file).parent.name,
+                    "graph_file": str(graph_file),
+                    "seed_pid": pool_df["seed_pid"][0]
                     }
             if use_gse:
                 pool["gse"] = pool_df.select(gse_cols).to_numpy()    # shape (m, 64)
@@ -278,8 +262,8 @@ class PoolDataset(torch.utils.data.Dataset):
 
     def draw_subset_method(self, i):
         """
-        Draws the subset of pool i and the query among it. Used by __getitem__ (GNN) and by evaluate_baselines, so
-        the GNN and the baselines see exactly the same visible points and query.
+        Draws the subset of pool i and the query among it. Used by __getitem__ (GNN) and by evaluate_baselines in
+        s04b_baseline_comparison, so the GNN and the baselines see exactly the same visible points and query.
 
         Arguments:
             i -- int, the pool number
@@ -336,7 +320,7 @@ class PoolDataset(torch.utils.data.Dataset):
         query_mask[q] = True
 
         return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, query_mask=query_mask,
-            region=pool["region"], orbit=pool["orbit"])
+            region=pool["region"], orbit=pool["orbit"], graph_file=pool["graph_file"], seed_pid=pool["seed_pid"])
 
 
 def draw_subset(n, subset_min, subset_max, min_graph_size, rng):
@@ -764,19 +748,21 @@ def evaluate(model, loader, device):
 
     Returns:
         metrics -- dict with nll, rmse, mae and inside_90
-        predictions -- polars.DataFrame, one row per query: region, orbit, y_mm, mu_mm, sigma_mm
+        predictions -- polars.DataFrame, one row per query: region, orbit, graph_file and seed_pid (the query's key,
+            for the join with the baselines in s04b), y_mm, mu_mm, sigma_mm
     """
 
     # switch model to evaluation mode and turn off gradients
     model.eval()
     with torch.no_grad():
         # the results of every batch are collected 
-        mus, logvars, ys, regions, orbits = [], [], [], [], []
+        mus, logvars, ys, regions, orbits, graph_files, seed_pids = [], [], [], [], [], [], []
         for batch in loader:
             batch = batch.to(device)
             mu, logvar = model(batch)
             mus.append(mu.cpu()); logvars.append(logvar.cpu()); ys.append(batch.y.cpu())
             regions.extend(batch.region); orbits.extend(batch.orbit)
+            graph_files.extend(batch.graph_file); seed_pids.extend(batch.seed_pid)
 
         # One long tensor. One entry in the tensor is one query not an entire graph
         mu, logvar, y = torch.cat(mus), torch.cat(logvars), torch.cat(ys)
@@ -800,8 +786,8 @@ def evaluate(model, loader, device):
         metrics = {"nll": nll, "rmse": rmse, "mae": mae, "inside_90": inside}
 
         # building prediction table
-        predictions = pl.DataFrame({"region": regions, "orbit": orbits, "y_mm": y_mm.numpy(),
-                            "mu_mm": mu_mm.numpy(), "sigma_mm": sigma_mm.numpy()})
+        predictions = pl.DataFrame({"region": regions, "orbit": orbits, "graph_file":graph_files, "seed_pid": seed_pids,
+                                     "y_mm": y_mm.numpy(), "mu_mm": mu_mm.numpy(), "sigma_mm": sigma_mm.numpy()})
 
     return metrics, predictions
 
@@ -825,346 +811,6 @@ def save_checkpoint(model, params, epoch, path):
 
     # state.dict() holds learned weights; params is the dict from main; epoch is at which epoch the best state was reached
     torch.save({"state_dict": model.state_dict(), "params": params, "epoch": epoch}, path)
-
-################################################
-#======== Section 4: Evaluation Helpers =======#
-################################################
-# Used by evaluate_on_dev: the baselines on the dev graphs (§7.5) and the metrics per method and group.
-
-def idw(pool, idx, q, power):
-    """
-    Predicts the query's velocity by inverse distance weighting of all visible points of the same dev graph
-    (baseline). Distances below 1 m are clipped, so very close points don't get an unbounded weight.
-
-    Arguments:
-        pool -- dict, the pool (see load_pools)
-        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
-        q -- int, position of the query within idx
-        power -- int or float, power of the inverse distance (1 or 2)
-
-    Returns:
-        prediction -- float, the predicted velocity in mm/yr
-    """
-
-    # coordinates and raw velocities (mm/yr) of the subset, in subset order (positions 0 ... m-1)
-    lat, lon, vel = pool["lat"][idx], pool["lon"][idx], pool["vel"][idx]
-    # pairwise distances between all points of the subset; the bearings are not needed
-    dist, _ = pairwise_geodesic(lat, lon)
-    # we only need the distances from the query to the other points, which are in row q of the matrix
-    query_dist_row = dist[q]
-    # the query itself is deleted (its distance to itself is 0)
-    query_dist_row = np.delete(query_dist_row, q)
-    # its velocity is deleted as well, so distances and velocities stay in the same order
-    vel = np.delete(vel, q)
-    # very close points (and distance 0) would get an unbounded weight: distances below 1 m are set to 1 m
-    query_dist_row = np.maximum(query_dist_row, 1.0)
-    # inverse distance weights
-    weights = 1 / query_dist_row ** power
-    # weighted mean by vector operation
-    result = np.sum(vel * weights) / np.sum(weights)
-
-    return float(result)
-
-
-def neighbour_mean(pool, idx, q, k_graph):
-    """
-    Predicts the query's velocity as the mean of its k_graph nearest visible points of the same dev graph (baseline).
-
-    Arguments:
-        pool -- dict, the pool (see load_pools)
-        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
-        q -- int, position of the query within idx
-        k_graph -- int, number of nearest visible points that are averaged
-
-    Returns:
-        mean -- float, the predicted velocity in mm/yr
-    """
-
-    # coordinates and raw velocities (mm/yr) of the subset, in subset order (positions 0 ... m-1)
-    lat, lon, vel = pool["lat"][idx], pool["lon"][idx], pool["vel"][idx]
-
-    # pairwise distances of the subset; the bearings are not needed
-    dist, _ = pairwise_geodesic(lat, lon)
-
-    # distances from the query to all subset points; the query itself gets inf so it is never its own neighbour
-    d_q = dist[q].copy()
-    d_q[q] = np.inf
-
-    # positions (within the subset) of the k nearest visible points
-    nearest = np.argsort(d_q)[:k_graph]
-
-    # mean of their velocities, as a plain python float
-    return float(vel[nearest].mean())
-
-
-def compute_variograms(dev_ds):
-    """
-    Fits one variogram per dev region x orbit for the ordinary kriging baseline (project.md §7.5). The points are all
-    points of the group's dev pools minus the dev queries (fixed draws), so the query values never enter the fit.
-    Empirical semivariance per bin with the robust Cressie-Hawkins estimator (Cressie & Hawkins 1980), weighted least
-    squares fit with the Cressie (1985) weights N(h)/gamma(h)^2 of an Exponential, Spherical and Gaussian model with
-    nugget, the best by r2 is kept. Distances (bins, len_scale) are in metres.
-
-    Arguments:
-        dev_ds -- PoolDataset, the dev dataset (fixed_draws=True)
-
-    Returns:
-        variograms -- dict, (region, orbit) -> fitted gstools model (see o_kriging)
-        vario_log -- list of dicts, one per group: points, kept bins, largest lag and the fitted parameters (report)
-    """
-
-    collected = defaultdict(lambda: {"lat":[], "lon": [], "vel": [], "dist": []})
-
-    for i in range(len(dev_ds)):
-        # extract necessary information from the graph
-        pool, idx, q = dev_ds.draw_subset_method(i)
-        dist, _ = pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
-
-        # mask over the whole pool (not only the subset): everything except the query enters the variogram.
-        # q is the position within idx, so the query's position in the pool is idx[q]
-        query_pos = idx[q] 
-        keep_mask = np.ones(len(pool["vel"]),dtype=bool)
-        keep_mask[query_pos] = False
-        key = (pool["region"], pool["orbit"])
-
-        # distances from the query to the visible points (row q, without the 0 to itself): the distances the kriging
-        # actually has to bridge, they set the largest lag of the group's variogram
-        dist_to_q = np.delete(dist[q], q)
-
-        # the defaultdict creates the empty lists the first time a key is accessed; every pool adds one array per list
-        for x in ["lat", "lon", "vel"]:
-            collected[key][x].append(pool[x][keep_mask])
-        collected[key]["dist"].append(dist_to_q)
-
-    variograms = {}
-    vario_log = []
-
-    # one fit per group: key = (region, orbit), value = dict of lat, lon, vel, dist (lists with one array per pool)
-    for (region, orbit), data in collected.items():
-        # one flat array per variable
-        for x in ["lat", "lon", "vel", "dist"]:
-            data[x] = np.concatenate(data[x])
-
-        n = len(data["vel"])
-
-        # bins up to the largest lag the kriging needs in this group, fine near 0 and coarse further out
-        max_dist_to_q = np.percentile(data["dist"], VARIO_PERCENTILE) * VARIO_LAG_FACTOR
-        bins = np.concatenate([[0.0], np.geomspace(VARIO_FIRST_EDGE_M, max_dist_to_q, VARIO_N_BINS)])
-
-        # empirical semivariance per bin (Cressie-Hawkins estimator), from at most VARIO_SAMPLING_SIZE random points
-        # (pairs grow with n^2); geo_scale in metres, so the bins are in metres
-        bin_center, gamma, counts = gs.vario_estimate(pos=(data["lat"], data["lon"]), field=data["vel"], bin_edges=bins, latlon=True,
-                                  geo_scale=gs.KM_SCALE * 1000, estimator="cressie", return_counts=True, sampling_size=min(n, VARIO_SAMPLING_SIZE),
-                                  sampling_seed=0)
-
-        # drop bins with too few pairs (noisy) and empty bins (gamma = 0 would divide by zero in the weights)
-        valid = (counts >= VARIO_MIN_PAIRS) & (gamma > 0)
-        bin_center, gamma, counts = bin_center[valid], gamma[valid], counts[valid]
-
-        # Cressie (1985) weights N(h)/gamma(h)^2, with the empirical gamma. gstools squares the weights internally
-        # (sigma = 1/weights in scipy's curve_fit), hence the root
-        weights = np.sqrt(counts) / gamma
-
-        # fit every candidate model with nugget and keep (r2, model); r2 is computed on the bins
-        fits = []
-        for model in [gs.Exponential, gs.Spherical, gs.Gaussian]:
-            x = model(dim=2, latlon=True, geo_scale=gs.KM_SCALE * 1000)
-            # upper bound of the range, otherwise variograms that keep rising (trend) end at absurd ranges
-            x.len_scale_bounds = [0, VARIO_LEN_FACTOR * max_dist_to_q]
-            _, _, r2 = x.fit_variogram(bin_center, gamma, nugget=True, weights=weights, max_eval=100000, return_r2=True)
-            fits.append((r2, x))
-
-        # the best model by r2 is used for the kriging, its parameters go to the report
-        best_r2, best_model = max(fits, key=lambda t: t[0])
-
-        variograms[(region, orbit)] = best_model
-        vario_log.append({"region": region, "orbit": orbit, "n": n, "n_bins_kept": len(gamma),
-                          "max_dist_to_q": max_dist_to_q, "model name": type(best_model).__name__,
-                          "best model nugget": best_model.nugget, "best model var": best_model.var,
-                          "best model len_scale": best_model.len_scale, "best R2": best_r2})
-
-    return variograms, vario_log
-
-
-def o_kriging(pool, idx, q, variograms):
-    """
-    Predicts the query's velocity by ordinary kriging from all visible points of the same dev graph (baseline), with
-    the fitted variogram of the pool's region x orbit. exact=False treats the nugget as measurement noise, so the
-    kriging variance includes it and sigma is comparable to the GNN's.
-
-    Arguments:
-        pool -- dict, the pool (see load_pools)
-        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
-        q -- int, position of the query within idx
-        variograms -- dict, (region, orbit) -> fitted gstools model (see compute_variograms)
-
-    Returns:
-        mu -- float, the predicted velocity (mm/yr)
-        sigma -- float, the kriging standard deviation (mm/yr)
-    """
-
-    # the variogram of the pool's region and orbit
-    model = variograms[(pool["region"], pool["orbit"])]
-
-    # the visible points: the subset without the query
-    lat = np.delete(pool["lat"][idx], q)
-    lon = np.delete(pool["lon"][idx], q)
-    vel = np.delete(pool["vel"][idx], q)
-
-    # the query's position
-    lat_q, lon_q = pool["lat"][idx][q], pool["lon"][idx][q]
-
-    # kriging system of the visible points; positions as (lat, lon) because the model has latlon=True
-    krig = gs.krige.Ordinary(model, cond_pos=(lat, lon), cond_val=vel, exact=False)
-    # mean and variance at the query (positions as arrays, also for a single point; store=False keeps no field)
-    mu, var = krig((np.array([lat_q]), np.array([lon_q])), return_var=True, store=False)
-
-    # the variance can be slightly negative from rounding, hence the max
-    return float(mu[0]), float(np.sqrt(max(var[0], 0.0)))
-
-
-def evaluate_baselines(dev_ds, k_graph):
-    """
-    Predicts every dev query with the baselines, each from exactly the visible points of the GNN's dev graph (same
-    subset and query, see PoolDataset.draw_subset_method). Runs once per run, the baselines don't depend on the model.
-
-    Arguments:
-        dev_ds -- PoolDataset, the dev dataset (fixed_draws=True)
-        k_graph -- int, number of nearest visible points of the neighbour mean
-
-    Returns:
-        baselines -- polars.DataFrame, one row per dev graph in pool order (= the order of the unshuffled dev loader):
-            region, orbit, y_mm and one column per baseline (mm/yr): neighbour_mean, idw_1, idw_2, ok_mu and the
-            kriging standard deviation ok_sigma
-        vario_log -- list of dicts, the fitted variograms per region x orbit (see compute_variograms)
-    """
-
-    # list to capture the comparisons
-    results = []
-
-    # one variogram per dev region x orbit, fitted once before the loop (never per query)
-    variograms, vario_log = compute_variograms(dev_ds)
-
-    # len applied to dev_ds calls the method __len__ of that object; we iterate over every graph of the dev set in pool
-    # order 0 ... n-1, the order in which the dev loader (shuffle=False) gives them to the GNN. The raw values of the
-    # draw are used here, not the Data object (that only holds normalized features and no coordinates)
-    for i in range(len(dev_ds)):
-        pool, idx, q = dev_ds.draw_subset_method(i)
-        # kriging gives a mean and a standard deviation
-        ok_mu, ok_sigma = o_kriging(pool, idx, q, variograms)
-        # one row per graph: the true value of the query and the prediction of every baseline
-        results_per_graph = {"region": pool["region"], "orbit": pool["orbit"],
-                             "y_mm": pool["vel"][idx][q], "neighbour_mean": neighbour_mean(pool, idx, q, k_graph),
-                             "ok_mu": ok_mu, "ok_sigma": ok_sigma,
-                             "idw_1": idw(pool, idx, q, 1), "idw_2": idw(pool, idx, q, 2)}
-
-        results.append(results_per_graph)
-    # a dataframe built from the list of dicts, one row per graph
-    return pl.DataFrame(results), vario_log
-
-
-def per_group_metrics(dev_predictions, pred_col, group_col=None, sigma_col=None):
-    """
-    Computes n, RMSE and MAE of one prediction column against y_mm, overall or per group, and the share inside
-    pred ± 1.645 sigma if a sigma column is given.
-
-    Arguments:
-        dev_predictions -- polars.DataFrame, one row per dev query with y_mm and the prediction columns
-            (see evaluate_on_dev)
-        pred_col -- str, the prediction column (mu_mm, idw_1, ...)
-        group_col -- str or None, column to group by (region, orbit); None = one row over all queries
-        sigma_col -- str or None, the predicted standard deviation (so far only the GNN has one)
-
-    Returns:
-        metrics -- list of dicts: one per group (sorted by the group), or a list with one dict without grouping
-    """
-
-    # the error as a polars expression, computed per row once it is used in select or agg
-    err = pl.col(pred_col) - pl.col("y_mm")
-    # a list of expressions for accuracy metrics
-    metrics_recipes = [pl.len().alias("n"), (err ** 2).mean().sqrt().alias("rmse"), err.abs().mean().alias("mae")]
-
-    if sigma_col is not None:
-        # <= comparison yields True or False. The mean of that yields the share of True, so how many are in interval
-        metrics_recipes.append((err.abs() <= (1.645 * pl.col(sigma_col))).mean().alias("inside_90"))
-
-    # agg applies the expressions per group (sorted, group_by has no fixed order); select applies them to the whole
-    # table and gives one row
-    if group_col is not None:
-        metrics = dev_predictions.group_by(group_col).agg(metrics_recipes).sort(group_col)
-    else:
-        metrics = dev_predictions.select(metrics_recipes)
-
-    return metrics.to_dicts()
-
-    
-################################################
-#======= Section 5: Markdown Log Helper =======#
-################################################
-# Used at the end of a run, for the step's part of the markdown log (see s01.write_md_log).
-
-def training_summary_md(results):
-    """
-    Builds the s04 part of the markdown log: data, training (epochs, best epoch, checkpoint), train vs dev metrics,
-    the dev metrics per region and orbit, the comparison with the baselines on dev and the fitted kriging variograms,
-    plus the loss curves as figure.
-
-    Arguments:
-        results -- dict, returned by main
-
-    Returns:
-        body -- str, markdown
-        figures -- dict, {"loss_curves": matplotlib.figure.Figure} (see xx.plot_loss_curves)
-    """
-    history, metrics = results["history"], results["metrics"]
-
-    # rounds the floats of a metrics row, so the tables stay readable (names and counts stay as they are)
-    def rounded(row):
-        return {k: round(v, 3) if isinstance(v, float) else v for k, v in row.items()}
-
-    body = "\n\n".join([
-        "## Data",
-        s01.table_to_md([{"train pools": results["n_train_pools"], "dev pools": results["n_dev_pools"],
-                          "GSE": "on" if results["use_gse"] else "off", "node features": results["n_node_features"]}]),
-        "## Training",
-        s01.table_to_md([{"epochs run": len(history), "best epoch": results["best_epoch"],
-                          "stopped": "early" if len(history) < results["max_epochs"] else "at max_epochs",
-                          "checkpoint": results["checkpoint_path"]}]),
-        # train vs dev shows the generalisation gap
-        "## Metrics, train vs dev",
-        "NLL in normalized units, RMSE and MAE in mm/yr, inside_90 = share of queries inside mu ± 1.645 sigma.",
-        s01.table_to_md([{"set": name, **rounded(metrics[name])} for name in ["train", "dev"]]),
-        "## Dev per region",
-        s01.table_to_md([rounded(r) for r in metrics["dev_per_region"]]),
-        "## Dev per orbit",
-        s01.table_to_md([rounded(r) for r in metrics["dev_per_orbit"]]),
-        # the GNN against the baselines on exactly the same dev graphs
-        "## Baselines on dev",
-        "All methods on the same dev graphs (same visible points and query). IDW1/IDW2 = inverse distance weighting "
-        "with power 1/2 over all visible points (distances below 1 m clipped), Neighbour Mean = mean of the k_graph "
-        "nearest visible points, Ordinary Kriging = ordinary kriging of all visible points with the variogram of the "
-        "query's region x orbit (see below). RMSE and MAE in mm/yr; inside_90 only for the methods with an uncertainty "
-        "(GNN and Ordinary Kriging, mu ± 1.645 sigma).",
-        s01.table_to_md([rounded(r) for r in metrics["baselines_overall"]]),
-        "### RMSE per region",
-        s01.table_to_md([rounded(r) for r in metrics["baselines_rmse_per_region"]]),
-        "### MAE per region",
-        s01.table_to_md([rounded(r) for r in metrics["baselines_mae_per_region"]]),
-        # the fitted variograms, so every kriging result can be traced back to its model
-        "### Variograms of the ordinary kriging, per dev region × orbit",
-        f"Fitted once per region × orbit on all dev pool points minus the dev queries (at most {VARIO_SAMPLING_SIZE} sampled points). "
-        f"Empirical semivariance with the Cressie-Hawkins estimator in {VARIO_N_BINS} bins from 0 to the largest lag "
-        f"max_dist_to_q (the {VARIO_PERCENTILE}th percentile of the query distances × {VARIO_LAG_FACTOR}, geometric "
-        f"spacing from {VARIO_FIRST_EDGE_M} m), bins with fewer than {VARIO_MIN_PAIRS} pairs dropped; weighted least "
-        f"squares fit with the Cressie (1985) weights, best of Exponential, Spherical and Gaussian (with nugget, range at most {VARIO_LEN_FACTOR} × max_dist_to_q) by r². "
-        f"Nugget and var (partial sill) in mm²/yr², len_scale and max_dist_to_q in m.",
-        s01.table_to_md([rounded(r) for r in metrics["Kriging log"]]),
-    ])
-
-    # train and dev loss per epoch, best epoch marked
-    figures = {"loss_curves": xx.plot_loss_curves(history)}
-
-    return body, figures
 
 
 ##############################################################################
@@ -1262,25 +908,20 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
     return history, best_epoch
 
 
-def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_graph):
+def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device):
     """
-    Reloads the best checkpoint and evaluates it on train and dev, on dev per region and per orbit, and compares it
-    with the baselines on exactly the same dev graphs.
+    Reloads the best checkpoint and evaluates it on train and dev. The comparison with the baselines, the metrics per
+    region and orbit and the report are done afterwards on the CPU by s04b_baseline_comparison.
 
     Arguments:
         model -- InSARGNN, its weights are replaced by the checkpoint's
         checkpoint_path -- Path, the best checkpoint (see train_model)
         train_loader, dev_loader -- DataLoader
         device -- str, "cuda" or "cpu"
-        k_graph -- int, number of nearest visible points of the neighbour mean baseline
 
     Returns:
-        metrics -- dict with
-            train, dev -- dicts, see evaluate
-            dev_per_region, dev_per_orbit -- lists of dicts, the GNN's n, rmse, mae, inside_90 per group
-            baselines_overall -- list of dicts, one per method: method, n, rmse, mae (inside_90 with a sigma)
-            baselines_rmse_per_region, baselines_mae_per_region -- lists of dicts, one per region, one column per method
-            Kriging log -- list of dicts, the fitted variograms per dev region x orbit (see compute_variograms)
+        train_metrics, dev_metrics -- dicts with nll, rmse, mae and inside_90 (see evaluate)
+        dev_predictions -- polars.DataFrame, one row per dev query (see evaluate), saved for s04b
     """
 
     # loads the best checkpoint not the last one
@@ -1291,45 +932,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_
     train_metrics, _ = evaluate(model, train_loader, device)
     dev_metrics, dev_predictions = evaluate(model, dev_loader, device)
 
-    # the baselines on all dev graphs, from the raw values of the same draws (once per run, not per epoch)
-    baseline_df, vario_log = evaluate_baselines(dev_loader.dataset, k_graph)
-
-    # same true values row by row = same graphs in the same order; otherwise the comparison is meaningless.
-    # The tolerance covers the float32 round trip (normalize -> de-normalize) of the GNN's y_mm
-    if not np.allclose(dev_predictions["y_mm"], baseline_df["y_mm"], atol=1e-2):
-        raise ValueError("The y_mm columns of the GNN and the baselines differ: different dev graphs or order.")
-
-    # GNN and baseline predictions side by side, one row per dev query (strict: both tables must have the same height)
-    dev_predictions = pl.concat([dev_predictions, baseline_df.select(["idw_1", "idw_2", "ok_mu", "ok_sigma", "neighbour_mean"])],
-                                how="horizontal", strict=True)
-
-    # the compared methods: display name -> (prediction column, sigma column or None). The GNN comes first, so the
-    # report tables take their columns (incl. inside_90) from its row (s01.table_to_md uses the keys of the first row)
-    result_recipe = {"GNN": ("mu_mm", "sigma_mm"),
-                     "IDW1": ("idw_1", None),
-                     "IDW2": ("idw_2", None),
-                     "Neighbour Mean": ("neighbour_mean", None),
-                     "Ordinary Kriging": ("ok_mu", "ok_sigma")}
-
-    # overall: one row per method
-    baselines_overall = [{"method": name, **per_group_metrics(dev_predictions, pred_col, None, sigma_col)[0]}
-                         for name, (pred_col, sigma_col) in result_recipe.items()]
-
-    # per region: first one row per method and region (long), then one row per region with one column per method (wide)
-    per_region_long = pl.DataFrame([{"method": name, **row}
-                                    for name, (pred_col, sigma_col) in result_recipe.items()
-                                    for row in per_group_metrics(dev_predictions, pred_col, "region", sigma_col)])
-    
-    rmse_per_region = per_region_long.pivot(on="method", index="region", values="rmse").to_dicts()
-    mae_per_region = per_region_long.pivot(on="method", index="region", values="mae").to_dicts()
-
-    return {"train": train_metrics, "dev": dev_metrics,
-            "dev_per_region": per_group_metrics(dev_predictions, "mu_mm", "region", "sigma_mm"),
-            "dev_per_orbit": per_group_metrics(dev_predictions, "mu_mm", "orbit", "sigma_mm"),
-            "baselines_overall": baselines_overall,
-            "baselines_rmse_per_region": rmse_per_region,
-            "baselines_mae_per_region": mae_per_region,
-            "Kriging log": vario_log}
+    return train_metrics, dev_metrics, dev_predictions
 
 ##############################################################################
 #============================================================================#
@@ -1342,21 +945,24 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
          lr, weight_decay, batch_size, max_epochs, patience, grad_clip, beta,
          seed, num_workers, run_name):
     """
-    Trains one model with one hyperparameter setting and evaluates it on dev; one run of the hyperparameter search
-    (one SLURM array task) or a single run.
+    Trains one model with one hyperparameter setting and evaluates the best checkpoint on train and dev; one run of the
+    hyperparameter search (one SLURM array task) or a single run. Writes the files for the evaluation on the CPU
+    (s04b_baseline_comparison: baselines, metrics per region and orbit, report) into the run folder.
 
     Arguments:
         project_dir -- str, project root, the weights go to <project_dir>/checkpoints/<run_name>/
         use_gse, n_graphs, k_graph, subset_min, subset_max, min_graph_size -- data arguments (see the argparse help)
         hidden_dim, n_layers, heads, dropout -- model arguments
-        lr, weight_decay, batch_size, max_epochs, patience, grad_clip -- training arguments
+        lr, weight_decay, batch_size, max_epochs, patience, grad_clip, beta -- training arguments
         seed -- int, run seed
         num_workers -- int, DataLoader worker processes
         run_name -- str or None, name of the run (None = timestamp)
 
     Returns:
-        results -- dict for the markdown log: dataset sizes, history, best epoch, checkpoint path, metrics,
-            use_gse, n_node_features, max_epochs
+        run_dir -- Path, the run folder <project_dir>/checkpoints/<run_name> with the four files s04b reads:
+            best_model.pt (weights and all settings in params), dev_predictions.parquet (the GNN's dev predictions,
+            one row per query), history.json (loss per epoch) and metrics.json (train and dev metrics, best epoch,
+            pool counts, number of node features)
     """
     
     # Setting the global seed eg. for weight initialization
@@ -1398,13 +1004,20 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
     history, best_epoch = train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, patience, grad_clip,
                                       device, checkpoint_path, params, beta)
 
-    # Reload the best checkpoint and evaluate it on train and dev (overall, per dev region and orbit), and compare it
-    # with the baselines on the same dev graphs
-    metrics = evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device, k_graph)
+    # Reload the best checkpoint and evaluate it on train and dev
+    train_metrics, dev_metrics, dev_predictions = evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device)
 
-    return {"n_train_pools": len(train_ds), "n_dev_pools": len(dev_ds), "history": history,
-            "best_epoch": best_epoch, "checkpoint_path": checkpoint_path, "metrics": metrics,
-            "use_gse": use_gse, "n_node_features": n_node_features, "max_epochs": max_epochs}
+    # everything s04b needs goes next to the checkpoint: dev predictions per query, loss per epoch, summary metrics
+    run_dir = checkpoint_path.parent
+    dev_predictions.write_parquet(run_dir / "dev_predictions.parquet")
+    with open(run_dir / "history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    with open(run_dir / "metrics.json", "w") as f:
+        json.dump({"train": train_metrics, "dev": dev_metrics, "best_epoch": best_epoch,
+                   "n_train_pools": len(train_ds), "n_dev_pools": len(dev_ds),
+                   "n_node_features": n_node_features}, f, indent=2)
+
+    return run_dir
 
 
 if __name__ == '__main__':
@@ -1471,9 +1084,5 @@ if __name__ == '__main__':
     if args.hidden_dim % args.heads != 0:
         parser.error("--hidden-dim must be divisible by --heads")
 
-    start = datetime.now()
-    results = main(**vars(args))
-
-    # the markdown log of the run, written only if the run got this far
-    body, figures = training_summary_md(results)
-    s01.write_md_log("s04_train_model", start, vars(args), body=body, figures=figures)
+    run_dir = main(**vars(args))
+    print(f"training finished, files for s04b in {run_dir}", flush=True)
