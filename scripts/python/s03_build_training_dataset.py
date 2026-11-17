@@ -944,10 +944,8 @@ def main(k_nearest, density, min_dist_seeds, buffer_m, max_dist,
 
     # Saving the parameterization of the graph generation for inclusion in the training report.
     data_dir = Path(study_areas_gdf["region_path"].dropna().iloc[0]).parents[1]   # .../LOSTInPLACE/data
-    with open(data_dir / "s03_params.json", "w") as f:
-        json.dump({**vars(args), "created": start.isoformat()}, f, indent=2)
 
-    return study_areas_gdf, log
+    return study_areas_gdf, log, data_dir
 
 
 if __name__ == '__main__':
@@ -988,10 +986,13 @@ if __name__ == '__main__':
         parser.error("--density must be in (0, 1]")
 
     start = datetime.now()
-    study_areas_gdf, log = main(args.k_nearest, args.density, args.min_dist_seeds, args.buffer_m, args.max_dist,
+    study_areas_gdf, log, data_dir = main(args.k_nearest, args.density, args.min_dist_seeds, args.buffer_m, args.max_dist,
                                 args.mu_mu_dist, args.sigma_mu_dist, args.mu_sigma_dist, args.sigma_sigma_dist,
                                 args.min_dist_pool, args.tolerance, args.max_tries)
 
+    with open(data_dir / "s03_params.json", "w") as f:
+            json.dump({**vars(args), "created": start.isoformat()}, f, indent=2)
+            
     # the markdown log of the run, written only if the run got this far
     s01.write_md_log("s03_build_training_dataset", start, vars(args),
                      body=training_summary_md(study_areas_gdf, log, args.k_nearest, args.density))

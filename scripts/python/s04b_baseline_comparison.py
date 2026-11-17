@@ -4,7 +4,8 @@
 """
 Evaluation of trained s04 runs on dev, on the CPU after the GPU training: the baselines (IDW, neighbour mean, ordinary
 kriging) on exactly the same dev graphs as the GNN, cached once per dataset and recomputed only if the dev data or the
-settings changed, GNN vs baselines per region and orbit, and one markdown report for one run or all runs of a grid.
+settings changed, GNN vs baselines overall, per region, per velocity and per distance range, the graph statistics of
+train and dev, and one markdown report for one run or all runs of a grid.
 Run via scripts/slurm/submit_train_eval.sh (after s04) or scripts/slurm/04b_baseline_comparison.slurm.
 """
 
@@ -70,7 +71,81 @@ RESULT_RECIPE = {"GNN": ("mu_mm", "sigma_mm"),
 ################################################
 #========= Section 1: Baseline Helpers ========#
 ################################################
-# Used by evaluate_baselines (moved from s04): the baselines on the dev graphs (project.md §7.5).
+
+
+def graph_stats(pool, idx, q):
+    """
+    Describes one drawn graph: its size and connectivity, the distances from the query to the visible points and the
+    velocities of the visible points around the query. The keys are the columns xx.GRAPH_STAT_LABELS expects
+    (graph-statistics and win-rate figures).
+
+    Arguments:
+        pool -- dict, the pool (see load_pools)
+        idx -- numpy int array (m,), positions of the subset's points in the pool (see PoolDataset.draw_subset_method)
+        q -- int, position of the query within idx
+
+    Returns:
+        stats -- dict: n_nodes, mean_degree, q_degree (number of edges into the query), span_m (largest distance in the
+            graph), q_nn_m / q_median_m (nearest / median distance query -> visible points), edge_median_m (median edge
+            length), query_vel, query_abs_vel, vel_std / vel_range (std / range of the visible velocities) and
+            q_dev_from_mean (|query velocity - mean of the visible velocities|); distances in m, velocities in mm/yr
+    """
+    # the same distances and the same Delaunay graph the GNN gets (s04.build_graph)
+    dist, _ = s04.pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
+    edges = s04.delaunay_edges(pool["x"][idx], pool["y"][idx]).numpy()     # every edge in both directions
+    # positions of the visible points (all but the query), their raw velocities and their distances to the query
+    vis = np.delete(np.arange(len(idx)), q)
+    v, d_q = pool["vel"][idx], dist[q, vis]
+    # every edge is stored in both directions, so n_edges / n_nodes is the mean degree and the edges ending in q are
+    # the query's degree. For train this is one draw per pool, not every graph the model sees over the epochs (the
+    # subset is redrawn every epoch), but the redraws come from the same pool and settings, so the distributions match
+    return {"n_nodes": len(idx), "mean_degree": edges.shape[1] / len(idx), "q_degree": int((edges[1] == q).sum()),
+        "span_m": dist.max(), "q_nn_m": d_q.min(), "q_median_m": np.median(d_q),
+        "edge_median_m": np.median(dist[edges[0], edges[1]]),
+        "query_vel": float(v[q]), "query_abs_vel": abs(float(v[q])), "vel_std": float(v[vis].std()),
+        "vel_range": float(np.ptp(v[vis])), "q_dev_from_mean": abs(float(v[q] - v[vis].mean()))}
+
+
+def train_graph_stats(settings, seed, cache_dir, n=20000):
+    """
+    Graph statistics of the train set for the comparison with dev: n randomly sampled train pools, each drawn once
+    like in the first training epoch. Cached like the baselines and recomputed only if the train data or the settings
+    changed.
+
+    Arguments:
+        settings -- dict, the draw settings (DRAW_KEYS) of the evaluated runs
+        seed -- int, seed of the pool sample and of the draws (the seed of the first evaluated run)
+        cache_dir -- Path, folder of the cache (the train data folder)
+        n -- int, number of sampled train pools
+
+    Returns:
+        stats -- polars.DataFrame, one row per sampled pool with the columns of graph_stats
+    """
+    # the train GRAPH files in the order s04 uses them, and the fingerprint of everything the statistics depend on
+    train_files = train_dev_graph_files(0)
+    parquet_path, meta_path = cache_dir / "train_graph_stats.parquet", cache_dir / "train_graph_stats.json"
+    fingerprint = dataset_fingerprint(train_files, {**settings, "seed": seed, "n": n})
+
+    # same fingerprint = same train data and settings, the cached statistics are still valid
+    if parquet_path.exists() and meta_path.exists():
+            meta = json.load(open(meta_path))
+            if meta["fingerprint"] == fingerprint:
+                print("train graph stats loaded from cache", flush=True)
+                return pl.read_parquet(parquet_path)
+
+    print("train graph stats computed (no cache, or train data or settings changed)", flush=True)
+    # n sampled pools, drawn like in s04's training (fixed_draws=False, epoch 0); no GSE and no normalization needed
+    index = s04.sample_pools(s04.build_pool_index(train_files), n, seed)
+    ds = s04.PoolDataset(s04.load_pools(index, False, settings["min_graph_size"]), None, settings["k_graph"],
+                         settings["subset_min"], settings["subset_max"], settings["min_graph_size"], False, seed=seed)
+
+    # one row per pool, and the cache with its fingerprint next to it
+    stats = pl.DataFrame([graph_stats(*ds.draw_subset_method(i)) for i in range(len(ds))])
+    stats.write_parquet(parquet_path)
+    with open(meta_path, "w") as f:
+        json.dump({"fingerprint": fingerprint, "created": datetime.now().isoformat()}, f, indent=2)
+    return stats
+
 
 def idw(pool, idx, q, power):
     """
@@ -276,7 +351,7 @@ def evaluate_baselines(dev_ds, k_graph):
     Returns:
         baselines -- polars.DataFrame, one row per dev graph in pool order: region, orbit, the query key graph_file and
             seed_pid (for the join with the GNN's predictions), y_mm and one column per baseline (mm/yr): neighbour_mean, idw_1, idw_2, ok_mu and the
-            kriging standard deviation ok_sigma
+            kriging standard deviation ok_sigma, plus the graph statistics of the dev graph (see graph_stats)
         vario_log -- list of dicts, the fitted variograms per region x orbit (see compute_variograms)
     """
 
@@ -298,7 +373,8 @@ def evaluate_baselines(dev_ds, k_graph):
                              "graph_file": pool["graph_file"], "seed_pid": pool["seed_pid"],
                              "y_mm": pool["vel"][idx][q], "neighbour_mean": neighbour_mean(pool, idx, q, k_graph),
                              "ok_mu": ok_mu, "ok_sigma": ok_sigma,
-                             "idw_1": idw(pool, idx, q, 1), "idw_2": idw(pool, idx, q, 2)}
+                             "idw_1": idw(pool, idx, q, 1), "idw_2": idw(pool, idx, q, 2),
+                             **graph_stats(pool, idx, q)}
 
         results.append(results_per_graph)
     # a dataframe built from the list of dicts, one row per graph
@@ -336,29 +412,31 @@ def load_run(run_dir):
             "metrics": json.load(open(run_dir / "metrics.json"))}
 
 
-def dev_graph_files():
+def train_dev_graph_files(set):
     """
-    Lists the dev GRAPH files from the region table, in exactly the same order as s04.build_datasets: the dev draws
-    depend on the order of the pools and that comes from the order of the files, so this list must not be sorted.
+    Lists the train or dev GRAPH files from the region table, in exactly the same order as s04.build_datasets: the
+    draws depend on the order of the pools and that comes from the order of the files, so this list must not be sorted.
 
     Arguments:
-        None -- reads the region table (s01.study_areas_io)
+        set -- int, the set column of the region table: 0 = train, 1 = dev
 
     Returns:
-        dev_files -- list of str, the dev GRAPH files
+        graph_files -- list of str, the GRAPH files of that set
     """
     gdf = s01.study_areas_io("read", base_path=Path(__file__).parent / "../../assets/study_areas_gdf")
-    return [f for files in gdf.loc[gdf["set"] == 1, "graph_file_list"] if files for f in files]
+    return [f for files in gdf.loc[gdf["set"] == set, "graph_file_list"] if files for f in files]
 
 
 def dataset_fingerprint(dev_files, settings):
     """
-    A hash of everything the baselines depend on: the dev files (path, size, modification time, so a rerun of s03
-    changes it), the draw settings, the graph construction and the variogram settings.
+    A hash of everything a cache depends on: the GRAPH files (path, size, modification time, so a rerun of s03
+    changes it), the draw settings, the graph construction, the variogram settings and the version of the graph
+    statistics (raise "graph_stats" whenever graph_stats changes, so both caches are recomputed). Used for the
+    baselines (dev files) and the train graph statistics (train files).
 
     Arguments:
-        dev_files -- list of str, the dev GRAPH files (see dev_graph_files)
-        settings -- dict, the draw settings (DRAW_KEYS) of the evaluated runs
+        dev_files -- list of str, the GRAPH files (see train_dev_graph_files)
+        settings -- dict, the draw settings (DRAW_KEYS) of the evaluated runs (for the train statistics plus seed and n)
 
     Returns:
         fingerprint -- str, SHA-256 hex digest
@@ -367,7 +445,9 @@ def dataset_fingerprint(dev_files, settings):
                "settings": settings,
                "graph": "delaunay",
                "vario": [VARIO_PERCENTILE, VARIO_LAG_FACTOR, VARIO_FIRST_EDGE_M, VARIO_N_BINS, VARIO_MIN_PAIRS,
-                         VARIO_SAMPLING_SIZE, VARIO_LEN_FACTOR]}
+                         VARIO_SAMPLING_SIZE, VARIO_LEN_FACTOR],
+                "graph_stats": 1}
+    
     # sort_keys: the same content always gives the same text and so the same hash
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
@@ -416,39 +496,95 @@ def load_or_compute_baselines(dev_files, settings, cache_dir):
 ################################################
 # Used by compare_run.
 
+def rmse_diff_ci(err_a, err_b, n_boot=1000, seed=0):
+    """
+    95 % paired bootstrap interval of RMSE(a) - RMSE(b): n_boot times the queries are drawn with replacement, with the
+    same indices for both methods (paired: a hard query stays hard for both, so only the difference varies), and the
+    2.5th and 97.5th percentile of the n_boot differences are returned. The queries are treated as independent; with
+    spatially correlated queries the interval is somewhat too narrow (a block bootstrap over graph files would not be).
+
+    Arguments:
+        err_a, err_b -- numpy arrays (n,), the errors (prediction - truth) of two methods on the same queries
+        n_boot -- int, number of resamples
+        seed -- int, seed of the resampling, so the report is reproducible
+
+    Returns:
+        ci -- numpy array (2,), lower and upper limit in mm/yr; 0 outside the interval = significant difference
+    """
+    rng = np.random.default_rng(seed)
+    # one difference per resample: n indices drawn with replacement, applied to both error arrays
+    d = [np.sqrt(np.mean(err_a[i] ** 2)) - np.sqrt(np.mean(err_b[i] ** 2))
+         for i in (rng.integers(0, len(err_a), len(err_a)) for _ in range(n_boot))]
+    return np.percentile(d, [2.5, 97.5])
+
+
 def per_group_metrics(dev_predictions, pred_col, group_col=None, sigma_col=None):
     """
-    Computes n, RMSE and MAE of one prediction column against y_mm, overall or per group, and the share inside
-    pred ± 1.645 sigma if a sigma column is given.
+    Computes the accuracy metrics of one prediction column against y_mm, overall or per group: n, RMSE, MAE, median
+    absolute error and R² (1 - MSE / variance of y_mm), and with a sigma column the uncertainty metrics: the share
+    inside pred ± z sigma for 50/90/95 %, the median width of the 90 % interval and the Spearman rank correlation of
+    sigma and |error| (does a larger sigma go with a larger error?). Without sigma these keys are None, so every
+    method has the same keys (s01.table_to_md takes its columns from the first row).
 
     Arguments:
         dev_predictions -- polars.DataFrame, one row per dev query with y_mm and the prediction columns
-            (see evaluate_on_dev)
+            (see compare_run)
         pred_col -- str, the prediction column (mu_mm, idw_1, ...)
-        group_col -- str or None, column to group by (region, orbit); None = one row over all queries
-        sigma_col -- str or None, the predicted standard deviation (so far only the GNN has one)
+        group_col -- str, list of str or None, column(s) to group by (region, ["region", "orbit"], abs_vel_bin, ...);
+            None = one row over all queries
+        sigma_col -- str or None, the predicted standard deviation (GNN: sigma_mm, kriging: ok_sigma)
 
     Returns:
         metrics -- list of dicts: one per group (sorted by the group), or a list with one dict without grouping
     """
 
-    # the error as a polars expression, computed per row once it is used in select or agg
+    # the error and the truth as polars expressions, computed per row once they are used in select or agg
     err = pl.col(pred_col) - pl.col("y_mm")
-    # a list of expressions for accuracy metrics
-    metrics_recipes = [pl.len().alias("n"), (err ** 2).mean().sqrt().alias("rmse"), err.abs().mean().alias("mae")]
+    y = pl.col("y_mm")
 
-    if sigma_col is not None:
-        # <= comparison yields True or False. The mean of that yields the share of True, so how many are in interval
-        metrics_recipes.append((err.abs() <= (1.645 * pl.col(sigma_col))).mean().alias("inside_90"))
+    # a list of expressions for the accuracy metrics
+    recipes = [pl.len().alias("n"), (err ** 2).mean().sqrt().alias("rmse"), err.abs().mean().alias("mae"),
+        err.abs().median().alias("median_ae"), (1 - (err ** 2).mean() / ((y - y.mean()) ** 2).mean()).alias("r2")]
+    # the uncertainty metrics; z = the two-sided normal quantile of the level (norm.ppf(0.5 + level / 200))
+    s = pl.col(sigma_col) if sigma_col else None
+    for level, z in [(50, 0.674), (90, 1.645), (95, 1.960)]:
+        recipes.append(((err.abs() <= z * s).mean() if s is not None else pl.lit(None)).alias(f"inside_{level}"))
+    recipes += [((2 * 1.645 * s).median() if s is not None else pl.lit(None)).alias("width_90"),
+            (pl.corr(s, err.abs(), method="spearman") if s is not None else pl.lit(None)).alias("spearman_sigma_err")]
 
     # agg applies the expressions per group (sorted, group_by has no fixed order); select applies them to the whole
     # table and gives one row
     if group_col is not None:
-        metrics = dev_predictions.group_by(group_col).agg(metrics_recipes).sort(group_col)
+        metrics = dev_predictions.group_by(group_col).agg(recipes).sort(group_col)
     else:
-        metrics = dev_predictions.select(metrics_recipes)
+        metrics = dev_predictions.select(recipes)
 
     return metrics.to_dicts()
+
+
+def per_method_table(joined, group_col, values, methods=tuple(RESULT_RECIPE)):
+    """
+    One row per group, one column per method (and metric): e.g. the RMSE of every method per region.
+
+    Arguments:
+        joined -- polars.DataFrame, one row per dev query with all prediction columns (see compare_run)
+        group_col -- str, the column to group by (region, abs_vel_bin, q_nn_bin)
+        values -- str or list of str, the metric(s) from per_group_metrics; one -> columns named by method,
+            several -> columns named <metric>_<method>
+        methods -- tuple of str, the names from RESULT_RECIPE to include (default all)
+
+    Returns:
+        table -- list of dicts, one per group (sorted), with n and the metric columns
+    """
+    # long: one row per method and group
+    long = pl.DataFrame([{"method": m, **row} for m in methods
+                         for row in per_group_metrics(joined, RESULT_RECIPE[m][0], group_col, RESULT_RECIPE[m][1])])
+    # "2-5, 5-10, <2, >10" comes in the report in this weird order because sorting later is alphabetically
+    long = long.with_columns(pl.col(group_col).cast(joined.schema[group_col]))
+    # n is the same for every method, so it's taken once from the first one
+    counts = long.filter(pl.col("method") == methods[0]).select(group_col, "n")
+    # wide: one row per group; sorted at the end because a join doesn't keep the row order
+    return counts.join(long.pivot(on="method", index=group_col, values=values), on=group_col).sort(group_col).to_dicts()
 
 
 ################################################
@@ -456,64 +592,157 @@ def per_group_metrics(dev_predictions, pred_col, group_col=None, sigma_col=None)
 ################################################
 # Used by main.
 
-def report_md(runs, comparisons, vario_log):
+def report_md(runs, comparisons, vario_table, s03_params, train_stats, dev_stats):
     """
-    Builds the s04b markdown log: one summary table of all runs, the baselines once (they are the same for all runs),
-    the fitted variograms, and per run the train vs dev metrics, the errors per region and orbit and the loss curves.
+    Builds the s04b markdown report: the settings of s04 (one column per run) and s03, the dataset sizes, the graph
+    statistics of train vs dev, one overview of the GNN of every run and the baselines, per run the training info,
+    train vs dev, the tables per region, velocity and distance range and the figures (each in its own section with a
+    short description, placed via s01.figure_marker), and the variograms in the appendix.
 
     Arguments:
         runs -- list of dicts, the evaluated runs (see load_run)
         comparisons -- list of dicts, one per run in the same order (see compare_run)
-        vario_log -- list of dicts, the fitted variograms (see compute_variograms)
+        vario_table -- list of dicts, the fitted variograms with the kriging errors per region x orbit (see main)
+        s03_params -- dict, the arguments of the last s03 run (data/s03_params.json)
+        train_stats -- polars.DataFrame, the train graph statistics (see train_graph_stats)
+        dev_stats -- polars.DataFrame, the dev graph statistics, one row per dev query (the baselines, see
+            evaluate_baselines)
 
     Returns:
         body -- str, markdown
-        figures -- dict, {"loss_curves_<run>": matplotlib.figure.Figure} (see xx.plot_loss_curves)
+        figures -- dict, {name: matplotlib.figure.Figure}: graph_stats once, and per run loss_curves_<run>,
+            pred_vs_true_<run>, calibration_<run> and win_rate_<run> (see xx_plotting)
     """
-    # rounds the floats of a metrics row, so the tables stay readable (names and counts stay as they are)
+    # rounds the floats of a metrics row, so the tables stay readable (names, counts and texts stay as they are)
     def rounded(row):
         return {k: round(v, 3) if isinstance(v, float) else v for k, v in row.items()}
+    parts, figures = [], {}
 
-    # one row per run: the main hyperparameters and the dev metrics
-    summary = [{"run": r["name"], "GSE": r["params"]["use_gse"], "layers": r["params"]["n_layers"],
-                "hidden": r["params"]["hidden_dim"], "lr": f'{r["params"]["lr"]:g}',   # as text, rounding to 3 decimals would make 3e-4 a 0.0
-                "beta": r["params"].get("beta", 0.0),
-                "epochs": len(r["history"]), "best epoch": r["metrics"]["best_epoch"],
-                **{f"dev {k}": v for k, v in r["metrics"]["dev"].items()}} for r in runs]
-    # the baselines are the same for every run, so they are taken from the first one
-    baselines_overall = [row for row in comparisons[0]["overall"] if row["method"] != "GNN"]
+    # a markdown table of rounded rows (used for every table of the report)
+    def table(rows):
+        return s01.table_to_md([rounded(r) for r in rows])
 
-    parts = [
-        "## Runs, dev metrics",
-        "NLL in normalized units, RMSE and MAE in mm/yr, inside_90 = share of queries inside mu ± 1.645 sigma.",
-        s01.table_to_md([rounded(r) for r in summary]),
-        "## Baselines on dev",
-        "All methods on the same dev graphs (same visible points and query). IDW1/IDW2 = inverse distance weighting "
-        "with power 1/2 over all visible points (distances below 1 m clipped), Neighbour Mean = mean of the k_graph "
-        "nearest visible points, Ordinary Kriging = ordinary kriging of all visible points with the variogram of the "
-        "query's region x orbit (see below). RMSE and MAE in mm/yr; inside_90 only for Ordinary Kriging "
-        "(mu ± 1.645 sigma). The GNN of every run is in the tables per run.",
-        s01.table_to_md([rounded(r) for r in baselines_overall]),
-        # the fitted variograms, so every kriging result can be traced back to its model
-        "### Variograms of the ordinary kriging, per dev region × orbit",
-        f"Fitted once per region × orbit on all dev pool points minus the dev queries (at most {VARIO_SAMPLING_SIZE} sampled points). "
-        f"Empirical semivariance with the Cressie-Hawkins estimator in {VARIO_N_BINS} bins from 0 to the largest lag "
-        f"max_dist_to_q (the {VARIO_PERCENTILE}th percentile of the query distances × {VARIO_LAG_FACTOR}, geometric "
-        f"spacing from {VARIO_FIRST_EDGE_M} m), bins with fewer than {VARIO_MIN_PAIRS} pairs dropped; weighted least "
-        f"squares fit with the Cressie (1985) weights, best of Exponential, Spherical and Gaussian (with nugget, range at most {VARIO_LEN_FACTOR} × max_dist_to_q) by r². "
-        f"Nugget and var (partial sill) in mm²/yr², len_scale and max_dist_to_q in m.",
-        s01.table_to_md([rounded(r) for r in vario_log]),
-    ]
+    # --- 1. settings: all s04 params, one column per run; the ones that differ between runs (in a grid: the
+    # hyperparameters of the grid) first and in bold. stats = the normalization statistics, not a setting; str() so
+    # that lists and None can be compared in a set
+    keys = [k for k in runs[0]["params"] if k != "stats"]
+    varying = [k for k in keys if len({str(r["params"].get(k)) for r in runs}) > 1]
+    settings_rows = [{"parameter": f"**{k}**" if k in varying else k, **{r["name"]: r["params"].get(k) for r in runs}}
+                     for k in varying + [k for k in keys if k not in varying]]
+    # the number of pools and node features per run (from metrics.json)
+    sizes = [{"run": r["name"], **{k: r["metrics"].get(k) for k in ("n_train_pools", "n_dev_pools", "n_node_features")}}
+             for r in runs]
+    parts += ["## Settings",
+              "### s04 (training)",
+              "The arguments of every evaluated run, one column per run. Parameters that differ between the runs "
+              "(in a grid: the varied hyperparameters) come first and are bold; with a single run none is bold.",
+              s01.table_to_md(settings_rows),
+              "### s03 (graph pools)",
+              "The arguments of the last s03 run (data/s03_params.json): how the seeds and their pools were built.",
+              s01.params_to_md(s03_params),
+              "### Dataset sizes",
+              "Number of train and dev pools (one graph is drawn per pool and epoch) and node features per point "
+              "(3 without GSE, 67 with).",
+              table(sizes)]
 
-    # per run: train vs dev, GNN and baselines per region, GNN per orbit, loss curves
-    figures = {}
+    # --- 2. graph statistics, train vs dev
+    parts += ["## Graph statistics",
+              f"What the graphs look like: size and connectivity, distances from the query to the visible points and "
+              f"the velocities around the query. Train = one draw (as in epoch 0) of {len(train_stats)} randomly "
+              f"sampled train pools, dev = the {len(dev_stats)} fixed dev graphs of this evaluation. Both are shown "
+              f"as densities, so the different sample sizes compare directly; median, std and n per set are next to "
+              f"each panel. Where the two differ, the dev graphs are unlike what the model was trained on.",
+              s01.figure_marker("graph_stats")]
+    figures["graph_stats"] = xx.plot_graph_stat_distributions(train_stats, dev_stats)
+
+    # --- 3. overview: the GNN of every run, then the baselines once (the same for all runs)
+    # the GNN rows come first, so table_to_md takes all columns (incl. the sigma metrics) from them
+    overview = [{"run": r["name"], **c["overall"][0]} for r, c in zip(runs, comparisons)]
+    overview += [{"run": "-", **row} for row in comparisons[0]["overall"][1:]]
+    parts += ["## Results on dev",
+              "All methods predict the same dev queries from the same visible points: one GNN row per run, the "
+              "baselines once (they don't depend on the run).",
+              "- **Methods:** IDW1/IDW2 = inverse distance weighting with power 1/2 over all visible points (distances "
+              "below 1 m clipped); Neighbour Mean = mean of the k_graph nearest visible points; Ordinary Kriging = "
+              "kriging of all visible points with the variogram of the query's region × orbit (see appendix).\n"
+              "- **Accuracy:** rmse, mae, median_ae in mm/yr; r2 = 1 - MSE / variance of the true velocities.\n"
+              "- **Uncertainty** (only GNN and kriging give a sigma): inside_50/90/95 = share of queries inside "
+              "mu ± z·sigma (ideal 0.50/0.90/0.95; above = intervals too wide, below = too narrow); width_90 = median "
+              "width of the 90 % interval (mm/yr); spearman_sigma_err = rank correlation of sigma and |error| "
+              "(> 0: a larger sigma goes with a larger error).\n"
+              "- **Against kriging:** skill_vs_ok = 1 - RMSE / RMSE_OK (> 0 = lower RMSE than kriging); "
+              "win_rate_vs_ok = share of queries with a smaller |error| than kriging; rmse_diff_ci95 = 95 % paired "
+              "bootstrap interval of RMSE - RMSE_OK (0 outside the interval = significant difference).\n"
+              "- **Note on rmse_diff_ci95:** the bootstrap resamples single queries and so treats them as independent. "
+              "Queries of the same region and GRAPH file are spatially correlated, so the interval is likely somewhat "
+              "too narrow. A block bootstrap (resampling whole GRAPH files instead of queries) would account for this "
+              "and is not implemented yet; treat intervals that barely exclude 0 with care.",
+              table(overview)]
+
+    # --- 4. per run: training, train vs dev, the tables per group and the figures, each with a short description
     for run, comp in zip(runs, comparisons):
-        parts += [f"## Run {run['name']}",
+        h, name, q = run["history"], run["name"], comp["joined"]
+        # .get / the minutes check: older runs without these fields still work
+        info = {"epochs": len(h), "best epoch": run["metrics"]["best_epoch"],
+                "stopped": run["metrics"].get("stopped", "?"),
+                "min/epoch": float(np.mean([e["minutes"] for e in h])) if "minutes" in h[0] else None}
+        parts += [f"## Run {name}",
+                  "### Training",
+                  "Epochs trained, the epoch of the saved checkpoint (lowest dev NLL), why the training stopped "
+                  "(early_stopping or max_epochs) and the mean duration of an epoch incl. the dev evaluation.",
+                  table([info]),
+                  s01.figure_marker(f"loss_curves_{name}"),
+                  "Plain NLL (normalized units) per epoch on train and dev, on the same scale; the dashed line marks "
+                  "the best epoch. The train NLL is averaged during the epoch (dropout on, weights still changing), so "
+                  "it lies slightly above a clean evaluation. Runs older than the train_nll logging show the β-NLL "
+                  "instead, which is not on the same scale.",
+                  "### Train vs dev",
+                  "The saved checkpoint evaluated on the train and the dev graphs (NLL in normalized units, RMSE and "
+                  "MAE in mm/yr). A much better train than dev value means overfitting.",
                   s01.table_to_md([{"set": s, **rounded(run["metrics"][s])} for s in ("train", "dev")]),
-                  "### RMSE per region", s01.table_to_md([rounded(r) for r in comp["rmse_per_region"]]),
-                  "### MAE per region", s01.table_to_md([rounded(r) for r in comp["mae_per_region"]]),
-                  "### GNN per orbit", s01.table_to_md([rounded(r) for r in comp["gnn_per_orbit"]])]
-        figures[f"loss_curves_{run['name']}"] = xx.plot_loss_curves(run["history"])
+                  "### Per region",
+                  "RMSE and MAE (mm/yr) of every method per dev region; n = dev queries of the region. RMSE weights "
+                  "large errors more, so a method can win on MAE and lose on RMSE when it misses a few outliers.",
+                  "**RMSE**", table(comp["rmse_per_region"]),
+                  "**MAE**", table(comp["mae_per_region"]),
+                  "### By true velocity and by distance",
+                  "GNN vs kriging per range of the true |velocity| (mm/yr) and per range of the distance from the query "
+                  "to its nearest visible point (m); n = dev queries in the range.",
+                  "**By |true velocity| (mm/yr)**", table(comp["per_vel_bin"]),
+                  "**By distance query → nearest visible point (m)**", table(comp["per_dist_bin"]),
+                  "### Predicted vs true",
+                  "Predicted vs true velocity of every dev query, GNN and kriging (colour = number of queries, log "
+                  "scale; grey line = perfect prediction). A cloud flatter than the line at large |v| means the method "
+                  "smooths extreme velocities towards the neighbourhood.",
+                  s01.figure_marker(f"pred_vs_true_{name}"),
+                  "### Calibration",
+                  "Share of dev queries inside the predicted interval mu ± z·sigma (observed) against the level the "
+                  "interval is meant to cover (nominal, 5 to 95 %). On the diagonal = honest uncertainty; above = "
+                  "intervals too wide (too cautious), below = too narrow (overconfident).",
+                  s01.figure_marker(f"calibration_{name}"),
+                  "### Win rate by graph statistic",
+                  "Share of dev queries where the GNN's |error| is smaller than kriging's, along each graph statistic "
+                  "(10 bins with equal numbers of queries; shaded = 95 % interval; solid line = 0.5, dashed = overall "
+                  "win rate). Above 0.5 = the GNN wins more often in that range, so weak ranges can be traced back to "
+                  "graph properties.",
+                  s01.figure_marker(f"win_rate_{name}")]
+        figures |= {f"loss_curves_{name}": xx.plot_loss_curves(h),
+                    f"pred_vs_true_{name}": xx.plot_pred_vs_true(q),
+                    f"calibration_{name}": xx.plot_calibration(q),
+                    f"win_rate_{name}": xx.plot_win_rate(q)}
+
+    # --- 5. appendix: the variograms with the kriging accuracy per region x orbit
+    parts += ["## Appendix: variograms of the ordinary kriging, per dev region × orbit",
+              f"The variogram model behind every kriging prediction, with the kriging errors of the dev queries of "
+              f"that group. Fitted once per region × orbit on all dev pool points minus the dev queries (at most "
+              f"{VARIO_SAMPLING_SIZE} sampled points). Empirical semivariance with the Cressie-Hawkins estimator in "
+              f"{VARIO_N_BINS} bins from 0 to the largest lag max_dist_to_q (the {VARIO_PERCENTILE}th percentile of the "
+              f"query distances × {VARIO_LAG_FACTOR}, geometric spacing from {VARIO_FIRST_EDGE_M} m), bins with fewer "
+              f"than {VARIO_MIN_PAIRS} pairs dropped; weighted least squares fit with the Cressie (1985) weights, best "
+              f"of Exponential, Spherical and Gaussian (with nugget, range at most {VARIO_LEN_FACTOR} × max_dist_to_q) "
+              f"by r². Nugget and var (partial sill) in mm²/yr², len_scale and max_dist_to_q in m. ok rmse / ok mae "
+              f"in mm/yr; check = best R² < 0.3 or var ≈ 0 (weak fit: kriging is then close to a plain weighted mean).",
+              table(vario_table)]
 
     return "\n\n".join(parts), figures
 
@@ -534,9 +763,12 @@ def compare_run(run, baselines):
 
     Returns:
         comparison -- dict with
-            overall -- list of dicts, one per method: method, n, rmse, mae (inside_90 with a sigma)
-            rmse_per_region, mae_per_region -- lists of dicts, one per region, one column per method
-            gnn_per_orbit -- list of dicts, the GNN's n, rmse, mae, inside_90 per orbit
+            overall -- list of dicts, one per method: method, the metrics of per_group_metrics and skill_vs_ok,
+                win_rate_vs_ok, rmse_diff_ci95 (None for kriging itself)
+            rmse_per_region, mae_per_region -- lists of dicts, one per region: n and one column per method
+            per_vel_bin, per_dist_bin -- lists of dicts, one per |velocity| / query-nearest-point distance range:
+                n and rmse, mae, inside_90 of GNN and kriging
+            joined -- polars.DataFrame, one row per dev query with all predictions and graph statistics (figures)
     """
     # one row per dev query: the GNN's prediction next to the baselines (region/orbit are in both, kept once)
     joined = run["predictions"].join(baselines.drop("region", "orbit"), on=["graph_file", "seed_pid"],
@@ -549,18 +781,41 @@ def compare_run(run, baselines):
     if not np.allclose(joined["y_mm"], joined["y_mm_baseline"], atol=1e-2):
         raise ValueError(f"{run['name']}: y_mm of GNN and baselines differ, the dev draws are not the same")
 
+    # bins for the tables by velocity and by distance (q_nn_m comes with the baselines, see graph_stats); cut gives an
+    # Enum that sorts in label order
+    joined = joined.with_columns(
+        pl.col("y_mm").abs().cut([2, 5, 10], labels=["<2", "2-5", "5-10", ">10"]).alias("abs_vel_bin"),
+        pl.col("q_nn_m").cut([50, 150, 300], labels=["<50", "50-150", "150-300", ">300"]).alias("q_nn_bin"))
+
     # overall: one row per method
     overall = [{"method": name, **per_group_metrics(joined, pred, None, sigma)[0]}
                for name, (pred, sigma) in RESULT_RECIPE.items()]
 
-    # per region: first one row per method and region (long), then one row per region with one column per method (wide)
-    per_region_long = pl.DataFrame([{"method": name, **row} for name, (pred, sigma) in RESULT_RECIPE.items()
-                                    for row in per_group_metrics(joined, pred, "region", sigma)])
+    # the error per query of every method as a numpy array (same row order for all, needed for the paired bootstrap)
+    err = {name: (joined[pred] - joined["y_mm"]).to_numpy() for name, (pred, _) in RESULT_RECIPE.items()}
 
+    # every method against kriging: skill (1 - RMSE ratio), win rate per query, bootstrap interval of the
+    # RMSE difference; every row gets all three keys so table_to_md doesn't drop them (kriging itself: None)
+    ok = err["Ordinary Kriging"]
+    rmse_ok = np.sqrt(np.mean(ok ** 2))
+    for row in overall:
+        if row["method"] == "Ordinary Kriging":
+            row |= {"skill_vs_ok": None, "win_rate_vs_ok": None, "rmse_diff_ci95": None}
+            continue
+        e = err[row["method"]]
+        lo, hi = rmse_diff_ci(e, ok)
+        row |= {"skill_vs_ok": 1 - np.sqrt(np.mean(e ** 2)) / rmse_ok,
+                "win_rate_vs_ok": float(np.mean(np.abs(e) < np.abs(ok))),
+                "rmse_diff_ci95": f"[{lo:.3f}, {hi:.3f}]"}
+
+    # the tables per group; the bin tables only for GNN vs kriging, all 5 methods x 3 metrics would be 15 columns
+    vs_ok = ("GNN", "Ordinary Kriging")
     return {"overall": overall,
-            "rmse_per_region": per_region_long.pivot(on="method", index="region", values="rmse").to_dicts(),
-            "mae_per_region": per_region_long.pivot(on="method", index="region", values="mae").to_dicts(),
-            "gnn_per_orbit": per_group_metrics(joined, "mu_mm", "orbit", "sigma_mm")}
+            "rmse_per_region": per_method_table(joined, "region", "rmse"),
+            "mae_per_region": per_method_table(joined, "region", "mae"),
+            "per_vel_bin": per_method_table(joined, "abs_vel_bin", ["rmse", "mae", "inside_90"], vs_ok),
+            "per_dist_bin": per_method_table(joined, "q_nn_bin", ["rmse", "mae", "inside_90"], vs_ok),
+            "joined": joined}
 
 
 ##############################################################################
@@ -572,7 +827,8 @@ def compare_run(run, baselines):
 def main(project_dir, runs):
     """
     Evaluates one run or several runs of a grid on dev: loads their s04 files, the (cached) baselines, compares them
-    query by query and builds one report.
+    query by query, adds what is the same for all runs (kriging errors per variogram, s03 settings, train graph
+    statistics) and builds one report.
 
     Arguments:
         project_dir -- str, project root (same as in s01/s04), the runs are in <project_dir>/checkpoints/
@@ -580,7 +836,7 @@ def main(project_dir, runs):
 
     Returns:
         body -- str, markdown of the report
-        figures -- dict, the loss curves per run
+        figures -- dict, the report's figures (see report_md)
     """
     # every run folder matching one of the names or patterns, each only once
     checkpoint_dir = Path(project_dir) / "checkpoints"
@@ -596,10 +852,23 @@ def main(project_dir, runs):
         raise ValueError(f"the runs use different draw settings, evaluate them separately: {settings_per_run}")
 
     # the baselines once for all runs, from the cache in the dev data folder if still valid
-    baselines, vario_log = load_or_compute_baselines(dev_graph_files(), settings, Path(project_dir) / "data" / "dev")
+    baselines, vario_log = load_or_compute_baselines(train_dev_graph_files(1), settings, Path(project_dir) / "data" / "dev")
     comparisons = [compare_run(r, baselines) for r in loaded]
 
-    return report_md(loaded, comparisons, vario_log)
+    # kriging accuracy per region x orbit next to its fitted variogram (appendix table); check flags weak fits
+    ok = pl.DataFrame(per_group_metrics(baselines, "ok_mu", ["region", "orbit"])).select(
+        "region", "orbit", pl.col("rmse").alias("ok rmse"), pl.col("mae").alias("ok mae"))
+    vario_table = (pl.DataFrame(vario_log).join(ok, on=["region", "orbit"], how="left")
+                   .with_columns(((pl.col("best R2") < 0.3) | (pl.col("best model var") < 1e-6)).alias("check"))
+                   .sort("region", "orbit").to_dicts())
+
+    # the s03 settings (written by s03 next to the data) and the train graph statistics (cached in data/train)
+    s03_params = json.load(open(Path(project_dir) / "data" / "s03_params.json"))
+    train_stats = train_graph_stats(settings, loaded[0]["params"]["seed"], Path(project_dir) / "data" / "train")
+
+    # baselines = the dev graph statistics too (one row per dev query, see evaluate_baselines)
+    return report_md(loaded, comparisons, vario_table, s03_params, train_stats, baselines)
+
 
 
 if __name__ == '__main__':

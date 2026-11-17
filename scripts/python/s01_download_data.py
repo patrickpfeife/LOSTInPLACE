@@ -235,13 +235,28 @@ def params_to_md(params):
     return table_to_md([{"parameter": k, "value": v} for k, v in params.items()])
 
 
+def figure_marker(name):
+    """
+    The placeholder a step puts into its markdown body where a figure should appear; write_md_log replaces it with the
+    image link (the figure folder is only known there). An HTML comment, so it is invisible if it is never replaced.
+
+    Arguments:
+        name -- str, the key of the figure in the figures dict passed to write_md_log
+
+    Returns:
+        marker -- str
+    """
+    return f"<!-- figure:{name} -->"
+
+
 def write_md_log(step_name, start, params, body="", figures=None, end=None):
     """
     Writes the markdown log of one run of a step to PARAM_LOG_DIR/<step_name>_<timestamp>.md. Called once at the
     end of a successful run with everything collected during it. Every log starts with the same header: the step,
     start, end and duration of the run and the arguments passed to the script; the step's own body follows.
-    Optional matplotlib figures are saved as png into the subfolder <step_name>_<timestamp>/ and appended to the
-    body as images, with paths relative to the md file.
+    Optional matplotlib figures are saved as png into the subfolder <step_name>_<timestamp>/ and linked as images,
+    with paths relative to the md file: at the place of their marker in the body (figure_marker), or at the end of
+    the body if the body has no marker for them.
 
     Arguments:
         step_name -- str, name of the step, used as title and in the file name (e.g. "s02_preprocessing")
@@ -268,14 +283,21 @@ def write_md_log(step_name, start, params, body="", figures=None, end=None):
     stamp = start.strftime("%Y%m%d_%H%M%S")
     md_path = PARAM_LOG_DIR / f"{step_name}_{stamp}.md"
 
-    # figures go into a subfolder with the same name as the md file, and are linked at the end of the body
+    # figures go into a subfolder with the same name as the md file. A figure whose marker (see figure_marker) is in
+    # the body is linked there, inside its own section; all others are linked at the end of the body
     if figures:
         fig_dir = PARAM_LOG_DIR / f"{step_name}_{stamp}"
         fig_dir.mkdir(parents=True, exist_ok=True)
-        body += "\n\n## Figures\n"
+        unplaced = []
         for name, fig in figures.items():
             fig.savefig(fig_dir / f"{name}.png", dpi=120, bbox_inches="tight")
-            body += f"\n![{name}]({fig_dir.name}/{name}.png)\n"
+            link = f"![{name}]({fig_dir.name}/{name}.png)"
+            if figure_marker(name) in body:
+                body = body.replace(figure_marker(name), link)
+            else:
+                unplaced.append(link)
+        if unplaced:
+            body += "\n\n## Figures\n" + "".join(f"\n{link}\n" for link in unplaced)
 
     md_path.write_text(body + "\n")
     return md_path

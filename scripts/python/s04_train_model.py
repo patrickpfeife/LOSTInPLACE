@@ -677,13 +677,15 @@ def train_one_epoch(model, loader, optimizer, grad_clip, device, beta):
         device -- str, "cuda" or "cpu"
 
     Returns:
-        train_loss -- float, mean loss per graph of the epoch
+        train_loss -- float, mean loss per graph of the epoch (the β-NLL that is optimized)
+        train_nll -- float, mean plain NLL (beta=0) per graph of the epoch, the same quantity as the dev loss, so
+            both curves can be compared on one scale (computed without gradients)
     """
 
     # switch the model to training mode
     model.train()
     # set up counters
-    total_loss, n_graphs = 0.0, 0
+    total_loss, total_nll, n_graphs = 0.0, 0.0, 0
 
     # every batch is moved to the device (the GPU if available)
     for batch in loader:
@@ -697,7 +699,7 @@ def train_one_epoch(model, loader, optimizer, grad_clip, device, beta):
         loss = loss_fn(mu, logvar, batch.y, beta=beta)
 
         # Computing the regular NLL loss for reporting in the .md 
-        with torch.no_grad:
+        with torch.no_grad():
             nll = loss_fn(mu, logvar, batch.y)
 
         total_nll += nll.item() * batch.num_graphs
@@ -887,7 +889,8 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
         params -- dict, saved with the checkpoint (see save_checkpoint)
 
     Returns:
-        history -- list of dicts, one per epoch: epoch, train_loss, dev_loss, dev_rmse
+        history -- list of dicts, one per epoch: epoch, train_loss (β-NLL), train_nll (plain NLL), dev_loss (plain
+            NLL), dev_rmse and minutes (duration of the epoch incl. the dev evaluation)
         best_epoch -- int, the epoch of the saved checkpoint
     """
     
@@ -905,7 +908,7 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
         train_loss, train_nll = train_one_epoch(model, train_loader, optimizer, grad_clip, device, beta)
         dev_metrics, _ = evaluate(model, dev_loader, device)
         history.append({"epoch": epoch, "train_loss": train_loss, "train_nll": train_nll,
-                "dev_loss": dev_metrics["nll"], "dev_rmse": dev_metrics["rmse"], "minutes": (time.perf_counter - t0)/60})
+                "dev_loss": dev_metrics["nll"], "dev_rmse": dev_metrics["rmse"], "minutes": (time.perf_counter() - t0)/60})
         print(history[-1], flush=True)
         if dev_metrics["nll"] < best_loss:
             best_loss, best_epoch = dev_metrics["nll"], epoch
@@ -973,7 +976,7 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
         run_dir -- Path, the run folder <project_dir>/checkpoints/<run_name> with the four files s04b reads:
             best_model.pt (weights and all settings in params), dev_predictions.parquet (the GNN's dev predictions,
             one row per query), history.json (loss per epoch) and metrics.json (train and dev metrics, best epoch,
-            pool counts, number of node features)
+            stop reason (early_stopping or max_epochs), pool counts, number of node features)
     """
     
     # Setting the global seed eg. for weight initialization
@@ -1022,16 +1025,17 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
     # everything s04b needs goes next to the checkpoint: dev predictions per query, loss per epoch, summary metrics
     run_dir = checkpoint_path.parent
     dev_predictions.write_parquet(run_dir / "dev_predictions.parquet")
+
+    # saving the metadata
     with open(run_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
     with open(run_dir / "metrics.json", "w") as f:
         json.dump({"train": train_metrics, "dev": dev_metrics, "best_epoch": best_epoch,
-                   "stopped": "early_stopping" if len(history) < max_epochs else "max_epochs",
-                   "n_train_pools": len(train_ds), "n_dev_pools": len(dev_ds),
-                   "n_node_features": n_node_features}, f, indent=2)
-
+                    "stopped": "early_stopping" if len(history) < max_epochs else "max_epochs",
+                    "n_train_pools": len(train_ds), "n_dev_pools": len(dev_ds),
+                    "n_node_features": n_node_features}, f, indent=2)
     return run_dir
-
+    
 
 if __name__ == '__main__':
 
@@ -1098,4 +1102,5 @@ if __name__ == '__main__':
         parser.error("--hidden-dim must be divisible by --heads")
 
     run_dir = main(**vars(args))
+            
     print(f"training finished, files for s04b in {run_dir}", flush=True)
