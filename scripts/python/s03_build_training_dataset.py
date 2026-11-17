@@ -13,6 +13,7 @@ import numpy as np
 import shapely
 import rasterio
 import geopandas as gpd
+import json
 
 import s01_download_data as s01
 import s02_preprocessing as s02
@@ -940,6 +941,11 @@ def main(k_nearest, density, min_dist_seeds, buffer_m, max_dist,
                     min_dist_pool=min_dist_pool, tolerance=tolerance, max_tries=max_tries)
 
     s01.study_areas_io("write", study_areas_gdf, Path(__file__).parent / "../../assets/study_areas_gdf")
+
+    # Saving the parameterization of the graph generation for inclusion in the training report.
+    data_dir = Path(study_areas_gdf["region_path"].dropna().iloc[0]).parents[1]   # .../LOSTInPLACE/data
+    with open(data_dir / "s03_params.json", "w") as f:
+        json.dump({**vars(args), "created": start.isoformat()}, f, indent=2)
 
     return study_areas_gdf, log
 
