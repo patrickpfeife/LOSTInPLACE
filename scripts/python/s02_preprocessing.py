@@ -122,6 +122,8 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
     """
     Keeps only points passing both quality thresholds and only EGMS_KEEP_COLS, written as
     "*_PREPROCESSED.csv" next to each original. Originals stay untouched.
+    Exact duplicates of rows as well as points that are the same but only slighlty differ 
+    in location are removed.
 
     Arguments:
         csvs -- list of Path, original burst csvs
@@ -143,6 +145,12 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
             (pl.col("temporal_coherence") >= egms_coherence) &
             (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
         ).select(EGMS_KEEP_COLS)
+
+        lf = pl.scan_csv(csv, schema_overrides=EGMS_FLOAT_COLS).filter(
+            (pl.col("temporal_coherence") >= egms_coherence) &
+            (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
+        ).select(EGMS_KEEP_COLS).unique(subset="pid", keep="first", maintain_order=True)
+
         lf.sink_csv(out_path)
 
 def compute_norm_stats(study_areas_gdf, egms_coherence, egms_ampdisp_max, stats_path=EGMS_NORM_STATS_PATH):
@@ -560,6 +568,7 @@ def preprocess_esa10mwc(study_areas_gdf):
     study_areas_gdf["wc_merged_path"] = study_areas_gdf.apply(merge_wc_tiles, axis = 1)
 
     return study_areas_gdf
+
 
 ##############################################################################
 #============================================================================#
