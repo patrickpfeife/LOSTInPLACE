@@ -13,6 +13,7 @@ import random
 import numpy as np
 import polars as pl
 import torch
+import time
 import torch.nn as nn
 
 import s01_download_data as s01
@@ -694,6 +695,13 @@ def train_one_epoch(model, loader, optimizer, grad_clip, device, beta):
         # forward pass through the model and comparison with ground truth to compute loss
         mu, logvar = model(batch)
         loss = loss_fn(mu, logvar, batch.y, beta=beta)
+
+        # Computing the regular NLL loss for reporting in the .md 
+        with torch.no_grad:
+            nll = loss_fn(mu, logvar, batch.y)
+
+        total_nll += nll.item() * batch.num_graphs
+
         # backward pass
         loss.backward()
         # gradient clipping stops them from exploding
@@ -706,7 +714,7 @@ def train_one_epoch(model, loader, optimizer, grad_clip, device, beta):
         total_loss += loss.item() * batch.num_graphs
         n_graphs += batch.num_graphs
 
-    return total_loss / n_graphs
+    return total_loss / n_graphs, total_nll / n_graphs
 
 
 def loss_fn(mu, logvar, y, beta=0.0):
@@ -889,12 +897,15 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
     best_loss, best_epoch, epochs_without_improvement, history = float("inf"), None, 0, []
     
     for epoch in range(max_epochs):
+        # Measuring how long the epochs take
+        t0 = time.perf_counter()
+
         # new draws for this epoch (the train draws depend on the run seed, the epoch and the pool, see PoolDataset)
         train_loader.dataset.set_epoch(epoch)
-        train_loss = train_one_epoch(model, train_loader, optimizer, grad_clip, device, beta)
+        train_loss, train_nll = train_one_epoch(model, train_loader, optimizer, grad_clip, device, beta)
         dev_metrics, _ = evaluate(model, dev_loader, device)
-        history.append({"epoch": epoch, "train_loss": train_loss,
-                "dev_loss": dev_metrics["nll"], "dev_rmse": dev_metrics["rmse"]})
+        history.append({"epoch": epoch, "train_loss": train_loss, "train_nll": train_nll,
+                "dev_loss": dev_metrics["nll"], "dev_rmse": dev_metrics["rmse"], "minutes": (time.perf_counter - t0)/60})
         print(history[-1], flush=True)
         if dev_metrics["nll"] < best_loss:
             best_loss, best_epoch = dev_metrics["nll"], epoch
@@ -998,7 +1009,8 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
                   subset_max=subset_max, min_graph_size=min_graph_size, hidden_dim=hidden_dim,
                   n_layers=n_layers, heads=heads, dropout=dropout, lr=lr, weight_decay=weight_decay,
                   batch_size=batch_size, max_epochs=max_epochs, patience=patience, grad_clip=grad_clip,
-                  beta=beta, seed=seed, n_node_features=n_node_features, edge_dim=edge_dim, stats=stats)
+                  beta=beta, seed=seed, n_node_features=n_node_features, edge_dim=edge_dim, stats=stats, 
+                  num_workers=num_workers)
 
     # params = the arguments of the run + n_node_features, edge_dim and stats (saved with every checkpoint)
     history, best_epoch = train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, patience, grad_clip,
@@ -1014,6 +1026,7 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
         json.dump(history, f, indent=2)
     with open(run_dir / "metrics.json", "w") as f:
         json.dump({"train": train_metrics, "dev": dev_metrics, "best_epoch": best_epoch,
+                   "stopped": "early_stopping" if len(history) < max_epochs else "max_epochs",
                    "n_train_pools": len(train_ds), "n_dev_pools": len(dev_ds),
                    "n_node_features": n_node_features}, f, indent=2)
 
