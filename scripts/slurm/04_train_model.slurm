@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=train_model
+#SBATCH --job-name=all_train_with_gse
 #SBATCH --output=../logs/train_%A_%a.out
 #SBATCH --error=../logs/train_%A_%a.err
 #SBATCH --partition=hpda2_compute_gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=01:00:00
+#SBATCH --time=03:30:00
 #SBATCH --account=hpda-c
 #SBATCH --qos=normal
 
@@ -27,20 +27,20 @@ module load uv
 # the arguments every run shares; in the grid search the varied ones are overridden per task
 ARGS=(
     --project-dir="/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE"   # the weights go to <project-dir>/checkpoints/<run-name>/
-    --n-graphs=30000      # train pools drawn at random (leave out for all ~188k)
+    #--n-graphs=30000      # train pools drawn at random (leave out for all ~188k)
     --k-graph=3           # every node of a drawn subset is connected to its k nearest nodes
     --subset-min=0.4      # smallest share of a pool's points drawn per epoch
     --subset-max=0.9      # largest share of a pool's points drawn per epoch
     --min-graph-size=7    # pools with fewer points are skipped, no subset gets smaller
-    --hidden-dim=96       # width of the node embeddings
+    --hidden-dim=128       # width of the node embeddings
     --n-layers=6          # number of message passing layers
     --heads=4             # attention heads per GATv2 layer (hidden-dim must be divisible by it)
     --dropout=0.1         # dropout rate in the message passing layers
     --lr=3e-4             # learning rate of AdamW
     --weight-decay=1e-4   # weight decay of AdamW
-    --batch-size=128       # graphs per batch
+    --batch-size=96       # graphs per batch
     --max-epochs=100      # upper bound on the number of epochs
-    --patience=10         # early stopping: epochs without a new best dev loss
+    --patience=50         # early stopping: epochs without a new best dev loss
     --grad-clip=5.0       # maximum gradient norm
     --seed=42             # seed of the pool sample, the draws and the weight initialisation
     --num-workers=14      # DataLoader worker processes (keep below --cpus-per-task, keep it fixed within a grid)
