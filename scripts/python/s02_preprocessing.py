@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 import polars as pl
 import json
+import re
 
 from pathlib import Path
 from datetime import datetime
@@ -140,7 +141,13 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
         if out_path.exists():
             out_path.unlink()
 
-        lf = pl.scan_csv(csv, schema_overrides=EGMS_FLOAT_COLS).filter(
+        # read the column names of the individual file
+        with open(csv) as f:
+            header = f.readline().strip().split(",")
+            # append the actual date column names to EGMS_FLOAT_COLS for correct parsing
+            overrides = {**EGMS_FLOAT_COLS, **{c: pl.Float64 for c in header if re.fullmatch(r"\d{8}", c)}}
+            
+        lf = pl.scan_csv(csv, schema_overrides=overrides).filter(
             (pl.col("temporal_coherence") >= egms_coherence) &
             (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
         ).select(EGMS_KEEP_COLS).unique(subset="pid", keep="first", maintain_order=True)
