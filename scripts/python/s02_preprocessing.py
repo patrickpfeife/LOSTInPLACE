@@ -43,7 +43,7 @@ EGMS_FLOAT_COLS = {c: pl.Float64 for c in ["latitude", "longitude", "easting", "
 #===== Section 1: Shared Helper Functions =====#
 ################################################
 
-def schema_overrides(csv, egms_float_cols):
+def schema_date_cols(csv, egms_float_cols):
     """
     Builds the polars schema_overrides for one burst csv: egms_float_cols plus every date column (YYYYMMDD)
     found in the csv's header, all as Float64. Needed per file because the dates differ between bursts, and
@@ -61,8 +61,9 @@ def schema_overrides(csv, egms_float_cols):
         header = f.readline().strip().split(",")
         # add the date columns of this file to the fixed float columns
         overrides = {**egms_float_cols, **{c: pl.Float64 for c in header if re.fullmatch(r"\d{8}", c)}}
+        date_cols = [c for c in header if re.fullmatch(r"\d{8}", c)]
 
-    return overrides
+    return overrides, date_cols
 
 def burst_csvs_for_region(region_path):
     """
@@ -163,7 +164,7 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
         if out_path.exists():
             out_path.unlink()
 
-        overrides = schema_overrides(csv, EGMS_FLOAT_COLS)
+        overrides, _ = schema_date_cols(csv, EGMS_FLOAT_COLS)
             
         lf = pl.scan_csv(csv, schema_overrides=overrides).filter(
             (pl.col("temporal_coherence") >= egms_coherence) &
@@ -215,7 +216,7 @@ def compute_norm_stats(study_areas_gdf, egms_coherence, egms_ampdisp_max, stats_
 
     for csv in csvs:
 
-        overrides = schema_overrides(csv, EGMS_FLOAT_COLS)
+        overrides, _ = schema_date_cols(csv, EGMS_FLOAT_COLS)
 
         raw_ts = pl.scan_csv(csv, schema_overrides=overrides).select(pl.col(r"^\d{8}$"))
 
