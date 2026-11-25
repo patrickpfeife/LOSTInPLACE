@@ -140,12 +140,6 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
         if out_path.exists():
             out_path.unlink()
 
-        # Filter rows based on thresholds, then select only the needed cols
-        lf = pl.scan_csv(csv, schema_overrides=EGMS_FLOAT_COLS).filter(
-            (pl.col("temporal_coherence") >= egms_coherence) &
-            (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
-        ).select(EGMS_KEEP_COLS)
-
         lf = pl.scan_csv(csv, schema_overrides=EGMS_FLOAT_COLS).filter(
             (pl.col("temporal_coherence") >= egms_coherence) &
             (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
