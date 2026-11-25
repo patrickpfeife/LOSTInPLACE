@@ -328,9 +328,11 @@ def polygon_to_coords(geom, t2wgs84):
 def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
     """
     Downloads the EGMS bursts of one orbit direction for one region. The search hits are checked against
-    the actual query area (core + clip_buffer_m, EPSG:3035), since the API only searches its lon/lat bounding box.
-    Of the intersecting bursts, only the relative orbit with the largest combined overlap is kept, and all
-    of its bursts are downloaded, however small their overlap (the minimum-overlap check is done in s02).
+    the actual core polygon (EPSG:3035), since the API only searches the lon/lat bounding box of the query
+    area (core + clip_buffer_m). Every burst whose footprint overlaps the core by more than 10 km2 is
+    downloaded, of all relative orbits (tracks), so a region can hold several tracks per orbit direction
+    (the file names carry the track, so they don't collide). The finer minimum-overlap check (area and
+    number of points) follows in s03.
     Files already on disk are skipped. Every file gets up to five attempts with a growing pause: after an error
     status of the server (a 401 also fetches a new token and search id) and after a connection that cannot be
     opened or breaks during the download. Files that fail all attempts are recorded in failed_downloads and
@@ -383,34 +385,20 @@ def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
     # Calling it once upfront on the entire df leads to expired ids once the download is actually performed
     result, links = query_egms(row=row, headers=headers)
 
-    # the query area (core + buffer) in EPSG:3035, to check and measure the overlap with the bursts below
-    study_area = row.geometry.buffer(row["clip_buffer_m"])
-
-    # keep only the products of the wanted orbit direction, together with their links,
-    # and only those that really intersect the query area, not just its lon/lat bounding box
+    # keep only the products of the wanted orbit direction, together with their links, of all tracks,
+    # and only those whose footprint really overlaps the core by > 10 km2, not just the lon/lat bounding box
     pairs = [(hit, link) for hit, link in zip(result["hits"], links)
          if hit["direction"] == orbit and transform(t2proj.transform,
-                                                    Polygon(hit["poly"])).intersects(study_area)]
-
-    # group by relative orbit, aggregating all bursts of that relative orbit
-    by_rel_orbit = {}
-    for hit, link in pairs:
-        by_rel_orbit.setdefault(hit["relativeOrbit"], []).append((hit, link))
+                                                    Polygon(hit["poly"])).intersection(row.geometry).area > 10_000_000]
 
     # Nothing to download for this orbit direction. Still return the path because download_egms
     # assigns the path column once per orbit direction
-    if not by_rel_orbit:
+    if not pairs:
         print(f"No {orbit} products found for {row['location']}, skipping", flush=True)
         return str(return_path)
 
-    # keep only the relative orbit whose combined bursts overlap the study area most
-    best_rel_orbit = max(
-        by_rel_orbit,
-        key=lambda ro: union_all([transform(t2proj.transform, Polygon(hit["poly"])) for hit, _ in by_rel_orbit[ro]]).intersection(study_area).area
-    )
-
     # split the (hit, link) pairs of that orbit into two separate tuples again
-    hits, links = zip(*by_rel_orbit[best_rel_orbit])
+    hits, links = zip(*pairs)
 
     # creating the directory where the data goes
     save_path.mkdir(parents=True, exist_ok=True)
@@ -834,13 +822,17 @@ def download_summary_md(study_areas_gdf):
     # random regions are named after their set with a running number, all others are handpicked
     random = study_areas_gdf["location"].str.match(r"^(train|dev|cal)_\d+$")
     # the raw (clipped) burst csvs of every region, the s02 outputs next to them are not counted
-    n_bursts = [len([c for c in Path(p).glob("*/*.csv") if "_PREPROCESSED" not in c.name]) for p in study_areas_gdf["region_path"]]
+    raw = [[c for c in Path(p).glob("*/*.csv") if "_PREPROCESSED" not in c.name] for p in study_areas_gdf["region_path"]]
+    n_bursts = [len(r) for r in raw]
+    # distinct orbit direction x relative orbit (track) per region; the track is the 3rd part of EGMS_L2b_<track>_...
+    n_tracks = [len({(c.parent.name, c.name.split("_")[2]) for c in r}) for r in raw]
 
     per_set = []
     for s, name in set_names.items():
         m = (study_areas_gdf["set"] == s).to_numpy()
         per_set.append({"set": name, "regions": int(m.sum()), "handpicked": int((m & ~random.to_numpy()).sum()),
                         "random": int((m & random.to_numpy()).sum()), "burst csvs": int(np.array(n_bursts)[m].sum()),
+                        "tracks (direction x track)": int(np.array(n_tracks)[m].sum()),
                         "WorldCover tiles": int(sum(len(u) for u in study_areas_gdf.loc[m, "wc_tile_urls"]))})
 
     failed_path = Path(__file__).parent / "../../assets/failed_egms_downloads.csv"
