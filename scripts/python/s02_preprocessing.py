@@ -43,6 +43,27 @@ EGMS_FLOAT_COLS = {c: pl.Float64 for c in ["latitude", "longitude", "easting", "
 #===== Section 1: Shared Helper Functions =====#
 ################################################
 
+def schema_overrides(csv, egms_float_cols):
+    """
+    Builds the polars schema_overrides for one burst csv: egms_float_cols plus every date column (YYYYMMDD)
+    found in the csv's header, all as Float64. Needed per file because the dates differ between bursts, and
+    polars ignores regex keys in schema_overrides; without it a date column whose first 100 values are whole
+    numbers is inferred as Int64 and fails to parse at the first decimal value.
+
+    Arguments:
+        csv -- str or Path, a burst csv (raw or preprocessed)
+        egms_float_cols -- dict, {column: pl.Float64} for the fixed columns (EGMS_FLOAT_COLS)
+
+    Returns:
+        overrides -- dict, {column: pl.Float64}
+    """
+    with open(csv) as f:
+        header = f.readline().strip().split(",")
+        # add the date columns of this file to the fixed float columns
+        overrides = {**egms_float_cols, **{c: pl.Float64 for c in header if re.fullmatch(r"\d{8}", c)}}
+
+    return overrides
+
 def burst_csvs_for_region(region_path):
     """
     Lists the original burst csvs of one region (both orbits), skipping "*_PREPROCESSED.csv".
@@ -121,10 +142,11 @@ def compute_qa_stats(csvs, coherence_q=0.05, ampdisp_q=0.95, sample_every=20):
 
 def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
     """
-    Keeps only points passing both quality thresholds and only EGMS_KEEP_COLS, written as
-    "*_PREPROCESSED.csv" next to each original. Originals stay untouched.
-    Exact duplicates of rows as well as points that are the same but only slighlty differ 
-    in location are removed.
+    Keeps only points passing both quality thresholds and only EGMS_KEEP_COLS plus all date columns
+    (YYYYMMDD, the cumulative LOS displacement time series, parsed as Float64 via schema_overrides),
+    written as "*_PREPROCESSED.csv" next to each original. Originals stay untouched.
+    Exact duplicates of rows as well as points that are the same but only slightly differ
+    in location are removed (one row per pid).
 
     Arguments:
         csvs -- list of Path, original burst csvs
@@ -141,23 +163,22 @@ def filter_egms(csvs, egms_coherence, egms_ampdisp_max):
         if out_path.exists():
             out_path.unlink()
 
-        # read the column names of the individual file
-        with open(csv) as f:
-            header = f.readline().strip().split(",")
-            # append the actual date column names to EGMS_FLOAT_COLS for correct parsing
-            overrides = {**EGMS_FLOAT_COLS, **{c: pl.Float64 for c in header if re.fullmatch(r"\d{8}", c)}}
+        overrides = schema_overrides(csv, EGMS_FLOAT_COLS)
             
         lf = pl.scan_csv(csv, schema_overrides=overrides).filter(
             (pl.col("temporal_coherence") >= egms_coherence) &
             (pl.col("amplitude_dispersion") <= egms_ampdisp_max)
-        ).select(EGMS_KEEP_COLS).unique(subset="pid", keep="first", maintain_order=True)
+        ).select(pl.col(EGMS_KEEP_COLS), pl.col(r"^\d{8}$")).unique(subset="pid", keep="first", maintain_order=True)
 
         lf.sink_csv(out_path)
 
 def compute_norm_stats(study_areas_gdf, egms_coherence, egms_ampdisp_max, stats_path=EGMS_NORM_STATS_PATH):
     """
     Computes mean/std of EGMS_NORM_COLS over the preprocessed csvs of train regions only and
-    writes them to a json file.
+    writes them to a json file. Also computes one global mean/std ("displacement_ts") over all
+    values of all date columns of these csvs (the dates differ between bursts, so no per-date stats):
+    per file mean, population std and count, pooled at the end via
+    var = sum(n_i * (std_i**2 + mean_i**2)) / N - mean**2. Files without points are skipped.
 
     Arguments:
         study_areas_gdf -- GeoDataFrame with region_path and set columns
@@ -166,11 +187,15 @@ def compute_norm_stats(study_areas_gdf, egms_coherence, egms_ampdisp_max, stats_
         stats_path -- Path, output json file
 
     Returns:
-        stats -- dict, mean/std per column plus counts and thresholds
+        stats -- dict, mean/std per column, mean/std/n of the displacement values,
+                 plus counts and thresholds
     """
     # Statistics for normalization are only computed from the training set
     train_gdf = study_areas_gdf.loc[study_areas_gdf["set"] == 0]
     csvs = [preprocessed_path(c) for c in all_burst_csvs(train_gdf)]
+
+    ########################
+    # for the mean velocity
 
     lf = pl.concat([pl.scan_csv(c, schema_overrides=EGMS_FLOAT_COLS).select(EGMS_NORM_COLS) for c in csvs], how="vertical_relaxed")
 
@@ -181,15 +206,51 @@ def compute_norm_stats(study_areas_gdf, egms_coherence, egms_ampdisp_max, stats_
         *[pl.col(c).std().alias(f"{c}_std") for c in EGMS_NORM_COLS],
     ]).collect(engine="streaming").row(0, named=True)
 
+    ########################
+    # for the raw time series data
+
+    n_list = []
+    mean_list = []
+    std_list = []
+
+    for csv in csvs:
+
+        overrides = schema_overrides(csv, EGMS_FLOAT_COLS)
+
+        raw_ts = pl.scan_csv(csv, schema_overrides=overrides).select(pl.col(r"^\d{8}$"))
+
+        # skip the files that have 0 rows to avoid error
+        if raw_ts.select(pl.len()).collect().item() == 0:
+            continue
+
+        stats_raw_ts = raw_ts.unpivot().select(
+            ts_mean=pl.col("value").mean(),
+            ts_std=pl.col("value").std(ddof=0),
+            ts_n = pl.col("value").count()
+        ).collect()
+        n_list.append(stats_raw_ts["ts_n"].item())
+        mean_list.append(stats_raw_ts["ts_mean"].item())
+        std_list.append(stats_raw_ts["ts_std"].item())
+
+    # turning them into arrays so element wise aithmetic works
+    n_list, mean_list, std_list = map(np.array, (n_list, mean_list, std_list))
+
+    N_ts    = n_list.sum()
+    MEAN_ts = (n_list * mean_list).sum() / N_ts
+    VAR_ts  = (n_list * (std_list**2 + mean_list**2)).sum() / N_ts - MEAN_ts**2
+    STD_ts  = np.sqrt(VAR_ts)
+
     # save the stats in assets directory
     stats = {
         "source": "preprocessed csvs of train regions (set == 0)",
         "n_csvs": len(csvs),
         "n_points": row["n_points"],
-        "filter": {"egms_coherence": egms_coherence, "egms_ampdisp_max": egms_ampdisp_max},
+        "filter": {"egms_coherence": egms_coherence, "egms_ampdisp_max": egms_ampdisp_max}
     }
     for c in EGMS_NORM_COLS:
         stats[c] = {"mean": row[f"{c}_mean"], "std": row[f"{c}_std"]}
+
+    stats["displacement_ts"] = {"mean": MEAN_ts, "std": STD_ts, "n": int(N_ts)}
 
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
@@ -444,8 +505,10 @@ def preprocessing_summary_md(study_areas_gdf, stats_path=EGMS_NORM_STATS_PATH):
                                                                for c in burst_csvs_for_region(p))}
                                    for s, name in set_names.items()]),
                   f"Normalization stats ({stats['source']}, {stats['n_csvs']} bursts, {stats['n_points']:,} points):",
-                  s01.table_to_md([{"column": c, "mean": round(stats[c]["mean"], 3), "std": round(stats[c]["std"], 3)}
-                                   for c in EGMS_NORM_COLS])]
+                  s01.table_to_md([{"column": c, "mean": round(stats[c]["mean"], 3), "std": round(stats[c]["std"], 3),
+                                    "values": f"{stats[c].get('n', stats['n_points']):,}"}
+                                   # displacement_ts: one global pair over all date values (older jsons lack it)
+                                   for c in EGMS_NORM_COLS + ["displacement_ts"] if c in stats])]
 
     # GNSS: stations in the core vs stations passing the quality filter, per val region
     if "gnss_station_codes_filtered" in study_areas_gdf.columns:

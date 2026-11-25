@@ -60,8 +60,8 @@ All three steps run by default; each is independently skippable. Flags are switc
 **Input:** the region table (`assets/study_areas_gdf_local*`) and the clipped EGMS csvs from Step 1.
 
 **Output:**
-- `<burst>_PREPROCESSED.csv` next to every raw burst csv: only points passing both thresholds, only the columns `pid`, `latitude`, `longitude`, `easting`, `northing`, `incidence_angle`, `track_angle`, `los_east`, `los_north`, `los_up`, `mean_velocity`. Raw csvs stay untouched; dropped columns can be joined back via `pid`.
-- `assets/egms_norm_stats.json` (gitignored): mean/std of `mean_velocity` and `incidence_angle`, computed from the preprocessed csvs of **train regions only**, plus the thresholds used. The csvs keep raw values; normalization is applied later at read time.
+- `<burst>_PREPROCESSED.csv` next to every raw burst csv: only points passing both thresholds, only the columns `pid`, `latitude`, `longitude`, `easting`, `northing`, `incidence_angle`, `track_angle`, `los_east`, `los_north`, `los_up`, `mean_velocity`, plus all date columns (`YYYYMMDD`, cumulative LOS displacement in mm, parsed as Float64; the dates differ between bursts). One row per `pid`. Raw csvs stay untouched; dropped columns can be joined back via `pid`.
+- `assets/egms_norm_stats.json` (gitignored): mean/std of `mean_velocity` and `incidence_angle`, and one global mean/std/n over all date values (`displacement_ts`), computed from the preprocessed csvs of **train regions only**, plus the thresholds used. The csvs keep raw values; normalization is applied later at read time.
 - the region table updated with `gnss_station_codes_filtered`/`gnss_station_paths_filtered`/`gnss_velocities`/`gnss_filter_params` (val regions) and `wc_merged_path`.
 - `assets/param_logs/s02_preprocessing_<timestamp>.md` (gitignored), written at the end of a successful run: run times, arguments, the thresholds used, preprocessed bursts per set, the normalization stats, GNSS stations per val region before/after the quality filter, merged WorldCover files.
 
