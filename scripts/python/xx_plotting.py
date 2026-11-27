@@ -44,13 +44,13 @@ COLOR_COVERAGE_EDGE = "#c3c2b7"
 SET_LABELS = {0: "train", 1: "dev", 2: "val"}
 SET_COLORS = {0: COLOR_TRAIN, 1: COLOR_DEV, 2: COLOR_VAL}
 
-# the s04b report figures: GNN vs the strongest baseline (slots 1 and 2, the pair validated for all chart forms)
+# the s06b report figures: GNN vs the strongest baseline (slots 1 and 2, the pair validated for all chart forms)
 COLOR_GNN = "#2a78d6"           # slot 1 blue
 COLOR_KRIGING = "#eb6834"       # slot 2 orange
 INK_SECONDARY = "#52514e"       # text next to the plots (never in a series color)
 INK_MUTED = "#898781"           # reference lines (1:1, 50 %, diagonal)
 
-# the graph statistics of the s04b report (columns of the per-graph tables of s04b): column -> axis label.
+# the graph statistics of the s06b report (columns of the per-graph tables of s06b): column -> axis label.
 # The order is the order of the panels in plot_graph_stat_distributions and plot_win_rate
 GRAPH_STAT_LABELS = {
     "n_nodes": "nodes per graph",
@@ -285,7 +285,7 @@ def plot_loss_curves(history):
 
     Arguments:
         history -- list of dicts, one per epoch, with the keys "epoch", "dev_loss" and "train_nll" (or only
-            "train_loss", older runs) (see train_model in s04)
+            "train_loss", older runs) (see train_model in s06)
 
     Returns:
         fig -- matplotlib.figure.Figure, not saved here since s01.write_md_log saves the figures it gets
@@ -335,7 +335,7 @@ def plot_graph_stat_distributions(train_stats, dev_stats, n_cols=3, n_bins=40):
     few extreme graphs don't squeeze the rest into one bin. Integer statistics with a small range get one bin per value.
 
     Arguments:
-        train_stats, dev_stats -- polars.DataFrame, one row per graph, one column per statistic (see s04b)
+        train_stats, dev_stats -- polars.DataFrame, one row per graph, one column per statistic (see s06b)
         n_cols -- int, panels per row
         n_bins -- int, number of bins of the continuous statistics
 
@@ -392,7 +392,7 @@ def plot_win_rate(queries, pred_col="mu_mm", ref_col="ok_mu", ref_name="Ordinary
 
     Arguments:
         queries -- polars.DataFrame, one row per dev query: y_mm, the two prediction columns and the graph statistics
-            (the baselines table of s04b joined with the GNN's predictions)
+            (the baselines table of s06b joined with the GNN's predictions)
         pred_col, ref_col -- str, the GNN's and the reference's prediction column
         ref_name -- str, the reference's name for the labels
         n_bins -- int, quantile bins per statistic (fewer if the statistic has many equal values)

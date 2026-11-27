@@ -21,7 +21,7 @@ uv run s01_download_data.py --project-dir PROJECTDIR --real-sub-buffer-value=150
 | `--maxit-rnd` | `200` | Upper bound on sampling attempts for the random regions |
 | `--egms-rand-extension` | `15000` | Half side length in metres of the square core of a random region (15000 → 30 × 30 km) |
 
-**Regions:** every region is a **core polygon** (seeds) plus a ring of `CLIP_BUFFER_M` = 5000 m (module constant in s01, stored per region as `clip_buffer_m`). EGMS is queried with core + ring. The EGMS search only uses the min/max lon/lat of the query polygon, so every returned burst is checked against the actual core polygon; per orbit direction, every burst that overlaps the core by more than 10 km² is downloaded, of all relative orbits (tracks), so a region can hold several tracks per direction (the file names carry the track number). Right after unzipping, every burst csv is **clipped in place** to its region's core + ring (rows only, all columns kept unchanged); bursts are never deleted, the minimum-overlap check follows in s03. s03 only uses the overlap of each burst with the core (edge margin `--buffer-m` inside it); the ring is downloaded as a reserve but not used for now. Random regions are squares around random points, sampled outside a zone around the real-subsidence cores so that no query areas overlap. GNSS stations are taken from the core of the val regions only.
+**Regions:** every region is a **core polygon** (seeds) plus a ring of `CLIP_BUFFER_M` = 5000 m (module constant in s01, stored per region as `clip_buffer_m`). EGMS is queried with core + ring. The EGMS search only uses the min/max lon/lat of the query polygon, so every returned burst is checked against the actual core polygon; per orbit direction, every burst that overlaps the core by more than 10 km² is downloaded, of all relative orbits (tracks), so a region can hold several tracks per direction (the file names carry the track number). Right after unzipping, every burst csv is **clipped in place** to its region's core + ring (rows only, all columns kept unchanged); bursts are never deleted, the minimum-overlap check follows in s05. s05 only uses the overlap of each burst with the core (edge margin `--buffer-m` inside it); the ring is downloaded as a reserve but not used for now. Random regions are squares around random points, sampled outside a zone around the real-subsidence cores so that no query areas overlap. GNSS stations are taken from the core of the val regions only.
 
 **Input:** `assets/real_subsidence_polygonbased.gpkg` (handpicked regions, tracked in git), `assets/token.jwt` (EGMS API service-account key), `assets/egms_coverage_countries.geojson`.
 
@@ -74,10 +74,22 @@ Run via `scripts/slurm/02_preprocessing.slurm` (the last run took ~40 min on the
 
 ---
 
-## Step 3 — Build Training Dataset
+## Step 3 — Classify Time Series
+
+`s03_classify_time_series.py` — not implemented yet (prototype: `python/prototyping_notebooks/ts_pre_training.ipynb`). Rule-based class per time series (steps, winter gap, linear, seasonal, noisy, other), used for class-balanced sampling.
+
+---
+
+## Step 4 — Pre-train LSTM
+
+`s04_pre_train_lstm.py` — not implemented yet. Pre-training of the LSTM encoder–decoder on class-balanced samples of the time series.
+
+---
+
+## Step 5 — Build Training Dataset
 
 ```bash
-uv run s03_build_training_dataset.py --k-nearest=25 --density=0.66 --min-dist=50 --buffer-m=2000 --max-dist=2000
+uv run s05_build_training_dataset.py --k-nearest=25 --density=0.66 --min-dist=50 --buffer-m=2000 --max-dist=2000
 ```
 
 | Argument | Default | Description |
@@ -100,8 +112,8 @@ uv run s03_build_training_dataset.py --k-nearest=25 --density=0.66 --min-dist=50
 **Output:**
 - `<burst>_GRAPH.parquet` next to every burst csv that got seeds: `pid`, `seed_pid` (pid of the pool's seed), `seed`, `latitude`, `longitude`, `easting`, `northing`, `incidence_angle`, `mean_velocity` (raw values, normalized at training time with `egms_norm_stats.json`), `gse_0` … `gse_63` (int8, raw quantised, de-quantised at training time with `x = ((v/127.5)**2) · sign(v)`). One file per burst, because `pid` is only unique within a burst.
 - the region table updated with `n_center_region`, `n_seed_points_per_region` and `graph_file_list`.
-- `assets/param_logs/s03_build_training_dataset_<timestamp>.md` (gitignored): run times, arguments, seeds and pool points per set, the budget calculation per set, seeds per region (capacity, budget, capped or not), the seed placement (grid vs land cover) and the points without GSE.
+- `assets/param_logs/s05_build_training_dataset_<timestamp>.md` (gitignored): run times, arguments, seeds and pool points per set, the budget calculation per set, seeds per region (capacity, budget, capped or not), the seed placement (grid vs land cover) and the points without GSE.
 
 **What happens at training time, not in this step:** every `__getitem__` draws a random subset of one pool, picks a random query point in it and hides its velocity, computes all pairwise geodesic distances/bearings from lat/lon, connects every node to its k nearest nodes (k=3 assumed) and builds the edge features. So the graph is an interconnected network, not a star around a fixed centre, and the subset, the graph and the query change every epoch (§7.1).
 
-Run via `scripts/slurm/03_build_training_dataset.slurm`. The GSE reads go over the network (~50–70 GB for all cores, ~3 s per block).
+Run via `scripts/slurm/05_build_training_dataset.slurm`. The GSE reads go over the network (~50–70 GB for all cores, ~3 s per block).

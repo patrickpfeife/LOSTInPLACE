@@ -11,10 +11,10 @@
 #SBATCH --qos=normal
 
 # One script for both modes:
-#   single run:   sbatch 04_train_model.slurm
+#   single run:   sbatch 06_train_model.slurm
 #                 -> trains once with the ARGS below
-#   grid search:  sbatch --array=0-$(( $(grep -c . 04_hparam_grid.txt) - 1 )) 04_train_model.slurm
-#                 -> array task i trains with the ARGS below plus line i+1 of 04_hparam_grid.txt
+#   grid search:  sbatch --array=0-$(( $(grep -c . 06_hparam_grid.txt) - 1 )) 06_train_model.slurm
+#                 -> array task i trains with the ARGS below plus line i+1 of 06_hparam_grid.txt
 #                    (the grid arguments come last and override the ones below, argparse keeps the last value)
 # %A = job id, %a = array task index (shows as 4294967294 for a single run)
 
@@ -50,7 +50,7 @@ ARGS=(
 
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
     # grid search: the line of this array task (task 0 = line 1) holds its hyperparameters
-    GRID_LINE=$(sed -n "$(( SLURM_ARRAY_TASK_ID + 1 ))p" ../slurm/04_hparam_grid.txt)
+    GRID_LINE=$(sed -n "$(( SLURM_ARRAY_TASK_ID + 1 ))p" ../slurm/06_hparam_grid.txt)
     read -r -a GRID_ARGS <<< "${GRID_LINE}"
     RUN_NAME="grid_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
     echo "array task ${SLURM_ARRAY_TASK_ID}: ${GRID_LINE}"
@@ -59,4 +59,4 @@ else
     RUN_NAME="single_${SLURM_JOB_ID}"
 fi
 
-uv run s04_train_model.py "${ARGS[@]}" "${GRID_ARGS[@]}" --run-name="${RUN_NAME}"
+uv run s06_train_model.py "${ARGS[@]}" "${GRID_ARGS[@]}" --run-name="${RUN_NAME}"

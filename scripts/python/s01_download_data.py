@@ -33,7 +33,7 @@ from shapely.ops import transform
 ################################################
 
 # Buffer (metres) around each region's core that is downloaded and kept when the bursts are clipped.
-# s03 only uses the core for now, the ring is a reserve so later steps can use more without a new download.
+# s05 only uses the core for now, the ring is a reserve so later steps can use more without a new download.
 CLIP_BUFFER_M = 5000
 # Parameter logs of all steps, kept with the repo (gitignored) instead of the data tree
 PARAM_LOG_DIR = Path(__file__).parent / "../../assets/param_logs"
@@ -58,7 +58,7 @@ EGMS_PERIOD = (float(EGMS_RELEASE.split("-")[0]), float(EGMS_RELEASE.split("-")[
 def create_file_system():
     """
     Creates the project's directory tree (data with train, dev, cal, val, and checkpoints for the model weights
-    of s04/s05) under PROJECT_DIR if it doesn't exist yet.
+    of s06/s07) under PROJECT_DIR if it doesn't exist yet.
 
     Arguments:
         None -- uses the global PROJECT_DIR / DATA_DIR / TRAIN_DIR / DEV_DIR / CAL_DIR / VAL_DIR / CHECKPOINT_DIR paths
@@ -332,7 +332,7 @@ def pull_egms(row, token_path, orbit, failed_downloads, t2proj):
     area (core + clip_buffer_m). Every burst whose footprint overlaps the core by more than 10 km2 is
     downloaded, of all relative orbits (tracks), so a region can hold several tracks per orbit direction
     (the file names carry the track, so they don't collide). The finer minimum-overlap check (area and
-    number of points) follows in s03.
+    number of points) follows in s05.
     Files already on disk are skipped. Every file gets up to five attempts with a growing pause: after an error
     status of the server (a 401 also fetches a new token and search id) and after a connection that cannot be
     opened or breaks during the download. Files that fail all attempts are recorded in failed_downloads and
@@ -1124,7 +1124,7 @@ if __name__ == '__main__':
     DEV_DIR = DATA_DIR / "dev"
     CAL_DIR = DATA_DIR / "cal"
     VAL_DIR = DATA_DIR / "val"
-    # the model weights of the training steps (s04, s05), next to the data tree
+    # the model weights of the training steps (s06, s07), next to the data tree
     CHECKPOINT_DIR = PROJECT_DIR / "checkpoints"
 
     # running the whole download

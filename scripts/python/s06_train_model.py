@@ -1,5 +1,5 @@
 #######################################
-# s04_train_model
+# s06_train_model
 
 ##############################################################################
 #============================================================================#
@@ -264,7 +264,7 @@ class PoolDataset(torch.utils.data.Dataset):
     def draw_subset_method(self, i):
         """
         Draws the subset of pool i and the query among it. Used by __getitem__ (GNN) and by evaluate_baselines in
-        s04b_baseline_comparison, so the GNN and the baselines see exactly the same visible points and query.
+        s06b_baseline_comparison, so the GNN and the baselines see exactly the same visible points and query.
 
         Arguments:
             i -- int, the pool number
@@ -759,7 +759,7 @@ def evaluate(model, loader, device):
     Returns:
         metrics -- dict with nll, rmse, mae and inside_90
         predictions -- polars.DataFrame, one row per query: region, orbit, graph_file and seed_pid (the query's key,
-            for the join with the baselines in s04b), y_mm, mu_mm, sigma_mm
+            for the join with the baselines in s06b), y_mm, mu_mm, sigma_mm
     """
 
     # switch model to evaluation mode and turn off gradients
@@ -804,7 +804,7 @@ def evaluate(model, loader, device):
 
 def save_checkpoint(model, params, epoch, path):
     """
-    Saves the weights together with everything needed to rebuild and use the model later (s05, s06, inference).
+    Saves the weights together with everything needed to rebuild and use the model later (s07, s08, inference).
 
     Arguments:
         model -- InSARGNN
@@ -925,7 +925,7 @@ def train_model(model, train_loader, dev_loader, lr, weight_decay, max_epochs, p
 def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device):
     """
     Reloads the best checkpoint and evaluates it on train and dev. The comparison with the baselines, the metrics per
-    region and orbit and the report are done afterwards on the CPU by s04b_baseline_comparison.
+    region and orbit and the report are done afterwards on the CPU by s06b_baseline_comparison.
 
     Arguments:
         model -- InSARGNN, its weights are replaced by the checkpoint's
@@ -935,7 +935,7 @@ def evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device):
 
     Returns:
         train_metrics, dev_metrics -- dicts with nll, rmse, mae and inside_90 (see evaluate)
-        dev_predictions -- polars.DataFrame, one row per dev query (see evaluate), saved for s04b
+        dev_predictions -- polars.DataFrame, one row per dev query (see evaluate), saved for s06b
     """
 
     # loads the best checkpoint not the last one
@@ -961,7 +961,7 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
     """
     Trains one model with one hyperparameter setting and evaluates the best checkpoint on train and dev; one run of the
     hyperparameter search (one SLURM array task) or a single run. Writes the files for the evaluation on the CPU
-    (s04b_baseline_comparison: baselines, metrics per region and orbit, report) into the run folder.
+    (s06b_baseline_comparison: baselines, metrics per region and orbit, report) into the run folder.
 
     Arguments:
         project_dir -- str, project root, the weights go to <project_dir>/checkpoints/<run_name>/
@@ -973,7 +973,7 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
         run_name -- str or None, name of the run (None = timestamp)
 
     Returns:
-        run_dir -- Path, the run folder <project_dir>/checkpoints/<run_name> with the four files s04b reads:
+        run_dir -- Path, the run folder <project_dir>/checkpoints/<run_name> with the four files s06b reads:
             best_model.pt (weights and all settings in params), dev_predictions.parquet (the GNN's dev predictions,
             one row per query), history.json (loss per epoch) and metrics.json (train and dev metrics, best epoch,
             stop reason (early_stopping or max_epochs), pool counts, number of node features)
@@ -1007,7 +1007,7 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
     # n_node_features = number of columns of train_ds[0].x (3, or 67 with GSE); edge_dim = 3
     model = InSARGNN(n_node_features, edge_dim, hidden_dim, n_layers, heads, dropout).to(device)
 
-    # everything needed to rebuild the model later (s05/s06/inference), saved with every checkpoint
+    # everything needed to rebuild the model later (s07/s08/inference), saved with every checkpoint
     params = dict(use_gse=use_gse, n_graphs=n_graphs, k_graph=k_graph, subset_min=subset_min,
                   subset_max=subset_max, min_graph_size=min_graph_size, hidden_dim=hidden_dim,
                   n_layers=n_layers, heads=heads, dropout=dropout, lr=lr, weight_decay=weight_decay,
@@ -1022,7 +1022,7 @@ def main(project_dir, use_gse, n_graphs, k_graph, subset_min, subset_max, min_gr
     # Reload the best checkpoint and evaluate it on train and dev
     train_metrics, dev_metrics, dev_predictions = evaluate_on_dev(model, checkpoint_path, train_loader, dev_loader, device)
 
-    # everything s04b needs goes next to the checkpoint: dev predictions per query, loss per epoch, summary metrics
+    # everything s06b needs goes next to the checkpoint: dev predictions per query, loss per epoch, summary metrics
     run_dir = checkpoint_path.parent
     dev_predictions.write_parquet(run_dir / "dev_predictions.parquet")
 
@@ -1103,4 +1103,4 @@ if __name__ == '__main__':
 
     run_dir = main(**vars(args))
             
-    print(f"training finished, files for s04b in {run_dir}", flush=True)
+    print(f"training finished, files for s06b in {run_dir}", flush=True)

@@ -9,10 +9,10 @@
 #SBATCH --account=hpda-c
 #SBATCH --qos=normal
 
-# Evaluation of trained s04 runs on dev (CPU): baselines (cached per dataset), GNN vs baselines, one report.
+# Evaluation of trained s06 runs on dev (CPU): baselines (cached per dataset), GNN vs baselines, one report.
 # Normally submitted by submit_train_eval.sh after the training; by hand:
-#   sbatch 04b_baseline_comparison.slurm single_123          one run
-#   sbatch 04b_baseline_comparison.slurm 'grid_456_*'        all runs of a grid (quotes, so the shell doesn't expand it)
+#   sbatch 06b_baseline_comparison.slurm single_123          one run
+#   sbatch 06b_baseline_comparison.slurm 'grid_456_*'        all runs of a grid (quotes, so the shell doesn't expand it)
 
 set -euo pipefail
 
@@ -21,4 +21,4 @@ cd ../python
 module load uv
 
 # the run names or glob patterns come from the command line
-uv run s04b_baseline_comparison.py --project-dir="/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE" --runs "$@"
+uv run s06b_baseline_comparison.py --project-dir="/dss/dsstbyfs02/scratch/0C/di54haf/LOSTInPLACE" --runs "$@"

@@ -1,12 +1,12 @@
 #######################################
-# s04b_baseline_comparison
+# s06b_baseline_comparison
 
 """
-Evaluation of trained s04 runs on dev, on the CPU after the GPU training: the baselines (IDW, neighbour mean, ordinary
+Evaluation of trained s06 runs on dev, on the CPU after the GPU training: the baselines (IDW, neighbour mean, ordinary
 kriging) on exactly the same dev graphs as the GNN, cached once per dataset and recomputed only if the dev data or the
 settings changed, GNN vs baselines overall, per region, per velocity and per distance range, the graph statistics of
 train and dev, and one markdown report for one run or all runs of a grid.
-Run via scripts/slurm/submit_train_eval.sh (after s04) or scripts/slurm/04b_baseline_comparison.slurm.
+Run via scripts/slurm/submit_train_eval.sh (after s06) or scripts/slurm/06b_baseline_comparison.slurm.
 """
 
 ##############################################################################
@@ -27,7 +27,7 @@ matplotlib.use("Agg")      # no display on the compute nodes, figures are only s
 import gstools as gs
 
 import s01_download_data as s01
-import s04_train_model as s04
+import s06_train_model as s06
 import xx_plotting as xx
 
 from pathlib import Path
@@ -51,7 +51,7 @@ VARIO_MIN_PAIRS = 30
 VARIO_SAMPLING_SIZE = 5000
 VARIO_LEN_FACTOR = 1.5
 
-# the draw settings that decide which dev graphs are built (saved in every s04 checkpoint); all evaluated runs must share them
+# the draw settings that decide which dev graphs are built (saved in every s06 checkpoint); all evaluated runs must share them
 DRAW_KEYS = ["subset_min", "subset_max", "min_graph_size", "k_graph"]
 
 # the compared methods: display name -> (prediction column, sigma column or None). The GNN comes first, so the
@@ -90,9 +90,9 @@ def graph_stats(pool, idx, q):
             length), query_vel, query_abs_vel, vel_std / vel_range (std / range of the visible velocities) and
             q_dev_from_mean (|query velocity - mean of the visible velocities|); distances in m, velocities in mm/yr
     """
-    # the same distances and the same Delaunay graph the GNN gets (s04.build_graph)
-    dist, _ = s04.pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
-    edges = s04.delaunay_edges(pool["x"][idx], pool["y"][idx]).numpy()     # every edge in both directions
+    # the same distances and the same Delaunay graph the GNN gets (s06.build_graph)
+    dist, _ = s06.pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
+    edges = s06.delaunay_edges(pool["x"][idx], pool["y"][idx]).numpy()     # every edge in both directions
     # positions of the visible points (all but the query), their raw velocities and their distances to the query
     vis = np.delete(np.arange(len(idx)), q)
     v, d_q = pool["vel"][idx], dist[q, vis]
@@ -121,7 +121,7 @@ def train_graph_stats(settings, seed, cache_dir, n=20000):
     Returns:
         stats -- polars.DataFrame, one row per sampled pool with the columns of graph_stats
     """
-    # the train GRAPH files in the order s04 uses them, and the fingerprint of everything the statistics depend on
+    # the train GRAPH files in the order s06 uses them, and the fingerprint of everything the statistics depend on
     train_files = train_dev_graph_files(0)
     parquet_path, meta_path = cache_dir / "train_graph_stats.parquet", cache_dir / "train_graph_stats.json"
     fingerprint = dataset_fingerprint(train_files, {**settings, "seed": seed, "n": n})
@@ -134,9 +134,9 @@ def train_graph_stats(settings, seed, cache_dir, n=20000):
                 return pl.read_parquet(parquet_path)
 
     print("train graph stats computed (no cache, or train data or settings changed)", flush=True)
-    # n sampled pools, drawn like in s04's training (fixed_draws=False, epoch 0); no GSE and no normalization needed
-    index = s04.sample_pools(s04.build_pool_index(train_files), n, seed)
-    ds = s04.PoolDataset(s04.load_pools(index, False, settings["min_graph_size"]), None, settings["k_graph"],
+    # n sampled pools, drawn like in s06's training (fixed_draws=False, epoch 0); no GSE and no normalization needed
+    index = s06.sample_pools(s06.build_pool_index(train_files), n, seed)
+    ds = s06.PoolDataset(s06.load_pools(index, False, settings["min_graph_size"]), None, settings["k_graph"],
                          settings["subset_min"], settings["subset_max"], settings["min_graph_size"], False, seed=seed)
 
     # one row per pool, and the cache with its fingerprint next to it
@@ -165,7 +165,7 @@ def idw(pool, idx, q, power):
     # coordinates and raw velocities (mm/yr) of the subset, in subset order (positions 0 ... m-1)
     lat, lon, vel = pool["lat"][idx], pool["lon"][idx], pool["vel"][idx]
     # pairwise distances between all points of the subset; the bearings are not needed
-    dist, _ = s04.pairwise_geodesic(lat, lon)
+    dist, _ = s06.pairwise_geodesic(lat, lon)
     # we only need the distances from the query to the other points, which are in row q of the matrix
     query_dist_row = dist[q]
     # the query itself is deleted (its distance to itself is 0)
@@ -200,7 +200,7 @@ def neighbour_mean(pool, idx, q, k_graph):
     lat, lon, vel = pool["lat"][idx], pool["lon"][idx], pool["vel"][idx]
 
     # pairwise distances of the subset; the bearings are not needed
-    dist, _ = s04.pairwise_geodesic(lat, lon)
+    dist, _ = s06.pairwise_geodesic(lat, lon)
 
     # distances from the query to all subset points; the query itself gets inf so it is never its own neighbour
     d_q = dist[q].copy()
@@ -234,7 +234,7 @@ def compute_variograms(dev_ds):
     for i in range(len(dev_ds)):
         # extract necessary information from the graph
         pool, idx, q = dev_ds.draw_subset_method(i)
-        dist, _ = s04.pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
+        dist, _ = s06.pairwise_geodesic(pool["lat"][idx], pool["lon"][idx])
 
         # mask over the whole pool (not only the subset): everything except the query enters the variogram.
         # q is the position within idx, so the query's position in the pool is idx[q]
@@ -388,7 +388,7 @@ def evaluate_baselines(dev_ds, k_graph):
 
 def load_run(run_dir):
     """
-    Loads the settings and the files s04 wrote for one run. Runs with a missing file (failed or unfinished) are skipped.
+    Loads the settings and the files s06 wrote for one run. Runs with a missing file (failed or unfinished) are skipped.
 
     Arguments:
         run_dir -- Path, the run folder <project_dir>/checkpoints/<run_name>
@@ -398,10 +398,10 @@ def load_run(run_dir):
             GNN's dev predictions), history (list of dicts, loss per epoch) and metrics (dict, train/dev metrics),
             or None if a file is missing
     """
-    # the four files s04 writes into the run folder
+    # the four files s06 writes into the run folder
     names = ["best_model.pt", "dev_predictions.parquet", "history.json", "metrics.json"]
     if not all((run_dir / n).exists() for n in names):
-        print(f"skipping {run_dir.name}: not all s04 files exist (failed or unfinished run)", flush=True)
+        print(f"skipping {run_dir.name}: not all s06 files exist (failed or unfinished run)", flush=True)
         return None
 
     # the settings of the run are saved with the checkpoint (weights_only=False: params is a plain dict, not tensors)
@@ -414,7 +414,7 @@ def load_run(run_dir):
 
 def train_dev_graph_files(set):
     """
-    Lists the train or dev GRAPH files from the region table, in exactly the same order as s04.build_datasets: the
+    Lists the train or dev GRAPH files from the region table, in exactly the same order as s06.build_datasets: the
     draws depend on the order of the pools and that comes from the order of the files, so this list must not be sorted.
 
     Arguments:
@@ -429,7 +429,7 @@ def train_dev_graph_files(set):
 
 def dataset_fingerprint(dev_files, settings):
     """
-    A hash of everything a cache depends on: the GRAPH files (path, size, modification time, so a rerun of s03
+    A hash of everything a cache depends on: the GRAPH files (path, size, modification time, so a rerun of s05
     changes it), the draw settings, the graph construction, the variogram settings and the version of the graph
     statistics (raise "graph_stats" whenever graph_stats changes, so both caches are recomputed). Used for the
     baselines (dev files) and the train graph statistics (train files).
@@ -477,9 +477,9 @@ def load_or_compute_baselines(dev_files, settings, cache_dir):
             return pl.read_parquet(parquet_path), meta["vario_log"]
 
     print("baselines computed (no cache, or dev data or settings changed)", flush=True)
-    # the same dev draws as in s04 (fixed draws, same settings); the baselines need neither GSE nor normalization stats
-    pools = s04.load_pools(s04.build_pool_index(dev_files), False, settings["min_graph_size"])
-    dev_ds = s04.PoolDataset(pools, None, settings["k_graph"], settings["subset_min"], settings["subset_max"],
+    # the same dev draws as in s06 (fixed draws, same settings); the baselines need neither GSE nor normalization stats
+    pools = s06.load_pools(s06.build_pool_index(dev_files), False, settings["min_graph_size"])
+    dev_ds = s06.PoolDataset(pools, None, settings["k_graph"], settings["subset_min"], settings["subset_max"],
                              settings["min_graph_size"], False, fixed_draws=True)
     baselines, vario_log = evaluate_baselines(dev_ds, settings["k_graph"])
 
@@ -592,9 +592,9 @@ def per_method_table(joined, group_col, values, methods=tuple(RESULT_RECIPE)):
 ################################################
 # Used by main.
 
-def report_md(runs, comparisons, vario_table, s03_params, train_stats, dev_stats):
+def report_md(runs, comparisons, vario_table, s05_params, train_stats, dev_stats):
     """
-    Builds the s04b markdown report: the settings of s04 (one column per run) and s03, the dataset sizes, the graph
+    Builds the s06b markdown report: the settings of s06 (one column per run) and s05, the dataset sizes, the graph
     statistics of train vs dev, one overview of the GNN of every run and the baselines, per run the training info,
     train vs dev, the tables per region, velocity and distance range and the figures (each in its own section with a
     short description, placed via s01.figure_marker), and the variograms in the appendix.
@@ -603,7 +603,7 @@ def report_md(runs, comparisons, vario_table, s03_params, train_stats, dev_stats
         runs -- list of dicts, the evaluated runs (see load_run)
         comparisons -- list of dicts, one per run in the same order (see compare_run)
         vario_table -- list of dicts, the fitted variograms with the kriging errors per region x orbit (see main)
-        s03_params -- dict, the arguments of the last s03 run (data/s03_params.json)
+        s05_params -- dict, the arguments of the last s05 run (data/s05_params.json)
         train_stats -- polars.DataFrame, the train graph statistics (see train_graph_stats)
         dev_stats -- polars.DataFrame, the dev graph statistics, one row per dev query (the baselines, see
             evaluate_baselines)
@@ -622,7 +622,7 @@ def report_md(runs, comparisons, vario_table, s03_params, train_stats, dev_stats
     def table(rows):
         return s01.table_to_md([rounded(r) for r in rows])
 
-    # --- 1. settings: all s04 params, one column per run; the ones that differ between runs (in a grid: the
+    # --- 1. settings: all s06 params, one column per run; the ones that differ between runs (in a grid: the
     # hyperparameters of the grid) first and in bold. stats = the normalization statistics, not a setting; str() so
     # that lists and None can be compared in a set
     keys = [k for k in runs[0]["params"] if k != "stats"]
@@ -633,13 +633,13 @@ def report_md(runs, comparisons, vario_table, s03_params, train_stats, dev_stats
     sizes = [{"run": r["name"], **{k: r["metrics"].get(k) for k in ("n_train_pools", "n_dev_pools", "n_node_features")}}
              for r in runs]
     parts += ["## Settings",
-              "### s04 (training)",
+              "### s06 (training)",
               "The arguments of every evaluated run, one column per run. Parameters that differ between the runs "
               "(in a grid: the varied hyperparameters) come first and are bold; with a single run none is bold.",
               s01.table_to_md(settings_rows),
-              "### s03 (graph pools)",
-              "The arguments of the last s03 run (data/s03_params.json): how the seeds and their pools were built.",
-              s01.params_to_md(s03_params),
+              "### s05 (graph pools)",
+              "The arguments of the last s05 run (data/s05_params.json): how the seeds and their pools were built.",
+              s01.params_to_md(s05_params),
               "### Dataset sizes",
               "Number of train and dev pools (one graph is drawn per pool and epoch) and node features per point "
               "(3 without GSE, 67 with).",
@@ -826,12 +826,12 @@ def compare_run(run, baselines):
 
 def main(project_dir, runs):
     """
-    Evaluates one run or several runs of a grid on dev: loads their s04 files, the (cached) baselines, compares them
-    query by query, adds what is the same for all runs (kriging errors per variogram, s03 settings, train graph
+    Evaluates one run or several runs of a grid on dev: loads their s06 files, the (cached) baselines, compares them
+    query by query, adds what is the same for all runs (kriging errors per variogram, s05 settings, train graph
     statistics) and builds one report.
 
     Arguments:
-        project_dir -- str, project root (same as in s01/s04), the runs are in <project_dir>/checkpoints/
+        project_dir -- str, project root (same as in s01/s06), the runs are in <project_dir>/checkpoints/
         runs -- list of str, run names or glob patterns, e.g. ["single_123"] or ["grid_456_*"]
 
     Returns:
@@ -862,12 +862,12 @@ def main(project_dir, runs):
                    .with_columns(((pl.col("best R2") < 0.3) | (pl.col("best model var") < 1e-6)).alias("check"))
                    .sort("region", "orbit").to_dicts())
 
-    # the s03 settings (written by s03 next to the data) and the train graph statistics (cached in data/train)
-    s03_params = json.load(open(Path(project_dir) / "data" / "s03_params.json"))
+    # the s05 settings (written by s05 next to the data) and the train graph statistics (cached in data/train)
+    s05_params = json.load(open(Path(project_dir) / "data" / "s05_params.json"))
     train_stats = train_graph_stats(settings, loaded[0]["params"]["seed"], Path(project_dir) / "data" / "train")
 
     # baselines = the dev graph statistics too (one row per dev query, see evaluate_baselines)
-    return report_md(loaded, comparisons, vario_table, s03_params, train_stats, baselines)
+    return report_md(loaded, comparisons, vario_table, s05_params, train_stats, baselines)
 
 
 
@@ -876,7 +876,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--project-dir", dest="project_dir", type=str, required=True,
-                        help="project root (same as in s01/s04), the runs are in <project-dir>/checkpoints/")
+                        help="project root (same as in s01/s06), the runs are in <project-dir>/checkpoints/")
     parser.add_argument("--runs", dest="runs", nargs="+", required=True,
                         help="run names or glob patterns in <project-dir>/checkpoints, e.g. single_123 or 'grid_456_*'")
 
@@ -886,4 +886,4 @@ if __name__ == '__main__':
     body, figures = main(args.project_dir, args.runs)
 
     # the markdown log of the evaluation, written only if it got this far
-    s01.write_md_log("s04b_baseline_comparison", start, vars(args), body=body, figures=figures)
+    s01.write_md_log("s06b_baseline_comparison", start, vars(args), body=body, figures=figures)

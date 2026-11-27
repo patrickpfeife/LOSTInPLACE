@@ -33,4 +33,4 @@ ARGS=(
     --max-tries=8         # rounds over all sectors in a row without a pick after which the pool is closed
 )
 
-uv run s03_build_training_dataset.py "${ARGS[@]}"
+uv run s05_build_training_dataset.py "${ARGS[@]}"

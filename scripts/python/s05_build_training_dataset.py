@@ -1,5 +1,5 @@
 #######################################
-# s03_build_training_dataset
+# s05_build_training_dataset
 
 ##############################################################################
 #============================================================================#
@@ -629,7 +629,7 @@ def tiles_for_core(core, gse_index):
 
 def training_summary_md(study_areas_gdf, log, k_nearest, density):
     """
-    Builds the s03 part of the markdown log: seeds (= graphs) and pool points per set, the budget calculation
+    Builds the s05 part of the markdown log: seeds (= graphs) and pool points per set, the budget calculation
     per set and its effect per region, the seed placement (grid vs land cover) and the points without GSE.
 
     Arguments:
@@ -750,9 +750,12 @@ def build_train_dataset_per_burst(csv_path, aoi, k_nearest, density, wc_merged_p
              "intended": 0, "seeds": 0, "pool points": 0}
     log["bursts"].append(entry)
 
+    overrides, date_cols = s02.schema_date_cols(p, s02.EGMS_FLOAT_COLS)
+
+    columns = ["pid","latitude","longitude","easting","northing","incidence_angle","mean_velocity"].append(date_cols)
+
     # Load the csv
-    burst = pl.read_csv(csv_path, columns=["pid","latitude","longitude","easting","northing","incidence_angle","mean_velocity"],
-                        schema_overrides={**s02.EGMS_FLOAT_COLS, "pid": pl.String})
+    burst = pl.read_csv(csv_path, columns=columns, schema_overrides=overrides)
 
     # Burst is now only the points intersecting the core, with the edge flag column
     burst, area_intersected, _ = select_area_and_buffer_burst_edges(burst, aoi, buffer_m=buffer_m)
@@ -990,10 +993,10 @@ if __name__ == '__main__':
                                 args.mu_mu_dist, args.sigma_mu_dist, args.mu_sigma_dist, args.sigma_sigma_dist,
                                 args.min_dist_pool, args.tolerance, args.max_tries)
 
-    with open(data_dir / "s03_params.json", "w") as f:
+    with open(data_dir / "s05_params.json", "w") as f:
             json.dump({**vars(args), "created": start.isoformat()}, f, indent=2)
             
     # the markdown log of the run, written only if the run got this far
-    s01.write_md_log("s03_build_training_dataset", start, vars(args),
+    s01.write_md_log("s05_build_training_dataset", start, vars(args),
                      body=training_summary_md(study_areas_gdf, log, args.k_nearest, args.density))
 
